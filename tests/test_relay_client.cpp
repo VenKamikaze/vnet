@@ -343,6 +343,23 @@ TEST_F(RelayClient, ReceivesDatagramsOnlyAfterPollAndByPort) {
     EXPECT_EQ(Recv(v, s1, &got), VNET_EAGAIN);
 }
 
+TEST_F(RelayClient, TheLargestDatagramArrivesWhole) {
+    // VNET_MAX_DATAGRAM of payload plus the relay's framing is bigger than a
+    // plain vnet datagram: the receive path must carry it.
+    Start();
+    Enter(1);
+    int s = vnet_open(v, 4000);
+    Bytes big(VNET_MAX_DATAGRAM);
+    for (size_t i = 0; i < big.size(); i++) big[i] = (uint8_t)(i * 7);
+    relay.Send(DataToClient(2, 4000, 1, big));
+    Bytes got;
+    ASSERT_TRUE(RecvOne(s, &got));
+    EXPECT_EQ(got, big);
+    vnet_stats st;
+    vnet_get_stats(v, &st);
+    EXPECT_EQ(st.rx_oversize, 0u);
+}
+
 TEST_F(RelayClient, DatagramsKeepTheirOrderAndAllBytes) {
     Start();
     Enter(1);
@@ -638,7 +655,9 @@ TEST_F(RelayClient, AHostNameIsResolvedWithTheSystemResolver) {
 }
 
 TEST_F(RelayClient, BadRelayAddressesFailCreate) {
-    for (const char *bad : {"", "nohostport", "1.2.3.4", "1.2.3.4:0", "1.2.3.4:99999", ":5000"}) {
+    for (const char *bad : {"", "nohostport", "1.2.3.4", "1.2.3.4:0", "1.2.3.4:99999", ":5000", "1.2.3:5000",
+                            // Names are rejected on the port before any lookup is attempted.
+                            "host.invalid:99999", "host.invalid:", "host.invalid:12x", "host.invalid:5:6"}) {
         vnet_config cfg;
         vnet_config_init(&cfg);
         cfg.backend = VNET_BACKEND_RELAY_UDP;

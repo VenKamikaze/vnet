@@ -281,6 +281,14 @@ func TestDataNeedsTheRightToken(t *testing.T) {
 	if errReason(t, got[0].b) != ErrNoSession {
 		t.Fatal("expected NO_SESSION")
 	}
+	// The token is the identity, not the source address: a wrong token from
+	// the member's own address is just as unauthenticated.
+	spoof := &vclient{th: th, addr: host.addr, room: bad.room}
+	spoof.send(2, 1, 1, []byte("same-address-wrong-token"))
+	got = th.drain()
+	if len(got) != 1 || got[0].to != host.addr || errReason(t, got[0].b) != ErrNoSession {
+		t.Fatalf("a wrong token from a member's address was accepted: %v", got)
+	}
 	_ = guest
 	// A token is not valid until it was issued, and not after the session ended.
 	host.leave()
@@ -633,6 +641,21 @@ func TestUnauthenticatedRepliesAreRateLimited(t *testing.T) {
 	}
 	if n := len(th.drain()); n > 10 {
 		t.Fatalf("unknown-token flood drew %d replies", n)
+	}
+}
+
+func TestAReplyLargerThanItsRequestIsNeverSent(t *testing.T) {
+	// The padding rule normally guarantees this; the check itself is the
+	// backstop, so exercise it directly.
+	th := newTestHub(t, nil)
+	src := ap("203.0.113.7", 9)
+	th.h.replyUnauth(src, roomLen-1, make([]byte, roomLen), th.clock.Now())
+	if len(th.drain()) != 0 || th.h.snapshot().RepliesSuppressed != 1 {
+		t.Fatal("an oversize reply was sent")
+	}
+	th.h.replyUnauth(src, roomLen, make([]byte, roomLen), th.clock.Now())
+	if len(th.drain()) != 1 {
+		t.Fatal("an equal-size reply should be allowed")
 	}
 }
 

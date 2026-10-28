@@ -215,21 +215,37 @@ TEST_F(RelayIntegration, TwoNativeClientsExchangeDatagramsInOrder) {
     ASSERT_EQ(vnet_resolve(host, "10.0.0.2:5001", &to_guest), 0);
 
     const int N = 200;
-    for (int i = 0; i < N; i++) {
-        std::string a = "g2h-" + std::to_string(i) + std::string((size_t)(i % 97), 'x');
-        std::string b = "h2g-" + std::to_string(i) + std::string((size_t)(i % 89), 'y');
-        ASSERT_EQ(Send(guest, gsock, a, to_host), (int)a.size());
-        ASSERT_EQ(Send(host, hsock, b, to_guest), (int)b.size());
-    }
     Rx at_host, at_guest;
-    ASSERT_TRUE(Collect({host, guest}, host, hsock, N, &at_host));
-    ASSERT_TRUE(Collect({host, guest}, guest, gsock, N, &at_guest));
+    // Frames of 20 in each direction, each frame collected before the next is
+    // sent (like a game at its frame rate; a burst of hundreds could overflow
+    // kernel socket buffers on a loaded machine).
+    for (int i = 0; i < N; i += 20) {
+        for (int k = i; k < i + 20; k++) {
+            std::string a = "g2h-" + std::to_string(k) + std::string((size_t)(k % 97), 'x');
+            std::string b = "h2g-" + std::to_string(k) + std::string((size_t)(k % 89), 'y');
+            ASSERT_EQ(Send(guest, gsock, a, to_host), (int)a.size());
+            ASSERT_EQ(Send(host, hsock, b, to_guest), (int)b.size());
+        }
+        ASSERT_TRUE(Collect({host, guest}, host, hsock, (size_t)i + 20, &at_host));
+        ASSERT_TRUE(Collect({host, guest}, guest, gsock, (size_t)i + 20, &at_guest));
+    }
     for (int i = 0; i < N; i++) {
         EXPECT_EQ(at_host.data[i], "g2h-" + std::to_string(i) + std::string((size_t)(i % 97), 'x'));
         EXPECT_EQ(at_guest.data[i], "h2g-" + std::to_string(i) + std::string((size_t)(i % 89), 'y'));
         EXPECT_EQ(at_host.from[i], "10.0.0.2:5001");  // sender's virtual address and port
         EXPECT_EQ(at_guest.from[i], "10.0.0.1:5000");
     }
+    // The largest datagram makes the whole trip, both ways.
+    std::string big(VNET_MAX_DATAGRAM, '\0');
+    for (size_t i = 0; i < big.size(); i++) big[i] = (char)(i * 13);
+    ASSERT_EQ(Send(host, hsock, big, to_guest), VNET_MAX_DATAGRAM);
+    ASSERT_EQ(Send(guest, gsock, big, to_host), VNET_MAX_DATAGRAM);
+    ASSERT_TRUE(Collect({host, guest}, guest, gsock, N + 1, &at_guest));
+    ASSERT_TRUE(Collect({host, guest}, host, hsock, N + 1, &at_host));
+    EXPECT_EQ(at_guest.data[N], big);
+    EXPECT_EQ(at_host.data[N], big);
+    at_guest.data.pop_back();
+    at_host.data.pop_back();
     // Replies go to the right place: answer from the received address.
     vnet_addr who{};
     ASSERT_TRUE(vnet_resolve(host, at_host.from[0].c_str(), &who) == 0);
@@ -240,8 +256,8 @@ TEST_F(RelayIntegration, TwoNativeClientsExchangeDatagramsInOrder) {
 
     vnet_stats st;
     vnet_get_stats(host, &st);
-    EXPECT_EQ(st.tx_datagrams, (uint64_t)N + 1);
-    EXPECT_EQ(st.rx_datagrams, (uint64_t)N);
+    EXPECT_EQ(st.tx_datagrams, (uint64_t)N + 2);   // N, the largest one, and the pong
+    EXPECT_EQ(st.rx_datagrams, (uint64_t)N + 1);   // N and the largest one
     vnet_destroy(guest);
     vnet_destroy(host);
 }
@@ -258,25 +274,28 @@ TEST_F(RelayIntegration, ImpairmentInFrontOfTheRelayBackend) {
     int hs = vnet_open(host, 1), gs = vnet_open(guest, 2);
     vnet_addr to_guest = A("10.0.0.2:2");
     const int N = 400;
-    // Send in frames of 10 and pump between them, as a game loop would (a
-    // single huge burst would overflow the guest's kernel socket buffer).
+    // Send in frames of 10 and collect each frame's survivors before the next
+    // (a game paces itself at its frame rate; a single huge burst would
+    // overflow kernel socket buffers on a loaded machine). The impairment
+    // layer is deterministic, so the number of survivors of a frame is known
+    // from its loss counter.
     Rx rx;
-    for (int i = 0; i < N; i++) {
-        ASSERT_EQ(Send(host, hs, std::to_string(i), to_guest), (int)std::to_string(i).size());
-        if (i % 10 == 9) {
-            vnet_poll(host);
-            vnet_poll(guest);
-            std::string d;
-            vnet_addr f{};
-            while (Recv(guest, gs, &d, &f) >= 0) rx.data.push_back(d);
-        }
+    uint64_t lost_before = 0;
+    size_t want = 0;
+    for (int i = 0; i < N; i += 10) {
+        for (int k = i; k < i + 10; k++)
+            ASSERT_EQ(Send(host, hs, std::to_string(k), to_guest), (int)std::to_string(k).size());
+        vnet_stats cur;
+        vnet_get_stats(host, &cur);
+        want += 10 - (size_t)(cur.impair_lost - lost_before);
+        lost_before = cur.impair_lost;
+        ASSERT_TRUE(Collect({host, guest}, guest, gs, want, &rx)) << "got " << rx.data.size() << " of " << want;
     }
     vnet_stats st;
     vnet_get_stats(host, &st);
     ASSERT_GT(st.impair_lost, 0u);
     ASSERT_LT(st.impair_lost, (uint64_t)N);
-    size_t want = (size_t)N - (size_t)st.impair_lost;
-    ASSERT_TRUE(Collect({host, guest}, guest, gs, want, &rx)) << "got " << rx.data.size() << " of " << want;
+    ASSERT_EQ(want, (size_t)N - (size_t)st.impair_lost);
     // Exactly the datagrams the impairment layer let through, in order.
     int last = -1;
     for (auto &d : rx.data) {
@@ -305,7 +324,8 @@ TEST_F(RelayIntegration, LatencyIsAppliedBeforeTheRelay) {
     Rx rx;
     ASSERT_TRUE(Collect({host, guest}, guest, gs, 1, &rx));
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
-    EXPECT_GE(ms, 150);
+    EXPECT_GE(ms, 149);  // 150 ms of latency on a 1 ms clock (a send can land just before a tick)
+    EXPECT_LT(ms, 5000);
     vnet_destroy(guest);
     vnet_destroy(host);
 }
