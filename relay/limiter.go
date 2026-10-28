@@ -60,7 +60,8 @@ type ipLimiter struct {
 	cfg    *Config
 	m      map[netip.Addr]*ipEntry
 	global bucket // handshakes of every source once the table is full
-	greply bucket // replies to unauthenticated packets, overall
+	greply bucket // replies to unauthenticated packets, overall (ERRORs to unproven sources)
+	gvital bucket // RETRY and PATH_CHALLENGE, overall: what an honest client needs to make progress
 }
 
 func newIPLimiter(cfg *Config) *ipLimiter {
@@ -94,7 +95,7 @@ func (l *ipLimiter) allowHandshake(ip netip.Addr, now time.Time) bool {
 
 // allowReply reports whether the relay may answer an unauthenticated packet
 // from ip: it must pass both the per-IP bucket and the global one.
-func (l *ipLimiter) allowReply(ip netip.Addr, now time.Time) bool {
+func (l *ipLimiter) allowReply(ip netip.Addr, now time.Time, vital bool) bool {
 	ip = ipKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -102,6 +103,9 @@ func (l *ipLimiter) allowReply(ip netip.Addr, now time.Time) bool {
 		if !e.reply.allow(now, l.cfg.ReplyPerSec, l.cfg.ReplyBurst, 1) {
 			return false
 		}
+	}
+	if vital {
+		return l.gvital.allow(now, l.cfg.GlobalVitalReplyPerSec, l.cfg.GlobalVitalReplyBurst, 1)
 	}
 	return l.greply.allow(now, l.cfg.GlobalReplyPerSec, l.cfg.GlobalReplyBurst, 1)
 }

@@ -46,7 +46,13 @@ type Config struct {
 	ReplyBurst        float64 // default 100
 	GlobalReplyPerSec float64 // replies to unauthenticated packets overall; default 5000
 	GlobalReplyBurst  float64 // default 5000
-	MaxTrackedIPs     int     // per-IP limiter entries; default 100000
+	// RETRY and PATH_CHALLENGE are what an honest client needs in order to make
+	// progress, and they are smaller than the packet that draws them, so they
+	// have an allowance of their own: a flood of forged packets that uses up
+	// the budget above cannot stop real clients from starting a handshake.
+	GlobalVitalReplyPerSec float64 // default 50000
+	GlobalVitalReplyBurst  float64 // default 50000
+	MaxTrackedIPs          int     // per-IP limiter entries; default 100000
 
 	// WebSocket.
 	WSSendQueue       int           // frames queued per WebSocket client before drops; default 128
@@ -105,6 +111,8 @@ func (c Config) withDefaults() (Config, error) {
 	defF(&c.ReplyBurst, 100)
 	defF(&c.GlobalReplyPerSec, 5000)
 	defF(&c.GlobalReplyBurst, 5000)
+	defF(&c.GlobalVitalReplyPerSec, 50000)
+	defF(&c.GlobalVitalReplyBurst, 50000)
 	def(&c.MaxTrackedIPs, 100000)
 	def(&c.WSSendQueue, 128)
 	if c.Now == nil {
@@ -121,6 +129,9 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.KeepaliveInterval < time.Second {
 		return c, fmt.Errorf("KeepaliveInterval must be at least 1 s (it is advertised in whole seconds)")
+	}
+	if 2*c.RetryCookieBucket >= c.NonceTTL {
+		return c, fmt.Errorf("2 * RetryCookieBucket (%v) must be shorter than NonceTTL (%v): a handshake cookie must have expired before the nonce of a finished session is forgotten, or a late replay could resurrect a room", 2*c.RetryCookieBucket, c.NonceTTL)
 	}
 	if c.KeepaliveInterval*3 > c.SessionTimeout {
 		return c, fmt.Errorf("KeepaliveInterval (%v) must be at most a third of SessionTimeout (%v), or healthy clients would time out", c.KeepaliveInterval, c.SessionTimeout)

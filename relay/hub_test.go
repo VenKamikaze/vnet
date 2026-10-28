@@ -657,11 +657,11 @@ func TestAReplyLargerThanItsRequestIsNeverSent(t *testing.T) {
 	// backstop, so exercise it directly.
 	th := newTestHub(t, nil)
 	src := ap("203.0.113.7", 9)
-	th.h.replyUnauth(src, roomLen-1, make([]byte, roomLen), th.clock.Now())
+	th.h.replyUnauth(src, roomLen-1, make([]byte, roomLen), th.clock.Now(), false)
 	if len(th.drain()) != 0 || th.h.snapshot().RepliesSuppressed != 1 {
 		t.Fatal("an oversize reply was sent")
 	}
-	th.h.replyUnauth(src, roomLen, make([]byte, roomLen), th.clock.Now())
+	th.h.replyUnauth(src, roomLen, make([]byte, roomLen), th.clock.Now(), false)
 	if len(th.drain()) != 1 {
 		t.Fatal("an equal-size reply should be allowed")
 	}
@@ -1299,14 +1299,34 @@ func TestHandshakeCookieIsBoundToSourceNonceAndTime(t *testing.T) {
 	if pk := th.take(a); len(pk) != 1 || pk[0][0] != TypeRoom {
 		t.Fatalf("a cookie one bucket old was refused: %v", pk)
 	}
-	// ...but two buckets later it has expired.
-	th2 := newTestHub(t, nil)
-	th2.feed(a, handshakeFrame(10, "", MinUDPHandshake))
-	c2 := retryCookie(t, th2.take(a))
-	th2.clock.Advance(3 * th2.h.cfg.RetryCookieBucket)
-	th2.feed(a, handshakeFrameC(10, "", c2, MinUDPHandshake))
-	if pk := th2.take(a); len(pk) != 1 || pk[0][0] != TypeRetry {
-		t.Fatalf("an expired cookie was accepted: %v", pk)
+	// ...but a cookie is good for at most two buckets. The fake clock starts at a
+	// bucket boundary, so a cookie issued there lives to the end of the next
+	// bucket: usable just before two buckets have passed, expired at exactly
+	// two (a third bucket must not be accepted).
+	bucket := th.h.cfg.RetryCookieBucket
+	for _, tc := range []struct {
+		name  string
+		issue time.Duration // offset into the bucket at which the cookie is issued
+		wait  time.Duration
+		ok    bool
+	}{
+		{"issued at the start, just under two buckets", 0, 2*bucket - time.Millisecond, true},
+		{"issued at the start, exactly two buckets", 0, 2 * bucket, false},
+		{"issued at the end of a bucket, one bucket later", bucket - time.Millisecond, bucket, true},
+		{"issued at the end of a bucket, two buckets later", bucket - time.Millisecond, 2 * bucket, false},
+		{"three buckets", 0, 3 * bucket, false},
+	} {
+		x := newTestHub(t, nil)
+		x.clock.Advance(tc.issue)
+		x.feed(a, handshakeFrame(10, "", MinUDPHandshake))
+		ck := retryCookie(t, x.take(a))
+		x.clock.Advance(tc.wait)
+		x.feed(a, handshakeFrameC(10, "", ck, MinUDPHandshake))
+		pk := x.take(a)
+		got := len(pk) == 1 && pk[0][0] == TypeRoom
+		if got != tc.ok {
+			t.Errorf("%s: accepted=%v, want %v", tc.name, got, tc.ok)
+		}
 	}
 	// Another relay (another secret) does not honour it either.
 	th3 := newTestHub(t, nil)
@@ -1686,4 +1706,149 @@ func TestWebSocketAdmissionIsAtomic(t *testing.T) {
 	if !th.h.acquireWS(netip.MustParseAddr("192.0.2.77")) {
 		t.Fatal("a released slot was not reusable")
 	}
+}
+
+func TestConfigRequiresCookiesToExpireBeforeNoncesAreForgotten(t *testing.T) {
+	// A cookie valid for up to two buckets must be dead before the nonce of a
+	// finished session is forgotten, or a replayed handshake could resurrect a room.
+	if _, err := New(Config{RetryCookieBucket: 30 * time.Second, NonceTTL: 60 * time.Second}); err == nil {
+		t.Fatal("2 x bucket == NonceTTL was accepted")
+	}
+	if _, err := New(Config{RetryCookieBucket: 40 * time.Second, NonceTTL: 60 * time.Second}); err == nil {
+		t.Fatal("2 x bucket > NonceTTL was accepted")
+	}
+	if _, err := New(Config{RetryCookieBucket: 29 * time.Second, NonceTTL: 60 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{}); err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+}
+
+// ---------------------------------------- relay-wide floods of forged packets
+
+// A flood of forged, random-source packets above the old global reply budget
+// must not stop a real client from completing its handshake: RETRY and
+// PATH_CHALLENGE have their own allowance, and the ROOM/ERROR replies to a
+// source that echoed a cookie are not charged to the unauthenticated budgets
+// at all.
+func TestForgedFloodAboveTheGlobalBudgetDoesNotStopRealHandshakes(t *testing.T) {
+	th := newTestHub(t, nil) // GlobalReplyPerSec 5000
+	rng := rand.New(rand.NewSource(3))
+	forged := func(n int) {
+		for i := 0; i < n; i++ {
+			src := netip.AddrPortFrom(netip.AddrFrom4([4]byte{byte(1 + rng.Intn(200)), byte(rng.Intn(256)), byte(rng.Intn(256)), byte(rng.Intn(256))}), uint16(1024+rng.Intn(60000)))
+			if i%2 == 0 {
+				th.feed(src, handshakeFrame(rng.Uint64(), "", MinUDPHandshake)) // draws a RETRY
+			} else {
+				f := handshakeFrame(rng.Uint64(), "", MinUDPHandshake)
+				f[1] = 9 // wrong version: draws an ERROR from the other budget
+				th.feed(src, f)
+			}
+		}
+		th.drain()
+	}
+	for sec := 0; sec < 4; sec++ {
+		forged(6000) // above the 5000/s global budget, every second
+		real := ap(fmt.Sprintf("192.0.2.%d", sec+1), 4000)
+		c := th.mustCreate(real, uint64(100+sec))
+		if c.room.octet != 1 {
+			t.Fatalf("second %d: the real client's handshake failed under the flood", sec)
+		}
+		th.clock.Advance(time.Second)
+	}
+	// The flood drew no state.
+	if st := th.h.snapshot(); st.Rooms != 4 || st.Sessions != 4 {
+		t.Fatalf("%+v", st)
+	}
+}
+
+func TestRepliesToCookieProvenSourcesAreNotChargedToTheUnprovenBudgets(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.GlobalReplyPerSec, c.GlobalReplyBurst = 1, 1; c.ReplyPerSec, c.ReplyBurst = 1, 1 })
+	src := ap("192.0.2.1", 1000)
+	// Get a cookie first (this uses the sender's tiny reply budget), then
+	// use up every unauthenticated budget there is.
+	th.feed(src, handshakeFrame(5, "", MinUDPHandshake))
+	cookie := retryCookie(t, th.take(src))
+	for i := 0; i < 50; i++ {
+		f := handshakeFrame(uint64(i), "", MinUDPHandshake)
+		f[1] = 9
+		th.feed(src, f) // bad version from the same address: drains its reply budget and the global one
+		th.feed(ap(fmt.Sprintf("198.51.100.%d", i+1), 1), f)
+	}
+	th.drain()
+	// A request that echoes the cookie still gets its answer.
+	th.feed(src, handshakeFrameC(5, "", cookie, MinUDPHandshake))
+	if pk := th.take(src); len(pk) != 1 || pk[0][0] != TypeRoom {
+		t.Fatalf("a cookie-proven source got no ROOM: %v", pk)
+	}
+	// So does a proven source asking for a room that does not exist.
+	th.feed(src, handshakeFrame(6, "ABCDEF", MinUDPHandshake))
+	th.drain() // (the RETRY may or may not fit the exhausted budget)
+	ck2 := th.h.cookieFor(src, nonceBytes(6), th.h.bucketOf(th.clock.Now()))
+	th.feed(src, handshakeFrameC(6, "ABCDEF", ck2[:], MinUDPHandshake))
+	if pk := th.take(src); len(pk) != 1 || errReason(t, pk[0]) != ErrRoomNotFound {
+		t.Fatalf("a proven source got no ERROR: %v", pk)
+	}
+}
+
+// exhaustUnprovenBudgets uses up the ordinary global reply budget (and the
+// per-address budgets of 50 throwaway addresses) with wrong-version packets.
+func exhaustUnprovenBudgets(th *testHub) {
+	for i := 0; i < 50; i++ {
+		f := handshakeFrame(uint64(1000+i), "", MinUDPHandshake)
+		f[1] = 9
+		th.feed(ap(fmt.Sprintf("198.51.100.%d", i+1), 1), f)
+	}
+	th.drain()
+}
+
+// Every other answer to a cookie-proven source is also free of the
+// unauthenticated budgets: the rate-limit ERROR and the malformed-code ERROR.
+func TestErrorsToCookieProvenSourcesAreNotChargedToTheUnprovenBudgets(t *testing.T) {
+	th := newTestHub(t, func(c *Config) {
+		c.GlobalReplyPerSec, c.GlobalReplyBurst = 1, 1
+		c.ReplyPerSec, c.ReplyBurst = 1, 1
+		c.HandshakePerSec, c.HandshakeBurst = 1, 1
+	})
+	exhaustUnprovenBudgets(th)
+	ck := func(src netip.AddrPort, nonce uint64) []byte {
+		c := th.h.cookieFor(src, nonceBytes(nonce), th.h.bucketOf(th.clock.Now()))
+		return c[:]
+	}
+	// Malformed room code.
+	a := ap("192.0.2.1", 1000)
+	th.feed(a, handshakeFrameC(1, "!!!!!!", ck(a, 1), MinUDPHandshake))
+	if pk := th.take(a); len(pk) != 1 || errReason(t, pk[0]) != ErrRoomNotFound {
+		t.Fatalf("malformed code: want ERROR(ROOM_NOT_FOUND), got %v", pk)
+	}
+	// Second proven handshake from one address inside the 1/s limit.
+	b := ap("192.0.2.2", 1000)
+	th.feed(b, handshakeFrameC(2, "", ck(b, 2), MinUDPHandshake))
+	if pk := th.take(b); len(pk) != 1 || pk[0][0] != TypeRoom {
+		t.Fatalf("first handshake: %v", pk)
+	}
+	th.feed(b, handshakeFrameC(3, "", ck(b, 3), MinUDPHandshake))
+	if pk := th.take(b); len(pk) != 1 || errReason(t, pk[0]) != ErrRate {
+		t.Fatalf("second handshake: want ERROR(RATE), got %v", pk)
+	}
+}
+
+// PATH_CHALLENGE is not starved by a flood of ordinary unauthenticated
+// replies either: a client behind a rebinding NAT can still migrate.
+func TestPathChallengeSurvivesAnExhaustedOrdinaryReplyBudget(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.GlobalReplyPerSec, c.GlobalReplyBurst = 1, 1 })
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	guest := th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
+	th.drain()
+	exhaustUnprovenBudgets(th)
+	moved := ap("203.0.113.9", 40000)
+	th.feed(moved, guest.tokenFrame(TypeKeepalive))
+	var atMoved [][]byte
+	for _, p := range th.drain() {
+		if p.to == moved {
+			atMoved = append(atMoved, p.b)
+		}
+	}
+	challengeCookie(t, atMoved)
 }

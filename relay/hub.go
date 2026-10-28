@@ -344,12 +344,25 @@ func (h *Hub) leave(s *session) {
 // session. It enforces the anti-reflection rules: the reply is never larger
 // than the packet it answers, and replies are rate-limited per source IP and
 // globally.
-func (h *Hub) replyUnauth(src netip.AddrPort, reqLen int, reply []byte, now time.Time) {
+func (h *Hub) replyUnauth(src netip.AddrPort, reqLen int, reply []byte, now time.Time, vital bool) {
 	if len(reply) > reqLen {
 		h.stats.repliesSuppressed.Add(1)
 		return
 	}
-	if !h.ips.allowReply(src.Addr().Unmap(), now) {
+	if !h.ips.allowReply(src.Addr().Unmap(), now, vital) {
+		h.stats.repliesSuppressed.Add(1)
+		return
+	}
+	h.send(src, reply)
+}
+
+// replyProven answers a source that has just echoed a handshake cookie: it is
+// known to receive at its address, so a reply cannot be reflected at a
+// victim, and the unauthenticated reply budgets (which forged floods can use
+// up) do not apply. The reply is still never larger than the request, so the
+// relay's output stays bounded by what real, reachable clients send it.
+func (h *Hub) replyProven(src netip.AddrPort, reqLen int, reply []byte) {
+	if len(reply) > reqLen {
 		h.stats.repliesSuppressed.Add(1)
 		return
 	}
@@ -452,7 +465,7 @@ func (h *Hub) udpHandshake(p []byte, src netip.AddrPort, now time.Time) {
 	copy(nonce[:], p[2:2+NonceLen])
 	if p[1] != ProtocolVersion {
 		h.stats.handshakeRejected.Add(1)
-		h.replyUnauth(src, len(p), encodeError(ErrBadVersion, nonce), now)
+		h.replyUnauth(src, len(p), encodeError(ErrBadVersion, nonce), now, false)
 		return
 	}
 	cookieAt := createLen
@@ -467,13 +480,13 @@ func (h *Hub) udpHandshake(p []byte, src netip.AddrPort, now time.Time) {
 		// reply budget like any answer to an unproven source.
 		ck := h.cookieFor(src, nonce, h.bucketOf(now))
 		h.stats.retriesSent.Add(1)
-		h.replyUnauth(src, len(p), encodeRetry(nonce, ck), now)
+		h.replyUnauth(src, len(p), encodeRetry(nonce, ck), now, true)
 		return
 	}
 	// The source is proven. Only now do rate limits and state apply.
 	if !h.ips.allowHandshake(ip, now) {
 		h.stats.rateLimited.Add(1)
-		h.replyUnauth(src, len(p), encodeError(ErrRate, nonce), now)
+		h.replyProven(src, len(p), encodeError(ErrRate, nonce))
 		return
 	}
 	req := hsReq{kind: p[0], nonce: nonce, ip: ipKey(ip)}
@@ -481,14 +494,14 @@ func (h *Hub) udpHandshake(p []byte, src netip.AddrPort, now time.Time) {
 		code, ok := normaliseCode(p[createLen : createLen+CodeLen])
 		if !ok {
 			h.stats.handshakeRejected.Add(1)
-			h.replyUnauth(src, len(p), encodeError(ErrRoomNotFound, nonce), now)
+			h.replyProven(src, len(p), encodeError(ErrRoomNotFound, nonce))
 			return
 		}
 		req.code = code
 	}
 	req.udp = &src
 	reply, _ := h.handshake(req, now)
-	h.replyUnauth(src, len(p), reply, now)
+	h.replyProven(src, len(p), reply)
 }
 
 func (h *Hub) udpAuthenticated(p []byte, src netip.AddrPort, now time.Time, scratch *[]byte) {
@@ -513,7 +526,7 @@ func (h *Hub) udpAuthenticated(p []byte, src netip.AddrPort, now time.Time, scra
 	if s == nil || s.ws != nil {
 		h.stats.unknownToken.Add(1)
 		var zero [NonceLen]byte
-		h.replyUnauth(src, len(p), encodeError(ErrNoSession, zero), now)
+		h.replyUnauth(src, len(p), encodeError(ErrNoSession, zero), now, false)
 		return
 	}
 	s.touch(now)
@@ -577,7 +590,7 @@ func (h *Hub) challenge(s *session, src netip.AddrPort, reqLen int, now time.Tim
 	copy(frame[1:], s.chCookie[:])
 	s.chMu.Unlock()
 	h.stats.pathChallenges.Add(1)
-	h.replyUnauth(src, reqLen, frame, now)
+	h.replyUnauth(src, reqLen, frame, now, true)
 }
 
 // pathResponse completes a validation: the source echoed the cookie that was

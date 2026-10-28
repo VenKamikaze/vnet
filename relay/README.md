@@ -48,6 +48,8 @@ Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper ca
 
 The public listener serves only `/vnet` and `/healthz`. `/stats` (counters as JSON: rooms, members, frames, drops by reason, path validations) is **off by default**: give `-stats` a private address (localhost or an internal interface) to turn it on.
 
+If `/stats` shows `panics` > 0, restart the relay soon: a recovered panic is not guaranteed to have left its state consistent.
+
 ## TLS (`wss://`) in front of the relay
 
 A page served over HTTPS may only open `wss://` connections, so production needs TLS. The relay speaks plain HTTP and expects a reverse proxy to terminate TLS and forward `/vnet` only.
