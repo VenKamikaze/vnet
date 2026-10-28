@@ -108,8 +108,10 @@ jobs:
         run: go vet ./...
       - name: Tests under the race detector
         run: go test -race -count=1 ./...
-      - name: Fuzz target (30 s)
-        run: go test -run XXX -fuzz FuzzHandleUDP -fuzztime 30s .
+      - name: Fuzz targets (30 s each)
+        run: |
+          go test -run XXX -fuzz FuzzHandleUDP -fuzztime 30s .
+          go test -run XXX -fuzz FuzzHandleWS -fuzztime 30s .
       - name: Build the Docker image
         run: docker build -t vnet-relay .
       - name: Run the container and talk to it
