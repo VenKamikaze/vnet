@@ -30,8 +30,8 @@ The relay puts clients into **rooms** and forwards datagrams between the members
 
 | Type | Name | UDP layout | WebSocket layout |
 |---|---|---|---|
-| `0x01` | `CREATE_ROOM` | `01 ver nonce[8]` + zero padding to **at least 64 bytes** | `01 ver nonce[8]` |
-| `0x02` | `JOIN_ROOM` | `02 ver nonce[8] code[6]` + zero padding to **at least 64 bytes** | `02 ver nonce[8] code[6]` |
+| `0x01` | `CREATE_ROOM` | `01 ver nonce[8] cookie[16]` + zero padding to **at least 64 bytes** | `01 ver nonce[8]` |
+| `0x02` | `JOIN_ROOM` | `02 ver nonce[8] code[6] cookie[16]` + zero padding to **at least 64 bytes** | `02 ver nonce[8] code[6]` |
 | `0x03` | `LEAVE` | `03 token[16]` | `03` (the relay then closes the connection) |
 | `0x04` | `KEEPALIVE` | `04 token[16]` | `04` |
 | `0x06` | `PATH_RESPONSE` | `06 token[16] cookie[8]` | (not used) |
@@ -49,25 +49,30 @@ The relay puts clients into **rooms** and forwards datagrams between the members
 | `0x82` | `ERROR` | `82 ver nonce[8] reason` (11 bytes) |
 | `0x04` | `KEEPALIVE` | `04` (the answer to a `KEEPALIVE`) |
 | `0x05` | `PATH_CHALLENGE` | `05 cookie[8]` (UDP only; see [Where the relay sends](#where-the-relay-sends-address-validation)) |
+| `0x07` | `RETRY` | `07 ver nonce[8] cookie[16]` (UDP only, 26 bytes; the stateless retry, see [Handshake](#handshake-and-idempotent-retries)) |
 | `0x10` | `DATA` | `10 src_vaddr[4] dst_port[2] src_port[2] payload` |
 
 - `ROOM` answers `CREATE_ROOM` and `JOIN_ROOM`. `nonce` echoes the request; `vaddr` is the member's address; `token` is the session token (WebSocket clients may ignore it); `code` is the room code; `max_members` is the room's member cap; `keepalive_s` is the interval the relay suggests for `KEEPALIVE` frames.
+- `RETRY` answers a UDP `CREATE_ROOM`/`JOIN_ROOM` that carries no valid cookie. The relay keeps **no state** for it.
 - `ERROR` carries the nonce of the request it answers. Errors that are not about a request (`NO_SESSION`, `CLOSED`, `TIMEOUT` on an established session) carry the session's nonce, or all zeros if the relay does not know the session.
 - `DATA` has the same layout in both directions, with the address field meaning **destination** when a client sends it and **source** when the relay delivers it. The relay fills in the source from the sender's membership; a client cannot choose it. `src_port` and `dst_port` are opaque to the relay: they are the game's vnet ports, carried so that the receiving vnet context can hand the datagram to the right local socket.
 - Clients **ignore frame types they do not know** (forward compatibility).
 
 ## Handshake and idempotent retries
 
-1. The client picks a random 8-byte **nonce** once and sends `CREATE_ROOM` (to make a room) or `JOIN_ROOM` (to enter one).
-2. The relay answers `ROOM` or `ERROR`.
-3. Over UDP, either datagram can be lost, so the client **repeats the identical request, nonce included**, until it gets an answer. The relay treats the nonce as an idempotency key:
-   - a repeat of a request that already succeeded returns the same `ROOM` (same token, same address) and creates nothing, so a retry never makes a second room or a second member;
-   - a repeat from a **different source address** gets the same `ROOM` too (the client may be behind a NAT whose mapping changed) but does not move the session: only address validation does, see below;
+The source address of a UDP datagram can be forged, so over UDP the relay creates nothing for a source until that source has shown it can receive at its address. This is a stateless retry, as QUIC does it:
+
+1. The client picks a random 8-byte **nonce** once and sends `CREATE_ROOM` (to make a room) or `JOIN_ROOM` (to enter one) with an all-zero `cookie`.
+2. **UDP only:** the relay answers `RETRY(nonce, cookie)` and forgets the request: no session, no room, no budget used, nothing stored. The cookie is an HMAC (key: a random secret that never leaves the relay and changes at each start) over the source address and port, the nonce and a 16-second time bucket; the current and the previous bucket are accepted. `RETRY` is 26 bytes, always smaller than the (at least 64-byte) request, and counts against the sender's reply budget like any answer to an unproven source.
+3. The client repeats **the same request, nonce included, with the cookie filled in**. Only now does the relay apply its limits and create state; the session's address is the source of this request, which has just been proved. A cookie cannot be moved to another address, port or nonce, and expires; one that is missing, wrong or expired just draws a fresh `RETRY`. (The client keeps repeating until it gets an answer, so a lost `RETRY`, request or reply costs one retransmission.)
+4. The relay answers `ROOM` or `ERROR`. Over UDP either datagram can be lost, so the client **repeats the identical request (with the cookie)** until it gets an answer. The nonce is an idempotency key:
+   - a repeat of a request that already succeeded, **from the session's own address**, returns the same `ROOM` (same token, same address) and creates nothing, so a retry never makes a second room or a second member;
+   - a repeat from **any other address** gets `ERROR(NONCE_REUSED)`, whatever its cookie: the ROOM, and with it the token, goes only to the address that was proved when the session was created (a client whose ROOM was lost *and* whose NAT mapping changed in the same moment has to start again with a new nonce);
    - a nonce that was used for a *different* request (CREATE vs JOIN, or another code) gets `ERROR(NONCE_REUSED)`;
    - when a session ends, its nonce is remembered for 60 s (`NonceTTL`) so that a late, reordered duplicate of the handshake gets `ERROR(CLOSED)` instead of resurrecting a room.
-4. The vnet client sends the first request at once, then retries after 250 ms, 500 ms more, then every 1000 ms, and gives up (`VNET_ETIMEDOUT`) after `relay_timeout_ms` (default 10 s).
-5. Over WebSocket the handshake is sent once, when the connection opens. Repeating the same request on the same connection returns the same `ROOM`; a different request on a connection that already has a session gets `ERROR(ALREADY_IN_ROOM)`; the same nonce on another connection gets `ERROR(NONCE_REUSED)`.
-6. A WebSocket connection must send `CREATE_ROOM` or `JOIN_ROOM` within 10 s (`HandshakeTimeout`) and as its first frame; anything else gets `ERROR(MALFORMED)` and the connection is closed.
+5. The vnet client sends the first request at once, answers a `RETRY` immediately, retransmits after 250 ms, 500 ms more, then every 1000 ms, and gives up (`VNET_ETIMEDOUT`) after `relay_timeout_ms` (default 10 s).
+6. **Over WebSocket** the TCP handshake already proved the address: there is no cookie field and no `RETRY`; the handshake is sent once, when the connection opens. Repeating the same request on the same connection returns the same `ROOM`; a different request on a connection that already has a session gets `ERROR(ALREADY_IN_ROOM)`; the same nonce on another connection gets `ERROR(NONCE_REUSED)`.
+7. A WebSocket connection must send `CREATE_ROOM` or `JOIN_ROOM` within 10 s (`HandshakeTimeout`) and as its first frame; anything else gets `ERROR(MALFORMED)` and the connection is closed. A browser cannot tell why a WebSocket failed to open (relay down, or HTTP 503 because this address has too many sockets pending right now), so the vnet browser backend retries a failed open five times over about 4 s before reporting `VNET_ECONNREFUSED`.
 
 `ERROR` answers over WebSocket leave the connection open (except as above), so a client may try another code. Failed attempts count against the per-source handshake limit.
 
@@ -85,22 +90,21 @@ The relay puts clients into **rooms** and forwards datagrams between the members
 ## Sessions, keepalive and timeouts
 
 - A **session** is one member of one room. Over UDP it is identified by its **token**, not by its source address: a frame bearing the token is accepted from any address, so a NAT rebinding does not break a session. *Where the relay sends* is a separate matter, see below. Over WebSocket the session lives as long as the connection.
-- `KEEPALIVE`: the client sends one about every 5 s (`keepalive_s` from `ROOM`); the relay answers with a one-byte `KEEPALIVE`. This keeps NAT mappings open, keeps the session alive, and lets the client notice a dead relay. The client sends the first one **as soon as it has its `ROOM`** and repeats it every 500 ms until the relay has answered or sent data (see below), then every `keepalive_s`. A client's own interval must be at most a third of the relay's session timeout (vnet accepts 100 to 5000 ms and clamps the relay's suggestion to 5 s).
-
-### Where the relay sends (address validation)
-
-The source address of a UDP datagram can be forged. If a session followed whatever source its token arrived from, anyone holding a token could aim the relay's output at a victim. So the relay only sends to an address that has **proved it receives**, QUIC-style:
-
-1. A UDP member starts **unvalidated**: until a frame bearing its token arrives *from the address its handshake came from*, the relay sends it nothing (not data, not even an expiry notice), and drops it after `UnvalidatedTimeout` (10 s). Only a host that received the `ROOM` knows the token, so only the real client can validate itself, which is why it sends its first `KEEPALIVE` immediately. A forged-source `CREATE_ROOM`/`JOIN_ROOM` therefore cannot make the relay send anything to the victim except the single `ROOM` reply (38 bytes, smaller than the request, rate-limited).
-2. A frame bearing the token from **another** source (a NAT rebinding) is processed (a token is the right to send), but does **not** move the session. The relay answers it with `PATH_CHALLENGE(cookie)` to that source: 9 bytes, always smaller than the frame that triggered it, at most one per session per second, and counted against the per-source reply limits.
-3. The client answers every `PATH_CHALLENGE` it gets from the relay with `PATH_RESPONSE(token, cookie)`, from the same socket (so from the new address). The relay moves the session to the source of a `PATH_RESPONSE` only if the cookie is the one it sent to *that* source, within 10 s, once. Anything else is dropped and counted.
-4. A repeated `CREATE_ROOM`/`JOIN_ROOM` (same nonce) from another address gets the same `ROOM` but does not move the session either.
-
-What an attacker with a stolen token can still do is send as that member and cause one 9-byte challenge per second at a spoofed address. It cannot steer the relay's traffic to an address that does not answer.
+- `KEEPALIVE`: the client sends one about every 5 s (`keepalive_s` from `ROOM`); the relay answers with a one-byte `KEEPALIVE`. This keeps NAT mappings open, keeps the session alive, and lets the client notice a dead relay. A client's own interval must be at most a third of the relay's session timeout (vnet accepts 100 to 5000 ms and clamps the relay's suggestion to 5 s).
 - **Relay side:** a session with no authenticated frame for 15 s (`SessionTimeout`; WebSocket pongs count) is dropped, and a UDP member is told with `ERROR(TIMEOUT)`. The relay pings WebSocket clients every 5 s; browsers answer pings by themselves, even in a background tab whose timers are throttled, so a hidden page keeps its session as long as the connection is up.
 - **Client side:** the vnet client declares the session lost (`VNET_ETIMEDOUT`) after three keepalive intervals without any frame from the relay, and `VNET_ECLOSED` on `ERROR(NO_SESSION | CLOSED | TIMEOUT)` or when the WebSocket closes.
 - `ERROR(NO_SESSION)` answers an authenticated-type frame (`KEEPALIVE`, `LEAVE`, `DATA`) whose token is unknown (expired, never issued, the relay restarted, or a WebSocket session's token used over UDP).
 - `LEAVE` is best effort over UDP (a lost `LEAVE` is just the 15 s timeout).
+
+### Where the relay sends (address validation)
+
+A UDP session's address is **proved when the session is created** (the handshake cookie, above) and afterwards moves only on proof:
+
+1. A frame bearing the token from a source other than the session's address (a NAT rebinding, or a forgery) is processed (a token is the right to send), but does **not** move the session. The relay answers it with `PATH_CHALLENGE(cookie)` to that source: 9 bytes, always smaller than the frame that triggered it, at most one per session per second, and counted against the per-source reply limits.
+2. The client answers every `PATH_CHALLENGE` it gets from the relay with `PATH_RESPONSE(token, cookie)`, from the same socket (so from the new address). The relay moves the session to the source of a `PATH_RESPONSE` only if the cookie is the one it sent to *that* source, within 10 s, once. Anything else is dropped and counted.
+3. The `ROOM` reply, and with it the token, is only ever sent to the address that echoed a handshake cookie. A request with a forged source never receives a cookie, so it never creates a session and never learns a token; and a second request with the same nonce from a real address learns nothing (point 4 of the handshake).
+
+An attacker who has stolen a token can send as that member, and can cause one 9-byte challenge per second at a spoofed address; it cannot make the relay's traffic go to an address that does not answer.
 
 ## Limits
 
@@ -111,14 +115,15 @@ All configurable; the defaults are in `relay/config.go`, the flags in `relay/cmd
 | members per room | 8 | `ERROR(ROOM_FULL)` |
 | rooms | 1000 | `ERROR(LIMIT)` on `CREATE_ROOM` |
 | members (and open WebSockets) | 20000 | `ERROR(LIMIT)`; WebSocket upgrade refused with HTTP 503 |
-| members per source address | 64 | `ERROR(LIMIT)` |
+| members per source address | 128 | `ERROR(LIMIT)` |
 | live rooms created per source address | 16 | `ERROR(LIMIT)` on `CREATE_ROOM` |
-| open WebSockets per source address / not yet in a room | 64 / 8 | HTTP 503 on the upgrade |
+| the same, for an IPv6 /48 (all /64s in it together) | 4 times the per-address caps | as above |
+| open WebSockets per source address / not yet in a room | 128 / 32 | HTTP 503 on the upgrade (the browser backend retries) |
 | payload | 1100 bytes | frame dropped |
 | per-client packets | 600/s, burst 1200 | frame dropped, counted (`rate_limited`) |
 | per-client bytes (whole frames) | 600000/s, burst 1200000 | frame dropped |
-| handshakes per source IP | 20/s, burst 50 | `ERROR(RATE)` if a reply is allowed, else silence |
-| replies to unauthenticated packets, per source IP | 20/s, burst 50 | no reply |
+| handshakes per source IP (counted only once a valid cookie has proved the source) | 20/s, burst 50 | `ERROR(RATE)` if a reply is allowed, else silence |
+| replies to unauthenticated packets (`RETRY`, `ERROR`, `ROOM`, `PATH_CHALLENGE`), per source IP | 40/s, burst 100 | no reply |
 | replies to unauthenticated packets, overall | 5000/s | no reply |
 | WebSocket send queue | 128 frames and 64 KiB | frames to that client dropped (`ws_queue_drops`) |
 | WebSocket write | 5 s | the connection is closed |
@@ -130,15 +135,17 @@ Limited frames are *dropped*, not queued: vnet is unreliable, and queueing behin
 
 The relay is a router for the members of a room, not a proxy and not a gateway to the internet.
 
-- **No forwarding to non-members.** A `DATA` frame is delivered only to a current member of the sender's room, found by the destination's last address byte *inside the sender's room*. The relay only ever sends to a member's own address, and over UDP only to one that has proved it receives there (see [address validation](#where-the-relay-sends-address-validation)): there is no code path from a frame to an arbitrary socket address.
+- **No forwarding to non-members.** A `DATA` frame is delivered only to a current member of the sender's room, found by the destination's last address byte *inside the sender's room*.
+- **Where the relay sends, precisely.** Every datagram the relay sends is addressed either (a) to the *address of a session*, which is the source of a handshake that echoed a cookie (so a host that received our `RETRY`), or a source that later answered a `PATH_CHALLENGE`; or (b) to the *source of the packet that triggered a reply*, in which case the reply is a `RETRY`, `ERROR`, `ROOM`, `PATH_CHALLENGE` or one-byte `KEEPALIVE`, never larger than the packet it answers (at most 38 bytes against at least 64 for a handshake), and for unproven sources rate-limited per source IP and overall. There is no way to make the relay send a *data* datagram, or a token, to an address that has not proved it receives. A forged source can draw small replies (b) at its victim, within those rate limits; it cannot draw state or data.
 - **Anti-reflection (UDP).** An attacker can spoof a victim's source address. So:
   - `CREATE_ROOM`/`JOIN_ROOM` datagrams must be **at least 64 bytes**; shorter ones get no reply and create no state. Every reply to an unauthenticated packet is at most 38 bytes, so the relay **never answers an unauthenticated packet with a larger one**. (`replyUnauth` also checks `reply <= request` itself.)
+  - A handshake without a valid cookie draws only a 26-byte `RETRY`, and no state.
   - Packets that are not valid frames get no reply at all.
-  - Replies to unauthenticated sources are rate-limited per source IP and overall (table above); a spoofing flood is mostly answered with silence.
+  - Replies to unauthenticated sources are rate-limited per source IP and overall (table above); a spoofing flood is mostly answered with silence. The price: someone who can forge a victim's address at more than a few dozen packets per second can use up that address's *reply* budget and keep the victim from starting a handshake while the flood lasts (no state remains afterwards).
   - Replies to *authenticated* frames (the one-byte `KEEPALIVE`) are smaller than their request, and need a valid token.
-- **Tokens.** 128 random bits from `crypto/rand`, one per session. They travel in clear text over UDP, like every UDP game protocol without encryption: anyone who can read a client's traffic can impersonate it. Use `wss://` for browsers; encryption of the UDP path is out of scope.
-- **The nonce is a credential.** The relay answers a repeat of a request's nonce with that session's `ROOM`, token included, so a guessable nonce would hand the session to whoever guessed it. Clients must draw it from a cryptographically secure source (vnet uses `getentropy()`, or `rand_s` on Windows, and **fails to create the context** rather than fall back to something weaker). 64 random bits.
-- **Capacity per source.** One address (IPv6: one /64, since a subscriber controls the whole prefix) can hold at most 64 members, 16 live rooms (counted until the room dies, not until its creator leaves), 64 open WebSockets and 8 WebSockets that have not entered a room yet; the handshake and reply rates are per the same key. Everyone behind one NAT shares these budgets (flags below). Source addresses of UDP handshakes can be forged, so these limits can be used to lock a victim's address out for a short time (an unvalidated session lives at most 10 s); a stateless retry token (as QUIC does) would remove that, and is not in version 1.
+- **Tokens.** 128 random bits from `crypto/rand`, one per session. They travel in clear text over UDP, like every UDP game protocol without encryption: anyone who can read a client's traffic can impersonate it. A token is only ever sent to the address that proved, with a cookie, that it receives there, so an attacker who merely forges a source address never learns one. Use `wss://` for browsers; encryption of the UDP path is out of scope.
+- **The nonce.** A repeat of a request's nonce is answered with that session's `ROOM`, token included, but only to the session's own address, so a guessed nonce is not enough to learn a token. Clients should still draw the nonce from a cryptographically secure source (vnet uses `getentropy()`, or `rand_s` on Windows, and **fails to create the context** rather than fall back to something weaker): a predictable nonce lets someone else claim it first.
+- **Capacity per source.** One address (IPv6: one /64) can hold at most 128 members, 16 live rooms (counted until the room dies, not until its creator leaves), 128 open WebSockets and 32 WebSockets that have not entered a room yet; the handshake and reply rates are per the same key. An IPv6 /48 (a whole site; a /56 or /64 from the same provider block sits inside one) is limited to 4 times those numbers in total, so a subscriber with many /64s cannot take the relay's room budget (`-max-rooms`) by itself. Because sessions and rooms exist only for sources that echoed a cookie, forged handshakes use none of these budgets. Everyone behind one NAT shares them, including carrier-grade NAT: 128 members is the cap for all players behind one public address (flags below).
 - **Relay-to-client frames carry no token.** The client accepts them only from the relay's address. An attacker who can forge the relay's source address *and* guess the client's port could inject `DATA` or end a session; this is inherent to unauthenticated UDP.
 - **Brute forcing codes.** 30-bit codes with at most 1000 live rooms, plus the per-IP handshake limit, makes guessing impractical but not impossible for a patient attacker with many addresses. Rooms are meant for casual games, not secrets.
 - **WebSocket.** `Origin` can be restricted (`-origins`); by default any origin may connect, because the relay has no ambient credentials to protect. Behind a reverse proxy, `-trust-forwarded-for` makes per-IP limits use the real client address, taken from the **rightmost** `X-Forwarded-For` entry (the one the proxy added; earlier entries are written by the client). Only enable it if the relay is reachable only through the proxy.
@@ -165,8 +172,9 @@ Other failures seen by a client: `VNET_ETIMEDOUT` (no answer, or the relay went 
 
 The vnet backends implement this; another client should:
 
-- generate a fresh nonce per attempt from a **cryptographically secure** source (it is a credential, see [Security properties](#security-properties)) and keep it across retries;
-- send a `KEEPALIVE` as soon as the `ROOM` arrives, repeat it every 500 ms until the relay answers (a `KEEPALIVE` back, or data), and answer every `PATH_CHALLENGE` with a `PATH_RESPONSE` from the same socket;
+- generate a fresh nonce per attempt from a **cryptographically secure** source (see [Security properties](#security-properties)) and keep it across retries;
+- over UDP, answer a `RETRY` (matching nonce, from the relay's address) at once by repeating the request with the cookie filled in, keep the cookie for later retransmissions, and replace it when a newer `RETRY` arrives;
+- answer every `PATH_CHALLENGE` with a `PATH_RESPONSE` from the same socket;
 - pad UDP handshakes to 64 bytes;
 - accept `ROOM`/`ERROR` only if the nonce matches during the handshake, and frames only from the relay's address;
 - send `KEEPALIVE` at the suggested interval and treat silence for three intervals as a lost session;
@@ -176,6 +184,6 @@ The vnet backends implement this; another client should:
 ## Versioning
 
 - The version byte is in `CREATE_ROOM`/`JOIN_ROOM` and echoed in `ROOM`/`ERROR`. This relay speaks **version 1** only; any other value gets `ERROR(BAD_VERSION)` carrying the relay's version.
-- `PATH_CHALLENGE`/`PATH_RESPONSE` and the unvalidated-until-proven rule are part of version 1 (it has not been released).
+- `RETRY` (with the cookie field of UDP `CREATE_ROOM`/`JOIN_ROOM`) and `PATH_CHALLENGE`/`PATH_RESPONSE` are part of version 1 (it has not been released).
 - Changes that keep old clients working (new optional frame types, new `ERROR` reasons, more trailing bytes in `ROOM`) stay at version 1: clients ignore frame types they do not know, and treat unknown error reasons as protocol errors. Anything else bumps the version. `VNET_MAX_DATAGRAM` (1100) is part of the ABI of every game and will not be raised.
 - Not in version 1, and left to later briefs: peer join/leave notifications, broadcast addresses, host migration, rejoin after a drop (Bit Riot brief 13), encryption, a WebTransport transport (vnet brief 11, which carries the same frames: control frames on a stream, `DATA` as datagrams).
