@@ -434,11 +434,12 @@ TEST_F(RelayIntegration, UnreachableRelayTimesOutOnVirtualTime) {
     vnet_destroy(v);
 }
 
-// A UDP forwarder that loses the first `drop_replies` datagrams the relay sends
-// back, so the client's CREATE reaches the relay several times.
+// A UDP forwarder that loses the first `drop_replies` datagrams of one type
+// (RETRY or ROOM) that the relay sends back, so the client's request reaches
+// the relay several times.
 class LossyProxy {
 public:
-    LossyProxy(uint16_t relay_port, int drop_replies) : drop_(drop_replies) {
+    LossyProxy(uint16_t relay_port, int drop_replies, uint8_t drop_type) : drop_(drop_replies), type_(drop_type) {
         fd_ = socket(AF_INET, SOCK_DGRAM, 0);
         sockaddr_in a{};
         a.sin_family = AF_INET;
@@ -483,7 +484,7 @@ private:
             if (p[1].revents & POLLIN) {
                 ssize_t n = recv(up_, buf, sizeof buf, 0);
                 if (n > 0 && have_client) {
-                    if (dropped_ < drop_) {
+                    if (n > 0 && buf[0] == type_ && dropped_ < drop_) {
                         dropped_++;
                     } else {
                         sendto(fd_, buf, (size_t)n, 0, (sockaddr *)&client, sizeof client);
@@ -496,6 +497,7 @@ private:
     uint16_t port_;
     sockaddr_in relay_{};
     int drop_;
+    uint8_t type_;
     std::atomic<int> requests_{0}, dropped_{0};
     std::atomic<bool> stop_{false};
     std::thread th_;
@@ -503,7 +505,7 @@ private:
 
 TEST_F(RelayIntegration, LostRepliesCauseRetriesButNeverASecondRoomOrMember) {
     RelayProc relay;
-    LossyProxy proxy(relay.udp_port(), 2);  // the first two ROOM replies are lost
+    LossyProxy proxy(relay.udp_port(), 2, RELAY_T_ROOM);  // the first two ROOM replies are lost
     std::string via = "127.0.0.1:" + std::to_string(proxy.port());
     vnet *host = RelayClientFor(via, nullptr);
     ASSERT_NE(host, nullptr);
@@ -518,7 +520,7 @@ TEST_F(RelayIntegration, LostRepliesCauseRetriesButNeverASecondRoomOrMember) {
     EXPECT_EQ(Str(st.self), "10.0.0.1:0");
 
     // The same for JOIN_ROOM: the joiner takes one address, not several.
-    LossyProxy proxy2(relay.udp_port(), 2);
+    LossyProxy proxy2(relay.udp_port(), 2, RELAY_T_ROOM);
     std::string via2 = "127.0.0.1:" + std::to_string(proxy2.port());
     vnet *guest = RelayClientFor(via2, st.room);
     ASSERT_NE(guest, nullptr);
@@ -625,6 +627,28 @@ bool SendUntilReceived(vnet *a, int sa, const std::string &text, const vnet_addr
         }
     }
     return false;
+}
+
+TEST_F(RelayIntegration, LostRetryRepliesAreJustRetriedAndKeepNoStateAtTheRelay) {
+    RelayProc relay;
+    LossyProxy proxy(relay.udp_port(), 3, RELAY_T_RETRY);  // the first three RETRYs are lost
+    std::string via = "127.0.0.1:" + std::to_string(proxy.port());
+    vnet *host = RelayClientFor(via, nullptr);
+    ASSERT_NE(host, nullptr);
+    // While the RETRYs are being lost the relay has created nothing at all.
+    for (int i = 0; i < 20; i++) {
+        vnet_poll(host);
+        if (proxy.dropped() >= 3) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(relay.Stat("rooms_created"), 0);
+    EXPECT_EQ(relay.Stat("sessions"), 0);
+    ASSERT_EQ(Settle(host), VNET_STATUS_READY);
+    EXPECT_EQ(proxy.dropped(), 3);
+    EXPECT_EQ(relay.Stat("rooms_created"), 1);
+    EXPECT_EQ(relay.Stat("sessions"), 1);
+    EXPECT_GE(relay.Stat("retries_sent"), 4);
+    vnet_destroy(host);
 }
 
 TEST_F(RelayIntegration, SessionSurvivesNatRebindingBecauseTheTokenIsTheIdentity) {

@@ -56,16 +56,10 @@ protected:
         tp.state = RELAY_TP_OPEN;
         vnet_poll(v);
     }
-    // Enter the room; the client says "I am here" at once (KEEPALIVE) and the
-    // relay answers, which ends the client's fast repeats.
     void Enter(int octet = 1) {
         tp.in.push_back(RoomFrame(tp.out.at(0), octet, "WXYZ23"));
         vnet_poll(v);
         ASSERT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
-        ASSERT_EQ(tp.out.size(), 2u);
-        ASSERT_EQ(tp.out[1], B({RELAY_T_KEEPALIVE}));
-        tp.in.push_back(B({RELAY_T_KEEPALIVE}));
-        vnet_poll(v);
     }
     ScriptTp tp;
     TestClockState clk;
@@ -100,6 +94,20 @@ TEST_F(RelayWsStyle, HandshakeIsUnpaddedAndSentOnce) {
     EXPECT_EQ(tp.out.size(), 1u) << "no retransmission over a reliable transport";
 }
 
+TEST_F(RelayWsStyle, NeverUsesTheStatelessRetry) {
+    // A WebSocket proved its address with the TCP handshake: no cookie field,
+    // and a RETRY (which a WebSocket relay never sends) changes nothing.
+    v = Make();
+    Open();
+    ASSERT_EQ(tp.out.size(), 1u);
+    Bytes retry{RELAY_T_RETRY, RELAY_PROTO_VERSION};
+    retry.insert(retry.end(), tp.out[0].begin() + 2, tp.out[0].begin() + 10);
+    retry.insert(retry.end(), 16, 0x33);
+    tp.in.push_back(retry);
+    vnet_poll(v);
+    EXPECT_EQ(tp.out.size(), 1u);
+}
+
 TEST_F(RelayWsStyle, JoinFrame) {
     v = Make("k7m2qx");
     Open();
@@ -115,17 +123,17 @@ TEST_F(RelayWsStyle, FramesCarryNoToken) {
     Enter(1);
     int s = vnet_open(v, 4000);
     ASSERT_EQ(Send(v, s, "abc", A("10.0.0.2:5000")), 3);
-    ASSERT_EQ(tp.out.size(), 3u);
+    ASSERT_EQ(tp.out.size(), 2u);
     Bytes want = B({RELAY_T_DATA, 10, 0, 0, 2, 0x13, 0x88, 0x0f, 0xa0, 'a', 'b', 'c'});
-    EXPECT_EQ(tp.out[2], want);
+    EXPECT_EQ(tp.out[1], want);
     clk.now += 5000;
     vnet_poll(v);
-    ASSERT_EQ(tp.out.size(), 4u);
-    EXPECT_EQ(tp.out[3], B({RELAY_T_KEEPALIVE}));
+    ASSERT_EQ(tp.out.size(), 3u);
+    EXPECT_EQ(tp.out[2], B({RELAY_T_KEEPALIVE}));
     vnet_destroy(v);
     v = nullptr;
-    ASSERT_EQ(tp.out.size(), 5u);
-    EXPECT_EQ(tp.out[4], B({RELAY_T_LEAVE}));
+    ASSERT_EQ(tp.out.size(), 4u);
+    EXPECT_EQ(tp.out[3], B({RELAY_T_LEAVE}));
     EXPECT_TRUE(tp.destroyed);
 }
 

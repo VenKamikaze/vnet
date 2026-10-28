@@ -16,7 +16,6 @@
 #define HANDSHAKE_RETRY_FIRST_MS 250u
 #define HANDSHAKE_RETRY_MAX_MS 1000u
 #define MAX_FRAMES_PER_POLL 2048
-#define KEEPALIVE_UNCONFIRMED_MS 500u
 #define KEEPALIVE_MIN_MS 100
 #define KEEPALIVE_MAX_MS 5000  /* a third of the relay's default 15 s session timeout */
 
@@ -48,6 +47,7 @@ typedef struct rc_state {
     int is_join;
     char want_code[RELAY_CODE_LEN + 1];
     int hs_sent;
+    uint8_t hs_cookie[RELAY_HS_COOKIE_LEN];  // from RETRY (UDP): proves our address to the relay
     uint64_t hs_next;      // when to resend (UDP style)
     unsigned hs_backoff;
 
@@ -60,7 +60,6 @@ typedef struct rc_state {
     unsigned hs_timeout_ms;
     unsigned keepalive_ms;
     uint64_t ka_next;
-    int ka_confirmed;      // the relay has answered since we entered the room
     uint64_t last_rx;
 
     rc_sock *socks;
@@ -132,7 +131,14 @@ static void send_handshake(vnet *v, rc_state *st) {
         memcpy(buf + n, st->want_code, RELAY_CODE_LEN);
         n += RELAY_CODE_LEN;
     }
-    if (st->udp_style) n = RELAY_MIN_UDP_HANDSHAKE;  // padded: replies are always smaller
+    if (st->udp_style) {
+        // The relay keeps no state for a source that has not shown it receives
+        // there: the first request draws a RETRY with a cookie, and the repeat
+        // carries it (zeros until then). The datagram is padded so that every
+        // reply to it is smaller.
+        memcpy(buf + n, st->hs_cookie, RELAY_HS_COOKIE_LEN);
+        n = RELAY_MIN_UDP_HANDSHAKE;
+    }
     int rc = st->ops->send(st->tp, buf, n);
     if (rc < 0) vnet__logf(v, VNET_LOG_DEBUG, "handshake send failed (%d)", rc);
 }
@@ -184,14 +190,6 @@ static void queue_data(vnet *v, rc_state *st, const uint8_t *p, size_t n) {
     q->from.port = sport;
 }
 
-// The relay has answered since we entered the room: it knows we receive here.
-// Stop the fast repeats and go to the regular keepalive interval.
-static void confirm_path(rc_state *st, uint64_t now) {
-    if (st->ka_confirmed) return;
-    st->ka_confirmed = 1;
-    st->ka_next = now + st->keepalive_ms;
-}
-
 static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint64_t now) {
     if (n == 0) return;
     switch (p[0]) {
@@ -215,11 +213,7 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
                 if (st->keepalive_ms > KEEPALIVE_MAX_MS) st->keepalive_ms = KEEPALIVE_MAX_MS;  // never let a relay's suggestion outlast its own timeout
             }
             st->phase = RC_READY;
-            // The relay sends nothing to a UDP member until a frame bearing
-            // its token has arrived from the address it joined from: say so
-            // at once, and repeat until the relay answers.
-            st->ka_next = now;
-            st->ka_confirmed = 0;
+            st->ka_next = now + st->keepalive_ms;
             vnet__logf(v, VNET_LOG_INFO, "entered room %s as 10.0.0.%u", st->code, st->octet);
             break;
         case RELAY_T_ERROR: {
@@ -236,9 +230,17 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
             break;
         }
         case RELAY_T_KEEPALIVE:
-            if (n == 1 && st->phase == RC_READY) {
+            if (n == 1 && st->phase == RC_READY) st->last_rx = now;
+            break;
+        case RELAY_T_RETRY:
+            // Stateless retry: the relay wants proof that we receive at our
+            // address before it creates anything. Repeat the request with the
+            // cookie. (Only from the relay's address: the transport checks.)
+            if (n == RELAY_RETRY_LEN && p[1] == RELAY_PROTO_VERSION && st->phase == RC_HANDSHAKE &&
+                st->udp_style && memcmp(p + 2, st->nonce, RELAY_NONCE_LEN) == 0) {
+                memcpy(st->hs_cookie, p + 2 + RELAY_NONCE_LEN, RELAY_HS_COOKIE_LEN);
                 st->last_rx = now;
-                confirm_path(st, now);
+                send_handshake(v, st);
             }
             break;
         case RELAY_T_PATH_CHALLENGE:
@@ -259,7 +261,6 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
         case RELAY_T_DATA:
             if (st->phase != RC_READY) return;
             st->last_rx = now;
-            confirm_path(st, now);  // the relay only sends data to a validated member
             queue_data(v, st, p, n);
             break;
         default:
@@ -429,8 +430,7 @@ static void rc_poll(vnet *v) {
             fail(v, st, VNET_ETIMEDOUT);
         } else if (now >= st->ka_next) {
             send_simple(v, st, RELAY_T_KEEPALIVE);
-            st->ka_next = now + (st->ka_confirmed || st->keepalive_ms < KEEPALIVE_UNCONFIRMED_MS
-                                     ? st->keepalive_ms : KEEPALIVE_UNCONFIRMED_MS);
+            st->ka_next = now + st->keepalive_ms;
         }
     }
 }

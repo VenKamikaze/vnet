@@ -29,12 +29,60 @@ typedef struct inbox_frame {
     uint8_t data[RELAY_MAX_FRAME];
 } inbox_frame;
 
+// A browser cannot tell why a WebSocket failed to open: a relay that is down
+// and a relay that answered HTTP 503 (this address has too many sockets
+// pending right now, which clears within milliseconds) look the same. So a
+// failure before the socket ever opened is retried a few times with backoff,
+// ~3.75 s in all, before it is reported as "relay unreachable".
+#define CONNECT_RETRIES 5
+#define CONNECT_BACKOFF_FIRST_MS 250.0
+#define CONNECT_BACKOFF_MAX_MS 1000.0
+
 typedef struct ws_tp {
     EMSCRIPTEN_WEBSOCKET_T ws;
     int state;  // RELAY_TP_*
     int head, count;
     inbox_frame *inbox;
+    char url[512];
+    int attempts;        // failed attempts to open so far
+    int retry_pending;   // a reconnect is scheduled
+    double next_try_ms;  // emscripten_get_now() time
+    double backoff_ms;
 } ws_tp;
+
+static EM_BOOL on_open(int type, const EmscriptenWebSocketOpenEvent *e, void *user);
+static EM_BOOL on_error(int type, const EmscriptenWebSocketErrorEvent *e, void *user);
+static EM_BOOL on_close(int type, const EmscriptenWebSocketCloseEvent *e, void *user);
+static EM_BOOL on_message(int type, const EmscriptenWebSocketMessageEvent *e, void *user);
+
+static int open_socket(ws_tp *t) {
+    EmscriptenWebSocketCreateAttributes attr;
+    emscripten_websocket_init_create_attributes(&attr);
+    attr.url = t->url;
+    t->ws = emscripten_websocket_new(&attr);
+    if (t->ws <= 0) {
+        t->ws = 0;
+        return -1;
+    }
+    emscripten_websocket_set_onopen_callback(t->ws, t, on_open);
+    emscripten_websocket_set_onerror_callback(t->ws, t, on_error);
+    emscripten_websocket_set_onclose_callback(t->ws, t, on_close);
+    emscripten_websocket_set_onmessage_callback(t->ws, t, on_message);
+    return 0;
+}
+
+// The socket failed or closed. Before it ever opened that may be retried.
+static void failed(ws_tp *t) {
+    if (t->state == RELAY_TP_FAILED || t->retry_pending) return;
+    if (t->state == RELAY_TP_CONNECTING && t->attempts < CONNECT_RETRIES) {
+        t->attempts++;
+        t->retry_pending = 1;
+        t->next_try_ms = emscripten_get_now() + t->backoff_ms;
+        t->backoff_ms = t->backoff_ms * 2 > CONNECT_BACKOFF_MAX_MS ? CONNECT_BACKOFF_MAX_MS : t->backoff_ms * 2;
+        return;
+    }
+    t->state = RELAY_TP_FAILED;
+}
 
 static EM_BOOL on_open(int type, const EmscriptenWebSocketOpenEvent *e, void *user) {
     (void)type;
@@ -47,14 +95,14 @@ static EM_BOOL on_open(int type, const EmscriptenWebSocketOpenEvent *e, void *us
 static EM_BOOL on_error(int type, const EmscriptenWebSocketErrorEvent *e, void *user) {
     (void)type;
     (void)e;
-    ((ws_tp *)user)->state = RELAY_TP_FAILED;
+    failed(user);
     return EM_TRUE;
 }
 
 static EM_BOOL on_close(int type, const EmscriptenWebSocketCloseEvent *e, void *user) {
     (void)type;
     (void)e;
-    ((ws_tp *)user)->state = RELAY_TP_FAILED;
+    failed(user);
     return EM_TRUE;
 }
 
@@ -70,7 +118,17 @@ static EM_BOOL on_message(int type, const EmscriptenWebSocketMessageEvent *e, vo
     return EM_TRUE;
 }
 
-static int tp_state(void *p) { return ((ws_tp *)p)->state; }
+static int tp_state(void *p) {
+    ws_tp *t = p;
+    if (t->retry_pending && emscripten_get_now() >= t->next_try_ms) {
+        // Deleting here (not in the callback) is safe, and stops late events
+        // from the failed socket.
+        emscripten_websocket_delete(t->ws);
+        t->retry_pending = 0;
+        if (open_socket(t) != 0) t->state = RELAY_TP_FAILED;
+    }
+    return t->state;
+}
 
 static int tp_send(void *p, const uint8_t *frame, size_t len) {
     ws_tp *t = p;
@@ -122,20 +180,18 @@ int vnet__relay_ws_init(vnet *v, const vnet_config *cfg) {
         return VNET_ENOMEM;
     }
     t->state = RELAY_TP_CONNECTING;
-    EmscriptenWebSocketCreateAttributes attr;
-    emscripten_websocket_init_create_attributes(&attr);
-    attr.url = cfg->relay;
-    t->ws = emscripten_websocket_new(&attr);
-    if (t->ws <= 0) {
+    t->backoff_ms = CONNECT_BACKOFF_FIRST_MS;
+    size_t urllen = strlen(cfg->relay);
+    if (urllen >= sizeof t->url) {
+        tp_destroy(t);
+        return VNET_EINVAL;
+    }
+    memcpy(t->url, cfg->relay, urllen + 1);
+    if (open_socket(t) != 0) {
         vnet__logf(v, VNET_LOG_ERROR, "cannot create WebSocket for \"%s\"", cfg->relay);
-        t->ws = 0;
         tp_destroy(t);
         return VNET_ECONNREFUSED;
     }
-    emscripten_websocket_set_onopen_callback(t->ws, t, on_open);
-    emscripten_websocket_set_onerror_callback(t->ws, t, on_error);
-    emscripten_websocket_set_onclose_callback(t->ws, t, on_close);
-    emscripten_websocket_set_onmessage_callback(t->ws, t, on_message);
     return vnet__relay_init(v, cfg, &ws_ops, t);
 }
 

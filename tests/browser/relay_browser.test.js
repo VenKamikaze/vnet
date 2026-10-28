@@ -186,6 +186,33 @@ async function main() {
       await bad.ctx.close();
     }
 
+    // 5. A relay that answers 503 because this address has too many sockets
+    // pending (many browsers behind one NAT): the page retries and gets in.
+    console.log('503 on connect is retried');
+    {
+      const busy = await startRelay(['-max-pending-ws-per-ip', '1']);
+      try {
+        const busyWs = `ws://${busy.http}/vnet`;
+        // Hold the only pending slot with a socket that never says anything.
+        const hold = new WebSocket(busyWs);
+        await new Promise((res, rej) => { hold.onopen = res; hold.onerror = () => rej(new Error('hold socket failed')); });
+        const page = await openPeerPage(browser, webOrigin, busyWs, null);
+        let refused = 0;
+        for (let i = 0; i < 300 && refused < 1; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+          refused = (await getJSON(busy.stats, '/stats')).ws_refused;
+        }
+        check(refused >= 1, `the relay refused the page's first connection (${refused} refusals)`);
+        hold.close();  // the slot frees; the page's retry gets in
+        const { code, line } = await pageRoom(page);
+        check(/ 10\.0\.0\.1:0 relay-ws$/.test(line), `the page got into room ${code} after being refused`);
+        check(page.errors.length === 0, 'no page errors');
+        await page.ctx.close();
+      } finally {
+        busy.child.kill('SIGTERM');
+      }
+    }
+
     // Closing a page closes its WebSocket; the relay notices asynchronously.
     let st = await getJSON(relay.stats, '/stats');
     for (let i = 0; i < 500 && st.sessions !== 0; i++) {

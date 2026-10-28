@@ -44,20 +44,9 @@ protected:
         }
     }
 
-    // Enter the room. A client says "I receive here" at once (the relay sends
-    // a UDP member nothing before that); like a relay, answer it, which stops
-    // the client's fast repeats. Pass confirm=false to look at that phase.
-    void Enter(int octet = 1, const char *code = "ABCDEF", int max_members = 8, int keepalive_s = 5,
-               bool confirm = true) {
+    void Enter(int octet = 1, const char *code = "ABCDEF", int max_members = 8, int keepalive_s = 5) {
         relay.Send(RoomFrame(req, octet, code, max_members, keepalive_s));
         ASSERT_TRUE(PollUntilState(VNET_STATUS_READY));
-        Bytes ka;
-        ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka)) << "no immediate KEEPALIVE after ROOM";
-        ASSERT_EQ(ka.size(), (size_t)(1 + RELAY_TOKEN_LEN));
-        if (confirm) {
-            relay.Send(Bytes{RELAY_T_KEEPALIVE});
-            vnet_poll(v);
-        }
     }
 
     // Poll until the client has received `n` more datagrams on socket s.
@@ -518,43 +507,86 @@ TEST_F(RelayClient, ConfiguredKeepaliveWins) {
     EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
 }
 
-TEST_F(RelayClient, SaysItIsThereAtOnceAndRepeatsUntilTheRelayAnswers) {
-    // The relay sends a UDP member nothing until a frame bearing its token has
-    // arrived from its address. The first KEEPALIVE comes with the ROOM, and
-    // it repeats every 500 ms (not every 5 s) until the relay has answered.
+// ---------------------------------------------- stateless retry (cookie)
+
+TEST_F(RelayClient, TheFirstRequestHasNoCookieAndTheRepeatCarriesTheRetryCookie) {
     Start();
-    Enter(1, "ABCDEF", 8, 5, /*confirm=*/false);  // consumed the first one
-    Bytes b;
-    clk.now += 499;
+    // Layout: fields, then 16 cookie bytes (zero on the first attempt), then padding.
+    ASSERT_EQ(req.size(), (size_t)RELAY_MIN_UDP_HANDSHAKE);
+    EXPECT_EQ(Bytes(req.begin() + 10, req.begin() + 26), Bytes(16, 0));
+    Bytes cookie{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    Bytes retry{RELAY_T_RETRY, RELAY_PROTO_VERSION};
+    retry.insert(retry.end(), req.begin() + 2, req.begin() + 10);
+    retry.insert(retry.end(), cookie.begin(), cookie.end());
+    ASSERT_EQ(retry.size(), (size_t)RELAY_RETRY_LEN);
+    relay.Send(retry);
     vnet_poll(v);
-    EXPECT_FALSE(relay.TryRecv(&b));
-    clk.now += 1;
+    Bytes again;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &again));
+    ASSERT_EQ(again.size(), (size_t)RELAY_MIN_UDP_HANDSHAKE);
+    EXPECT_EQ(Bytes(again.begin() + 10, again.begin() + 26), cookie);
+    // Everything else is the same request (same nonce).
+    EXPECT_EQ(Bytes(again.begin(), again.begin() + 10), Bytes(req.begin(), req.begin() + 10));
+    // The later retransmissions keep the cookie...
+    clk.now += 250;
     vnet_poll(v);
-    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
-    clk.now += 500;
+    Bytes rt;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &rt));
+    EXPECT_EQ(Bytes(rt.begin() + 10, rt.begin() + 26), cookie);
+    // ...and a fresh RETRY (the cookie expired) replaces it.
+    Bytes cookie2(16, 0x77);
+    for (size_t i = 0; i < 16; i++) retry[10 + i] = 0x77;
+    relay.Send(retry);
     vnet_poll(v);
-    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
-    // The answer ends the fast repeats: the next one is a regular interval away.
-    relay.Send(Bytes{RELAY_T_KEEPALIVE});
-    vnet_poll(v);
-    clk.now += 4999;
-    vnet_poll(v);
-    EXPECT_FALSE(relay.TryRecv(&b));
-    clk.now += 1;
-    vnet_poll(v);
-    EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+    ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &rt));
+    EXPECT_EQ(Bytes(rt.begin() + 10, rt.begin() + 26), cookie2);
+    // The full exchange ends in a room.
+    relay.Send(RoomFrame(rt, 1, "ABCDEF"));
+    ASSERT_TRUE(PollUntilState(VNET_STATUS_READY));
 }
 
-TEST_F(RelayClient, DataFromTheRelayAlsoMeansThePathIsConfirmed) {
-    Start();
-    Enter(1, "ABCDEF", 8, 5, /*confirm=*/false);
-    int s = vnet_open(v, 4000);
-    relay.Send(DataToClient(2, 4000, 1, Bytes{1}));  // the relay only sends data to a validated member
-    Bytes b;
-    ASSERT_TRUE(RecvOne(s, &b));
-    clk.now += 2000;
+TEST_F(RelayClient, JoinRepeatsCarryTheCookieAfterTheCode) {
+    Start("abcdef");
+    EXPECT_EQ(Bytes(req.begin() + 16, req.begin() + 32), Bytes(16, 0));
+    Bytes retry{RELAY_T_RETRY, RELAY_PROTO_VERSION};
+    retry.insert(retry.end(), req.begin() + 2, req.begin() + 10);
+    retry.insert(retry.end(), 16, 0x5A);
+    relay.Send(retry);
     vnet_poll(v);
-    EXPECT_FALSE(relay.TryRecv(&b)) << "still repeating after the relay delivered data";
+    Bytes again;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_JOIN, &again));
+    EXPECT_EQ(std::string(again.begin() + 10, again.begin() + 16), "ABCDEF");
+    EXPECT_EQ(Bytes(again.begin() + 16, again.begin() + 32), Bytes(16, 0x5A));
+}
+
+TEST_F(RelayClient, IgnoresRetriesThatAreNotForItsRequest) {
+    Start();
+    Bytes good{RELAY_T_RETRY, RELAY_PROTO_VERSION};
+    good.insert(good.end(), req.begin() + 2, req.begin() + 10);
+    good.insert(good.end(), 16, 0x11);
+    Bytes other_nonce = good;
+    other_nonce[4] ^= 0xFF;
+    Bytes bad_ver = good;
+    bad_ver[1] = 9;
+    Bytes short_one(good.begin(), good.end() - 1);
+    Bytes long_one = good;
+    long_one.push_back(0);
+    relay.SpoofFrom(good);  // not from the relay's address
+    for (const Bytes &b : {other_nonce, bad_ver, short_one, long_one}) relay.Send(b);
+    vnet_poll(v);
+    Bytes b;
+    EXPECT_FALSE(relay.TryRecv(&b)) << "the client answered a RETRY that was not for it";
+    // A good one afterwards works, and carries only its own cookie.
+    relay.Send(good);
+    vnet_poll(v);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &b));
+    EXPECT_EQ(Bytes(b.begin() + 10, b.begin() + 26), Bytes(16, 0x11));
+    // Once in a room a RETRY means nothing.
+    relay.Send(RoomFrame(req, 1, "ABCDEF"));
+    ASSERT_TRUE(PollUntilState(VNET_STATUS_READY));
+    relay.Send(good);
+    vnet_poll(v);
+    EXPECT_FALSE(relay.TryRecv(&b));
 }
 
 TEST_F(RelayClient, AnswersAPathChallengeFromTheSameSocketWithTokenAndCookie) {
@@ -622,57 +654,45 @@ TEST_F(RelayClient, ARelaySuggestionLongerThanItsOwnTimeoutIsClamped) {
     EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
 }
 
-// The handshake nonce is a credential, so it must come from a secure source
-// and a missing source must be an error, not a weaker nonce.
-struct RandomHookGuard {
-    explicit RandomHookGuard(int (*f)(void *, size_t)) { vnet__random_hook = f; }
-    ~RandomHookGuard() { vnet__random_hook = nullptr; }
-};
-
-TEST_F(RelayClient, NoSecureRandomSourceMeansNoSession) {
-    RandomHookGuard g([](void *, size_t) { return -1; });
-    int err = 0;
-    vnet *c = Create(nullptr, 0, 0, &err);
-    EXPECT_EQ(c, nullptr);
-    EXPECT_EQ(err, VNET_EIO);
-    Bytes b;
-    EXPECT_FALSE(relay.TryRecv(&b)) << "a handshake was sent without a nonce";
-}
-
+// The handshake nonce is a credential (a repeat of it is answered with the
+// session's ROOM), so it must come from a secure source, and a missing source
+// must be an error, never a weaker nonce. The OS source is replaced through a
+// link-time seam (getentropy, Linux), not through a hook in the library.
 #if defined(VNET_TEST_FAKE_ENTROPY)
 extern "C" int g_getentropy_errno;
+extern "C" int g_getentropy_fill;
 
-// The real OS source failing (not the test hook): no weaker nonce is invented.
 TEST_F(RelayClient, WhenTheOsRandomSourceFailsCreateFailsInsteadOfUsingAWeakNonce) {
     g_getentropy_errno = EIO;
     int err = 0;
     vnet *c = Create(nullptr, 0, 0, &err);
+    uint8_t a[8] = {};
+    int rc = vnet__random(a, sizeof a);
     g_getentropy_errno = 0;
     EXPECT_EQ(c, nullptr);
     EXPECT_EQ(err, VNET_EIO);
+    EXPECT_EQ(rc, -1);
     Bytes b;
-    EXPECT_FALSE(relay.TryRecv(&b));
+    EXPECT_FALSE(relay.TryRecv(&b)) << "a handshake was sent without a nonce";
+}
+
+TEST_F(RelayClient, AKernelWithoutGetentropyUsesTheStrongDeviceFile) {
     uint8_t a[8] = {}, d[8] = {};
-    g_getentropy_errno = EIO;
-    EXPECT_EQ(vnet__random(a, sizeof a), -1);
-    g_getentropy_errno = 0;
-    // A kernel without getentropy() falls back to the CSPRNG device file, still strong.
     g_getentropy_errno = ENOSYS;
-    EXPECT_EQ(vnet__random(a, sizeof a), 0);
-    EXPECT_EQ(vnet__random(d, sizeof d), 0);
+    int r1 = vnet__random(a, sizeof a), r2 = vnet__random(d, sizeof d);
     g_getentropy_errno = 0;
+    EXPECT_EQ(r1, 0);
+    EXPECT_EQ(r2, 0);
     EXPECT_NE(memcmp(a, d, sizeof a), 0);
 }
-#endif
 
-TEST_F(RelayClient, TheNonceComesFromTheRandomSource) {
-    RandomHookGuard g([](void *p, size_t n) {
-        for (size_t i = 0; i < n; i++) static_cast<uint8_t *>(p)[i] = (uint8_t)(0xC0 + i);
-        return 0;
-    });
+TEST_F(RelayClient, TheNonceComesFromTheOsRandomSource) {
+    g_getentropy_fill = 0xC0;
     Start();
+    g_getentropy_fill = -1;
     EXPECT_EQ(Bytes(req.begin() + 2, req.begin() + 10), Bytes({0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7}));
 }
+#endif
 
 TEST_F(RelayClient, NoncesDoNotRepeat) {
     std::set<Bytes> seen;

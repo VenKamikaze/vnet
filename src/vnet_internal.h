@@ -85,8 +85,6 @@ void vnet__imp_purge_socket(vnet *v, int s);
 // credential (whoever repeats it gets the session's ROOM and token), so it
 // must be unpredictable.
 int vnet__random(void *buf, size_t n);
-// Test seam: when non-NULL it replaces the OS source.
-extern int (*vnet__random_hook)(void *buf, size_t n);
 
 // Relay client (relay_client.c). A relay backend is a framing/state-machine
 // core plus a transport that moves whole frames: UDP datagrams (relay_udp.c)

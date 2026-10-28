@@ -24,10 +24,7 @@ extern int getentropy(void *buffer, size_t length);
 #endif
 #endif
 
-int (*vnet__random_hook)(void *buf, size_t n) = NULL;
-
 int vnet__random(void *buf, size_t n) {
-    if (vnet__random_hook) return vnet__random_hook(buf, n);
     if (n > 256) return -1;
     uint8_t *p = buf;
 #if defined(_WIN32)
