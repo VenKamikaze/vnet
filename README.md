@@ -8,9 +8,11 @@ Virtual UDP for games: a small, dependency-free C11 library with a non-blocking 
 | in-process loopback (`VNET_BACKEND_LOOPBACK`) | deterministic multi-peer tests in one thread |
 | relay over UDP (`VNET_BACKEND_RELAY_UDP`) | native clients in shared rooms with virtual addresses `10.0.0.N` |
 | relay over WebSocket (`VNET_BACKEND_RELAY_WS`) | browser (Emscripten) clients, in the same rooms as native ones |
+| relay over WebTransport (`VNET_BACKEND_RELAY_WT`) | browser clients with real unreliable datagrams (no head-of-line blocking) |
+| browser auto (`VNET_BACKEND_RELAY_AUTO`) | WebTransport where it works, WebSocket where it does not; same game code |
 | impairment layer | latency, jitter, loss, duplication, reordering on top of any backend |
 
-The relay itself is a small Go server in [`relay/`](relay/README.md); its wire protocol is in [`doco/relay-protocol.md`](doco/relay-protocol.md). A WebTransport backend is planned (see [`doco/`](doco/README.md)).
+The relay itself is a small Go server in [`relay/`](relay/README.md); its wire protocol is in [`doco/relay-protocol.md`](doco/relay-protocol.md). Work briefs and decisions are in [`doco/`](doco/README.md).
 
 vnet carries **unreliable, unordered datagrams only** (at most `VNET_MAX_DATAGRAM` = 1100 bytes). Reliability and ordering are the game protocol's job. Nothing blocks, there are no threads and no global state, and steady-state send/receive does not allocate.
 
@@ -109,6 +111,37 @@ Everything after setup is the usual API: sockets are local ports, destinations a
 scripts/setup-emsdk.sh                 # once: installs emsdk into .emsdk (git clone + pinned release)
 scripts/test-browser.sh                # builds relay, native peer and wasm page; runs Chromium via Playwright
 ```
+
+## Transports compared
+
+How a client reaches the relay (and, for completeness, a peer directly). Pick `VNET_BACKEND_RELAY_AUTO` in browser builds unless you know better; a game written for it needs no changes to run over either browser transport.
+
+| | Native UDP (`RELAY_UDP`) | WebSocket (`RELAY_WS`) | WebTransport (`RELAY_WT`) |
+|---|---|---|---|
+| Runs in | native programs | browsers (Emscripten) | browsers (Emscripten) |
+| Semantics | unreliable datagrams | **reliable, ordered** byte stream carrying datagram-sized messages; one lost TCP segment delays everything behind it (head-of-line blocking) | unreliable datagrams (QUIC); a lost datagram is lost and delays nothing |
+| What the game sees | datagrams may be lost, duplicated, reordered | the same API, but nothing is ever lost or reordered unless the relay drops it (do not rely on that) | datagrams may be lost, reordered (rarely duplicated) |
+| Browser support | n/a | all | Chrome/Edge 97+, Firefox 114+, Safari 26.4+ (macOS, iOS): [Baseline](https://web-platform-dx.github.io/web-features/) "newly available" since 2026-03-24, not yet "widely available"; `serverCertificateHashes` (used for local development) is Chrome/Edge 100+, Firefox 125+, Safari 26.4+ |
+| Relay port | UDP 7777 | TCP 8080, or 443 behind a TLS proxy | UDP (443 or any), HTTP/3 |
+| TLS | none (the UDP path is not encrypted) | `wss://` via a reverse proxy (Caddy, nginx) | built in (QUIC); needs a certificate the browser trusts |
+| Hosting needs | open a UDP port | any HTTP proxy | a public CA certificate, a UDP port the network lets through (some corporate networks and mobile carriers block outgoing UDP/443), the relay itself terminating QUIC (no proxy in front) |
+| Local development | `-udp 127.0.0.1:7777` | `ws://127.0.0.1:8080/vnet` | `-wt 127.0.0.1:4433 -dev-cert`, hash passed as `relay_cert_sha256` |
+| Max datagram | `VNET_MAX_DATAGRAM` (1100) | 1100 | 1100 (a browser's `maxDatagramSize` may report less; vnet checks what really fits) |
+| Connection setup | 1 round trip (+1 for the stateless retry) | TCP + TLS + HTTP upgrade | QUIC + TLS 1.3 + one Retry round trip + HTTP/3 `CONNECT` |
+| Falls back to | n/a | n/a | `RELAY_AUTO` falls back to WebSocket on error, timeout (`wt_timeout_ms`, 3 s) or a failed datagram-size check |
+
+Using it from a browser build:
+
+```c
+vnet_config cfg = {.backend = VNET_BACKEND_RELAY_AUTO,   /* was VNET_BACKEND_RELAY_WS: nothing else changes */
+                   .relay = "wss://relay.example.org/vnet"};   /* WebTransport: https://relay.example.org/vnet, derived */
+vnet *v = vnet_create(&cfg, NULL);
+/* ... poll until vnet_status() says READY, then: */
+vnet_status_info st; vnet_status(v, &st);
+printf("connected over %s\n", st.transport);              /* "relay-wt" or "relay-ws" */
+```
+
+`relay_wt` names the WebTransport URL when it differs from the one derived from `relay` (another port, or a `ws://` development relay); `relay_cert_sha256` pins a development certificate (leave it NULL in production); `wt_timeout_ms` is how long WebTransport gets before the WebSocket is tried (default 3 s). The fallback happens only before the room is entered: after `READY` the transport never changes (a lost session is `VNET_ECLOSED`, as before). Native builds return `VNET_ENOTSUP` for `RELAY_WT` and `RELAY_AUTO`; use `RELAY_UDP` there. Operating the WebTransport endpoint (certificates, firewall, Docker) is in [`relay/README.md`](relay/README.md#webtransport-http3-datagrams).
 
 ## Testing under bad network conditions
 

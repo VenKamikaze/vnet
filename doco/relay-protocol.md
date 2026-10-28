@@ -1,10 +1,11 @@
 # vnet relay protocol, version 1
 
-The relay puts clients into **rooms** and forwards datagrams between the members of a room. This document is the wire format. The server is `relay/` (Go), the client is `src/relay_client.c` (C), and the browser transport is `src/relay_ws.c`. Keep the three in step; the constants are in `relay/protocol.go` and `src/relay_proto.h`.
+The relay puts clients into **rooms** and forwards datagrams between the members of a room. This document is the wire format. The server is `relay/` (Go), the client is `src/relay_client.c` (C), and the browser transports are `src/relay_ws.c` (WebSocket) and `src/relay_wt.c` (WebTransport). Keep them in step; the constants are in `relay/protocol.go` and `src/relay_proto.h`.
 
 - [Overview](#overview)
 - [Frames](#frames)
 - [Handshake and idempotent retries](#handshake-and-idempotent-retries)
+- [WebTransport](#webtransport)
 - [Rooms and virtual addresses](#rooms-and-virtual-addresses)
 - [Sessions, keepalive and timeouts](#sessions-keepalive-and-timeouts)
 - [Limits](#limits)
@@ -15,9 +16,10 @@ The relay puts clients into **rooms** and forwards datagrams between the members
 
 ## Overview
 
-- One protocol, two transports. Both carry **whole frames**; a frame never spans datagrams or WebSocket messages.
+- One protocol, three transports. All carry **whole frames**; a frame never spans datagrams or WebSocket messages.
   - **UDP:** one frame per datagram, to the relay's UDP port. Unreliable, so the client retries the handshake, and every frame after the handshake carries the session **token**.
   - **WebSocket:** one frame per **binary** message on `/vnet`. Reliable and ordered, so no retries, no padding and no token (the connection is the identity). Text messages are not part of the protocol.
+  - **WebTransport** (HTTP/3 over QUIC, `CONNECT` to `/vnet`): control frames on one reliable bidirectional stream, each with a 2-byte length; `DATA` as unreliable QUIC datagrams. No retries, no padding and no token (the encrypted QUIC connection is the identity). See [WebTransport](#webtransport).
 - All integers are **big-endian**. A frame is a 1-byte type followed by its fields.
 - The relay hands each member a virtual IPv4 address `10.0.0.N` and forwards `DATA` between addresses **of the same room**. Nothing else is ever a destination: the relay is not a proxy.
 - vnet carries unreliable datagrams only (D7). The relay does not retransmit, order or acknowledge anything. Over WebSocket, TCP happens to deliver in order; a game must not rely on that.
@@ -28,7 +30,9 @@ The relay puts clients into **rooms** and forwards datagrams between the members
 
 ### Client to relay
 
-| Type | Name | UDP layout | WebSocket layout |
+The WebTransport layouts are the WebSocket ones (no token); `CREATE_ROOM`, `JOIN_ROOM`, `LEAVE` and `KEEPALIVE` go on the control stream and `DATA` in a datagram.
+
+| Type | Name | UDP layout | WebSocket / WebTransport layout |
 |---|---|---|---|
 | `0x01` | `CREATE_ROOM` | `01 ver nonce[8] cookie[16]` + zero padding to **at least 64 bytes** | `01 ver nonce[8]` |
 | `0x02` | `JOIN_ROOM` | `02 ver nonce[8] code[6] cookie[16]` + zero padding to **at least 64 bytes** | `02 ver nonce[8] code[6]` |
@@ -76,6 +80,26 @@ The source address of a UDP datagram can be forged, so over UDP the relay create
 
 `ERROR` answers over WebSocket leave the connection open (except as above), so a client may try another code. Failed attempts count against the per-source handshake limit.
 
+## WebTransport
+
+WebTransport gives a browser what WebSocket cannot: **unreliable datagrams** that are not held up behind a lost packet. The relay serves it over HTTP/3 on a UDP port of its own (`-wt`), with a TLS certificate (production) or a development certificate that the page pins by hash. A session is the HTTP/3 extended `CONNECT` request for `https://host:port/vnet` (path `/vnet`, as for WebSocket).
+
+**Carriage of the frames**
+
+- **Control stream.** The client opens **one** bidirectional stream and sends `CREATE_ROOM` or `JOIN_ROOM` on it as its first bytes; the relay answers on the same stream. Every control frame (client to relay: `CREATE_ROOM`, `JOIN_ROOM`, `LEAVE`, `KEEPALIVE`; relay to client: `ROOM`, `ERROR`, `KEEPALIVE`) is written as
+  `length[2] frame[length]`, big endian. `length` is 1 to **64**; anything else (zero, or more than 64) is a framing error that cannot be recovered on a byte stream: the relay answers `ERROR(MALFORMED)` and closes the session. A stream that ends or is reset ends the session. The frames themselves are exactly the WebSocket ones (no token, no padding, no cookie; the QUIC handshake, with Retry, has already proved the address).
+- **Datagrams.** `DATA` is one frame per QUIC datagram, in the WebSocket layout (`10 dst_vaddr[4] dst_port[2] src_port[2] payload` to the relay; `10 src_vaddr[4] dst_port[2] src_port[2] payload` from it). A datagram is at most 9 + 1100 = **1109 bytes**. A datagram that is not `DATA` (a control frame, an empty one, an unknown type) is counted as malformed and ignored: **a handshake in a datagram does nothing**. `DATA` on the control stream is likewise ignored (in a room) or a protocol error (before one). Datagrams that arrive before the session has entered a room are dropped (`wt_early_datagrams`).
+- **Surplus streams.** The relay reads no stream other than the control stream. A second bidirectional stream and any unidirectional stream the client opens (other than HTTP/3's own) are reset at once; more than 16 of them close the session. QUIC stream limits are 4 bidirectional (the `CONNECT` stream, the control stream, margin) and 8 unidirectional.
+- **One session per QUIC connection.** A second `CONNECT` on the same connection gets HTTP 429.
+- **Handshake** as for WebSocket: idempotent by nonce (a repeat on the same connection returns the same `ROOM`; the same nonce on another connection gets `ERROR(NONCE_REUSED)`; a different request in a room gets `ERROR(ALREADY_IN_ROOM)`). The first control frame must arrive within `HandshakeTimeout` (10 s) of the connection being accepted, or the connection is closed.
+- **Token.** `ROOM` carries a token as on every transport, but a WebTransport session is identified by its connection: **the token is no credential**. `DATA`, `KEEPALIVE`, `LEAVE` or a path response bearing a WebTransport (or WebSocket) session's token over UDP gets `ERROR(NO_SESSION)`.
+- **Liveness.** The relay sends QUIC keep-alives (`PingInterval`, 5 s) and sets QUIC's idle timeout to `SessionTimeout` (15 s): a client whose QUIC stack stops answering (closed laptop, pulled cable) loses its connection, and with it its membership, within about that long. While the connection is up the member is alive, whether or not the page sends anything, as with WebSocket pings; a hidden browser tab whose timers are throttled keeps its session. The sweeper's frame-based session timeout therefore does not apply to WebTransport members. The client's `KEEPALIVE` is still answered with `KEEPALIVE`, and the client treats three silent keepalive intervals as a lost session.
+- **Writes.** The relay writes the control stream from one goroutine (and from `reject`, under the same lock) and sends datagrams from another, from a queue bounded in frames (128) and bytes (64 KiB): a client that cannot keep up loses datagrams (`wt_datagram_drops`); one whose control stream backs up by more than 32 frames is closed (`wt_ctl_overflow`). A datagram larger than the connection can carry is dropped and counted, not fatal.
+
+**Browsers do not promise 1109 bytes.** `datagrams.maxDatagramSize` is a conservative bound: Chromium 153 reports **1024** while delivering datagrams of at least 1109 bytes in both directions. The vnet client therefore treats a reported size below 1109 as "unknown" and **probes** (see [Client guidance](#client-guidance)); it does not trust the number and does not refuse on it.
+
+**Certificates.** Production: a certificate for the relay's host name, from a public CA (`-wt-cert`, `-wt-key`). Development: `-dev-cert` makes a 13-day ECDSA P-256 certificate and prints its SHA-256; the page passes it as `serverCertificateHashes`. Browsers accept a certificate by hash only if it is X.509v3, valid now, has a validity period of **less than two weeks**, and does not use an RSA key.
+
 ## Rooms and virtual addresses
 
 - A room is created by `CREATE_ROOM` and lives until its last member is gone, or until it has carried no `DATA` for `RoomIdleTimeout` (default 30 min; keepalives do not count).
@@ -89,10 +113,10 @@ The source address of a UDP datagram can be forged, so over UDP the relay create
 
 ## Sessions, keepalive and timeouts
 
-- A **session** is one member of one room. Over UDP it is identified by its **token**, not by its source address: a frame bearing the token is accepted from any address, so a NAT rebinding does not break a session. *Where the relay sends* is a separate matter, see below. Over WebSocket the session lives as long as the connection.
+- A **session** is one member of one room. Over UDP it is identified by its **token**, not by its source address: a frame bearing the token is accepted from any address, so a NAT rebinding does not break a session. *Where the relay sends* is a separate matter, see below. Over WebSocket and WebTransport the session lives as long as the connection.
 - `KEEPALIVE`: the client sends one about every 5 s (`keepalive_s` from `ROOM`); the relay answers with a one-byte `KEEPALIVE`. This keeps NAT mappings open, keeps the session alive, and lets the client notice a dead relay. A client's own interval must be at most a third of the relay's session timeout (vnet accepts 100 to 5000 ms and clamps the relay's suggestion to 5 s).
-- **Relay side:** a session with no authenticated frame for 15 s (`SessionTimeout`; WebSocket pongs count) is dropped, and a UDP member is told with `ERROR(TIMEOUT)`. The relay pings WebSocket clients every 5 s; browsers answer pings by themselves, even in a background tab whose timers are throttled, so a hidden page keeps its session as long as the connection is up.
-- **Client side:** the vnet client declares the session lost (`VNET_ETIMEDOUT`) after three keepalive intervals without any frame from the relay, and `VNET_ECLOSED` on `ERROR(NO_SESSION | CLOSED | TIMEOUT)` or when the WebSocket closes.
+- **Relay side:** a session with no authenticated frame for 15 s (`SessionTimeout`; WebSocket pongs count) is dropped, and a UDP member is told with `ERROR(TIMEOUT)`. A WebTransport member is dropped when its QUIC connection is (see [WebTransport](#webtransport)). The relay pings WebSocket clients every 5 s; browsers answer pings by themselves, even in a background tab whose timers are throttled, so a hidden page keeps its session as long as the connection is up.
+- **Client side:** the vnet client declares the session lost (`VNET_ETIMEDOUT`) after three keepalive intervals without any frame from the relay, and `VNET_ECLOSED` on `ERROR(NO_SESSION | CLOSED | TIMEOUT)` or when the WebSocket or WebTransport session closes.
 - `ERROR(NO_SESSION)` answers an authenticated-type frame (`KEEPALIVE`, `LEAVE`, `DATA`) whose token is unknown (expired, never issued, the relay restarted, or a WebSocket session's token used over UDP).
 - `LEAVE` is best effort over UDP (a lost `LEAVE` is just the 15 s timeout).
 
@@ -130,6 +154,12 @@ All configurable; the defaults are in `relay/config.go`, the flags in `relay/cmd
 | WebSocket send queue | 128 frames and 64 KiB | frames to that client dropped (`ws_queue_drops`) |
 | WebSocket write | 5 s | the connection is closed |
 | WebSocket message size | 1125 bytes | connection closed |
+| QUIC connections per source address (a session or not) / not yet in a room | 128 / 32 | the connection is refused (QUIC `CONNECTION_REFUSED`); the browser backend falls back to WebSocket |
+| WebTransport datagram queue | 128 datagrams and 64 KiB | datagrams to that client dropped (`wt_datagram_drops`) |
+| WebTransport control stream: frame length / queued answers / write | 64 bytes / 32 frames / 5 s | the session is closed |
+| WebTransport surplus streams | 16 | the session is closed |
+
+Connections of every kind (WebSocket and WebTransport) count together against `max-sessions`, and the per-address numbers above are per source address as seen by the relay (IPv6 by /64, with the /48 factor).
 
 Limited frames are *dropped*, not queued: vnet is unreliable, and queueing behind a slow link only adds latency.
 
@@ -146,12 +176,13 @@ The relay is a router for the members of a room, not a proxy and not a gateway t
   - Replies to unauthenticated sources are rate-limited per source IP and overall (table above); a spoofing flood is mostly answered with silence. There are two overall allowances, so that junk of one kind cannot starve the other: `RETRY` and `PATH_CHALLENGE` (what a real client needs to start a handshake or to survive a NAT rebinding) share a high one (50000/s); `ERROR`s to unproven sources (wrong version, unknown token) have the ordinary one (5000/s). A `ROOM` or `ERROR` sent to a source that has just echoed a valid cookie is not charged to either: the source has proved it receives there, so it is not a reflection target. Total unauthenticated output is therefore bounded at roughly 55000 packets per second of at most 26 bytes each, about 11 Mbit/s.
   - **What a flood can still do.** *Per victim address:* someone who can forge a victim's address at more than a few dozen packets per second uses up that address's reply budget and keeps the victim from starting a handshake while the flood lasts. *Relay-wide:* to deny new handshakes and NAT migrations to **everyone**, an attacker must push the `RETRY`/`PATH_CHALLENGE` allowance over 50000/s. Because each source IP is limited to 40 replies a second first, that takes forged packets from at least ~1250 distinct source addresses (easy to forge from a network that does not filter spoofed sources), each of at least 64 bytes: more than 50000 packets/s, about 26 Mbit/s of UDP payload (about 37 Mbit/s on the wire). While it lasts, clients that are not yet in a room cannot get a `RETRY` and keep retransmitting until their handshake times out, and clients whose address changed cannot validate the new one. It does **not** affect sessions that already exist: `DATA`, `KEEPALIVE`, `LEAVE` and WebSocket traffic need no unauthenticated reply, and a client that already holds a cookie still gets its `ROOM`. No state remains afterwards. A flood of the other kind (wrong-version or unknown-token packets over 5000/s, about 3 Mbit/s) only silences those `ERROR`s, which affects no handshake. The allowances are `Config.GlobalVitalReplyPerSec`/`Burst` and `GlobalReplyPerSec`/`Burst`; the only complete defence against a sustained flood of this size is network-level (ingress filtering, a firewall or a provider scrubbing service in front of the UDP port), and WebSocket clients are unaffected by it.
   - Replies to *authenticated* frames (the one-byte `KEEPALIVE`) are smaller than their request, and need a valid token.
+- **WebTransport.** Every QUIC connection first goes through QUIC's **Retry**: an Initial packet from a source that has not echoed a Retry token gets one small Retry packet (132 bytes against a client Initial of 1280 in the test) and the relay keeps no state, so a forged source address cannot draw a handshake, a certificate, state or data (`TestWebTransportFirstAnswerToAnUnvalidatedAddressIsASmallRetry`). The per-address and relay-wide connection caps are applied when the validated Initial is accepted, before the TLS handshake is built, and given back exactly once when the connection ends, whether or not it ever got a session. Everything the relay sends on a connection goes to the address that completed the QUIC handshake (QUIC's own path validation covers migration). The cost is one extra round trip on connection setup. Not covered by this document: QUIC's own stateless reset and version negotiation packets (RFC 9000 requires them to be smaller than their trigger; not checked in quic-go), its limits on the number of handshakes in flight, and Initial packets from a *real* address at a high rate (each draws one Retry); these are bounded by quic-go's queues, and the network-level defences named under Anti-reflection apply.
 - **Tokens.** 128 random bits from `crypto/rand`, one per session. They travel in clear text over UDP, like every UDP game protocol without encryption: anyone who can read a client's traffic can impersonate it. A token is only ever sent to the address that proved, with a cookie, that it receives there, so an attacker who merely forges a source address never learns one. Use `wss://` for browsers; encryption of the UDP path is out of scope.
 - **The nonce.** A repeat of a request's nonce is answered with that session's `ROOM`, token included, but only to the session's own address, so a guessed nonce is not enough to learn a token. Clients should still draw the nonce from a cryptographically secure source (vnet uses `getentropy()`, or `rand_s` on Windows, and **fails to create the context** rather than fall back to something weaker): a predictable nonce lets someone else claim it first.
 - **Capacity per source.** One address (IPv6: one /64) can hold at most 128 members, 16 live rooms (counted until the room dies, not until its creator leaves), 128 open WebSockets and 32 WebSockets that have not entered a room yet; the handshake and reply rates are per the same key. An IPv6 /48 (a whole site; a /56 or /64 from the same provider block sits inside one) is limited to 4 times those numbers in total, so a subscriber with many /64s cannot take the relay's room budget (`-max-rooms`) by itself. Because sessions and rooms exist only for sources that echoed a cookie, forged handshakes use none of these budgets. Everyone behind one NAT shares them, including carrier-grade NAT: 128 members is the cap for all players behind one public address (flags below).
 - **Relay-to-client frames carry no token.** The client accepts them only from the relay's address. An attacker who can forge the relay's source address *and* guess the client's port could inject `DATA` or end a session; this is inherent to unauthenticated UDP.
 - **Brute forcing codes.** 30-bit codes with at most 1000 live rooms, plus the per-IP handshake limit, makes guessing impractical but not impossible for a patient attacker with many addresses. Rooms are meant for casual games, not secrets.
-- **WebSocket.** `Origin` can be restricted (`-origins`); by default any origin may connect, because the relay has no ambient credentials to protect. Behind a reverse proxy, `-trust-forwarded-for` makes per-IP limits use the real client address, taken from the **rightmost** `X-Forwarded-For` entry (the one the proxy added; earlier entries are written by the client). Only enable it if the relay is reachable only through the proxy.
+- **WebSocket and WebTransport.** `Origin` can be restricted (`-origins`, which applies to both); by default any origin may connect, because the relay has no ambient credentials to protect. Behind a reverse proxy, `-trust-forwarded-for` makes per-IP limits use the real client address, taken from the **rightmost** `X-Forwarded-For` entry (the one the proxy added; earlier entries are written by the client). Only enable it if the relay is reachable only through the proxy.
 
 ## Errors
 
@@ -179,6 +210,8 @@ The vnet backends implement this; another client should:
 - over UDP, answer a `RETRY` (matching nonce, from the relay's address) at once by repeating the request with the cookie filled in, keep the cookie for later retransmissions, and replace it when a newer `RETRY` arrives;
 - answer every `PATH_CHALLENGE` with a `PATH_RESPONSE` from the same socket;
 - pad UDP handshakes to 64 bytes;
+- over WebTransport: open one bidirectional stream, send every control frame on it with its 2-byte length, send `DATA` only as datagrams, and read control frames with a reassembling parser (a frame may arrive in pieces, several in one chunk); a length of 0 or over 64 is a protocol error;
+- over WebTransport, if the browser's `datagrams.maxDatagramSize` is below 1109, **probe before declaring the session usable**: after `ROOM`, send a full-size `DATA` frame (1100 payload bytes) to your own address with both ports 0, repeat it every 250 ms, and treat the session as usable only when it comes back from yourself with the same bytes; give up after 1.5 s (vnet: `VNET_EMSGSIZE`, or fall back to WebSocket). The relay needs no support for this: delivering a member's datagram to its own address is ordinary routing, and no socket has port 0;
 - accept `ROOM`/`ERROR` only if the nonce matches during the handshake, and frames only from the relay's address;
 - send `KEEPALIVE` at the suggested interval and treat silence for three intervals as a lost session;
 - drop `DATA` for ports it has not opened, and payloads over 1100 bytes;
@@ -189,4 +222,5 @@ The vnet backends implement this; another client should:
 - The version byte is in `CREATE_ROOM`/`JOIN_ROOM` and echoed in `ROOM`/`ERROR`. This relay speaks **version 1** only; any other value gets `ERROR(BAD_VERSION)` carrying the relay's version.
 - `RETRY` (with the cookie field of UDP `CREATE_ROOM`/`JOIN_ROOM`) and `PATH_CHALLENGE`/`PATH_RESPONSE` are part of version 1 (it has not been released).
 - Changes that keep old clients working (new optional frame types, new `ERROR` reasons, more trailing bytes in `ROOM`) stay at version 1: clients ignore frame types they do not know, and treat unknown error reasons as protocol errors. Anything else bumps the version. `VNET_MAX_DATAGRAM` (1100) is part of the ABI of every game and will not be raised.
-- Not in version 1, and left to later briefs: peer join/leave notifications, broadcast addresses, host migration, rejoin after a drop (Bit Riot brief 13), encryption, a WebTransport transport (vnet brief 11, which carries the same frames: control frames on a stream, `DATA` as datagrams).
+- The WebTransport carriage (control stream with 2-byte lengths, `DATA` in datagrams) is part of version 1; it adds no frame types.
+- Not in version 1, and left to later briefs: peer join/leave notifications, broadcast addresses, host migration, rejoin after a drop (Bit Riot brief 13), encryption of the UDP path.

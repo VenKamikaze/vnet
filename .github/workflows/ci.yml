@@ -112,17 +112,19 @@ jobs:
         run: |
           go test -run XXX -fuzz FuzzHandleUDP -fuzztime 30s .
           go test -run XXX -fuzz FuzzHandleWS -fuzztime 30s .
+          go test -run XXX -fuzz FuzzHandleWT -fuzztime 30s .
       - name: Build the Docker image
         run: docker build -t vnet-relay .
       - name: Run the container and talk to it
         run: |
-          docker run -d --name relay -p 127.0.0.1:7777:7777/udp -p 127.0.0.1:8080:8080 vnet-relay
+          docker run -d --name relay -p 127.0.0.1:7777:7777/udp -p 127.0.0.1:8080:8080 -p 127.0.0.1:4433:4433/udp vnet-relay -wt :4433 -dev-cert
           for i in $(seq 50); do curl -fsS http://127.0.0.1:8080/healthz && break; sleep 0.2; done
-          curl -fsS http://127.0.0.1:8080/stats
+          # (/stats is off by default since the brief 10 fix round: check the start-up line instead)
+          docker logs relay 2>&1 | grep -E '^LISTEN udp=.* wt=\[::\]:4433 wt_cert_sha256=[0-9a-f]{64}$'
           docker rm -f relay
 
   browser:
-    name: browser (Emscripten + Chromium via Playwright)
+    name: browser (Emscripten + Chromium via Playwright): WebSocket, WebTransport, fallback
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

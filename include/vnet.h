@@ -33,8 +33,9 @@
  *  - After setup, steady-state send/receive/poll performs no heap
  *    allocation (queues are sized and allocated in vnet_create() and
  *    vnet_open()). That is vnet's own code: in a browser build, Emscripten's
- *    WebSocket glue (and the browser) allocate for every message that
- *    arrives or is sent.
+ *    WebSocket glue, vnet's WebTransport glue (a copy of every frame in each
+ *    direction, in JavaScript) and the browser allocate for every message or
+ *    datagram that arrives or is sent.
  *  - Threading: a vnet context, and every loopback network and context
  *    attached to it, must be used from one thread at a time. Separate
  *    UDP contexts may be used from separate threads.
