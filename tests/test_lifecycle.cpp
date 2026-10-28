@@ -2,8 +2,12 @@
 #include "test_util.h"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <set>
 
 class Lifecycle : public VnetTest {};
+
+static std::set<int> OpenFds();
 
 static int CountOpenFds() {
     int n = 0;
@@ -54,6 +58,45 @@ TEST_F(Lifecycle, RepeatedCreateAndDestroyUdpReusesTheSamePortAndLeaksNoFds) {
     }
     EXPECT_GT(fds_before, 3) << "fd listing must work on this platform, or the check is vacuous";
     EXPECT_EQ(CountOpenFds(), fds_before);
+}
+
+static std::set<int> OpenFds() {
+#if defined(__APPLE__)
+    const char *dir = "/dev/fd";
+#else
+    const char *dir = "/proc/self/fd";
+#endif
+    std::set<int> fds;
+    if (DIR *d = opendir(dir)) {
+        int self = dirfd(d);  // the listing's own descriptor is not interesting
+        while (dirent *e = readdir(d))
+            if (e->d_name[0] != '.' && atoi(e->d_name) != self) fds.insert(atoi(e->d_name));
+        closedir(d);
+    }
+    return fds;
+}
+
+// Game sockets must not leak into child processes the game spawns.
+TEST_F(Lifecycle, UdpSocketsAreCloseOnExec) {
+    for (int family : {VNET_FAMILY_IPV4, VNET_FAMILY_ANY}) {
+        vnet *v = UdpHost(family);
+        ASSERT_NE(v, nullptr);
+        std::set<int> before = OpenFds();
+        ASSERT_FALSE(before.empty());
+        int s = vnet_open(v, 0);
+        ASSERT_GE(s, 0);
+        std::set<int> after = OpenFds();
+        int checked = 0;
+        for (int fd : after) {
+            if (before.count(fd)) continue;
+            int fl = fcntl(fd, F_GETFD);
+            ASSERT_GE(fl, 0);
+            EXPECT_TRUE(fl & FD_CLOEXEC) << "fd " << fd << " family " << family;
+            checked++;
+        }
+        EXPECT_EQ(checked, 1) << "exactly one new descriptor expected";
+        vnet_destroy(v);
+    }
 }
 
 TEST_F(Lifecycle, ManyContextsInOneProcessAreIndependent) {

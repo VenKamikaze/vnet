@@ -324,10 +324,20 @@ extern "C" int g_fake_ipv6;
 extern "C" int g_fake_v6only_last;
 extern "C" int g_fail_sendto;
 
+// Resets the shim switches even if an ASSERT returns early from a test.
+struct ShimReset {
+    ~ShimReset() {
+        g_fake_ipv6 = 0;
+        g_fail_sendto = 0;
+        g_fake_v6only_last = -1;
+    }
+};
+
 // A send the OS rejects (network unreachable) is reported as transient
 // VNET_EIO and is not counted as having reached the wire.
 TEST(UdpErrors, FailedOsSendIsEioAndNotCountedOnTheWire) {
     EnvGuard env;
+    ShimReset reset;
     vnet *a = UdpHost();
     int sa = vnet_open(a, 0);
     vnet_addr to = A("127.0.0.1:9");
@@ -360,6 +370,7 @@ TEST(UdpErrors, FailedOsSendIsEioAndNotCountedOnTheWire) {
 // Runs on hosts without IPv6 too (emulated sockets, see ipv6_shim.cpp).
 TEST(UdpFamily, Ipv6OnlyModeSetsV6OnlyAndRefusesIpv4Destinations) {
     EnvGuard env;
+    ShimReset reset;
     g_fake_ipv6 = 1;
     for (bool impaired : {false, true}) {
         vnet_impair im = {};

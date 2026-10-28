@@ -129,13 +129,18 @@ static void from_sockaddr(const struct sockaddr_storage *ss, vnet_addr *a) {
 // Backend ----------------------------------------------------------------
 
 static sock_t make_socket(vnet *v, int family, int v6only, uint16_t port, int *rc) {
+#if defined(SOCK_CLOEXEC)
+    // Atomic close-on-exec: no window for a concurrent fork()/exec() to inherit the socket.
+    sock_t fd = socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+#else
     sock_t fd = socket(family, SOCK_DGRAM, 0);
+#endif
     if (fd == BAD_SOCK) {
         *rc = SOCK_ERRNO() == E_AFNOSUPPORT ? VNET_EAFNOSUPPORT : VNET_EIO;
         return BAD_SOCK;
     }
-#if !defined(_WIN32) && defined(FD_CLOEXEC)
-    {  // Don't leak game sockets into child processes.
+#if !defined(_WIN32) && defined(FD_CLOEXEC) && !defined(SOCK_CLOEXEC)
+    {  // Fallback where socket() has no SOCK_CLOEXEC (e.g. macOS).
         int fl = fcntl(fd, F_GETFD, 0);
         if (fl >= 0) fcntl(fd, F_SETFD, fl | FD_CLOEXEC);
     }

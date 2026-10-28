@@ -55,8 +55,13 @@ endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(vnet PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
-    if(NOT WIN32)  # MinGW's own headers use strcpy, so the guard is POSIX-only
-        target_compile_options(vnet PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/cmake/banned.h)
+    # Developer-build guard against deprecated libc calls. Not for consumers
+    # (their flags and libc macros are none of our business), and POSIX only
+    # (MinGW's own headers use strcpy). SHELL: stops CMake de-duplicating the
+    # option against a consumer's own "-include".
+    if(VNET_IS_TOP_LEVEL AND NOT WIN32)
+        target_compile_options(vnet PRIVATE
+            "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/cmake/banned.h")
     endif()
     if(VNET_WARNINGS_AS_ERRORS)
         target_compile_options(vnet PRIVATE -Werror)

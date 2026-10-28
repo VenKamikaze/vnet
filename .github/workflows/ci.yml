@@ -1,11 +1,16 @@
 name: CI
 
-# Push builds only the integration branches; work branches are built by their
-# pull request, so in-repo PRs are not built twice.
+# Work branches (vnet/NN-*) are merged locally, so they need push builds. A
+# pull request from the same repository would run twice (push + PR): the
+# concurrency group below cancels the older run for the same ref.
 on:
   push:
-    branches: [main, claude]
+    branches: [main, claude, "vnet/**"]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
 
 jobs:
   build-test:
