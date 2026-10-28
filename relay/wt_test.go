@@ -182,7 +182,9 @@ func TestWTPayloadLimit(t *testing.T) {
 }
 
 func TestWTMalformedControlStreamsAreRefusedWithoutState(t *testing.T) {
-	long := append([]byte{0, maxCtlFrame + 1}, make([]byte, maxCtlFrame+1)...)
+	// One byte over the limit, and a perfectly good CREATE_ROOM followed by
+	// padding: only the length makes it wrong.
+	long := append([]byte{0, maxCtlFrame + 1}, handshakeFrame(1, "", maxCtlFrame+1)...)
 	cases := []struct {
 		name     string
 		raw      []byte
@@ -231,6 +233,23 @@ func TestWTMalformedControlStreamsAreRefusedWithoutState(t *testing.T) {
 				t.Fatalf("counters leaked: %v, %d", th.h.perIP, th.h.connsHeld)
 			}
 		})
+	}
+}
+
+func TestWTDatagramTooLargeForTheConnectionIsDroppedNotFatal(t *testing.T) {
+	th := newTestHub(t, nil)
+	host := th.wtClient("192.0.2.1").create()
+	guest := th.wtClient("192.0.2.2").join(host.room.code)
+	guest.f.maxDatagram.Store(wsDataHdr + 100) // the connection can carry only a little
+	host.dg(host.dataFrame(2, 1, 1, make([]byte, 500)))
+	host.dg(host.dataFrame(2, 1, 1, make([]byte, 50)))
+	host.syncData()
+	got := guest.syncData()
+	if len(got) != 1 || len(got[0]) != wsDataHdr+50 {
+		t.Fatalf("guest received %d datagrams", len(got))
+	}
+	if th.h.snapshot().WTDatagramDrops != 1 || guest.ended() {
+		t.Fatalf("a datagram that did not fit should be dropped and counted, not end the session: %+v", th.h.snapshot())
 	}
 }
 
@@ -325,6 +344,27 @@ func TestWTSlowDatagramConsumerLosesDatagramsNotTheRelay(t *testing.T) {
 	}
 	if last == nil {
 		t.Fatal("no traffic after the receiver recovered")
+	}
+}
+
+// The frame bound and the byte bound are separate: large datagrams reach the
+// byte bound long before the frame bound.
+func TestWTDatagramQueueIsBoundedInBytes(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.WTSendQueue = 1000; c.WTSendQueueBytes = 2500 })
+	src := th.wtClient("192.0.2.1").create()
+	slow := th.wtClient("192.0.2.2").join(src.room.code)
+	gate := make(chan struct{})
+	defer close(gate)
+	slow.f.sendGate.Store(&gate)
+	for i := 0; i < 50; i++ {
+		src.dg(src.dataFrame(2, 1, 1, make([]byte, 500))) // 509 bytes each
+	}
+	src.syncData()
+	if q := len(slow.c.out); q > 2500/509 || slow.c.qbytes.Load() > 2500 {
+		t.Fatalf("%d frames, %d bytes queued against a limit of 2500 bytes", q, slow.c.qbytes.Load())
+	}
+	if d := th.h.snapshot().WTDatagramDrops; d < 50-2500/509-2 {
+		t.Fatalf("only %d datagrams dropped", d)
 	}
 }
 
@@ -447,6 +487,28 @@ func TestWTPerAddressCaps(t *testing.T) {
 	if _, ok := h.wtAdmit(a1); ok {
 		t.Fatal("budget exceeded after a double release")
 	}
+}
+
+// Releasing a connection gives back exactly what it held: a connection that
+// had entered a room holds no pending slot, so its end must not free the
+// pending slot of another connection that is still waiting.
+func TestWTReleaseGivesBackOnlyWhatWasHeld(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.MaxPendingWTPerIP = 2 })
+	h := th.h
+	a := netip.MustParseAddr("192.0.2.1")
+	c1, _ := h.wtAdmit(a)
+	c2, _ := h.wtAdmit(a) // still waiting for its room
+	if !h.connHandshake(c1, handshakeFrame(1, "", 0), th.clock.Now()) {
+		t.Fatal("handshake")
+	}
+	h.wtGone(c1)
+	if _, ok := h.wtAdmit(a); !ok {
+		t.Fatal("one pending slot is free (c1 left it when it entered a room)")
+	}
+	if _, ok := h.wtAdmit(a); ok {
+		t.Fatal("c1's end freed a pending slot that c2 still holds")
+	}
+	h.wtGone(c2)
 }
 
 func TestWTPerAddressCapsKeyIPv6ByPrefix(t *testing.T) {

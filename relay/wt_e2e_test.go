@@ -592,6 +592,7 @@ func TestWebTransportFirstAnswerToAnUnvalidatedAddressIsASmallRetry(t *testing.T
 	if reply[0]&0xf0 != 0xf0 {
 		t.Fatalf("the first answer is not a Retry (first byte %#x, %d bytes)", reply[0], len(reply))
 	}
+	t.Logf("the first answer is a Retry of %d bytes against a request of %d bytes", len(reply), len(first))
 	if len(reply) >= len(first)/4 {
 		t.Fatalf("the Retry is %d bytes against a %d byte request", len(reply), len(first))
 	}

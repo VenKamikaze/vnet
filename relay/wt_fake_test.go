@@ -107,7 +107,8 @@ type fakeWT struct {
 	inSend   atomic.Int32
 	uniSeen  atomic.Int32
 
-	closeCode atomic.Int64 // code+1 of the first CloseWithError, 0 if none
+	closeCode   atomic.Int64 // code+1 of the first CloseWithError, 0 if none
+	maxDatagram atomic.Int64 // largest datagram SendDatagram accepts; 0 = 1200
 }
 
 func newFakeWT(t *testing.T) *fakeWT {
@@ -163,7 +164,11 @@ func (f *fakeWT) SendDatagram(b []byte) error {
 			return errors.New("session closed")
 		}
 	}
-	if len(b) > 1200 {
+	limit := int(f.maxDatagram.Load())
+	if limit == 0 {
+		limit = 1200
+	}
+	if len(b) > limit {
 		return errWTDatagramTooLarge
 	}
 	select {

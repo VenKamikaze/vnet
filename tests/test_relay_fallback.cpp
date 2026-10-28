@@ -194,9 +194,11 @@ TEST_F(RelayFallback, TheFallbackGetsTheWholeHandshakeTimeoutNotWhatIsLeft) {
     Poll(kPrimaryTimeout);  // falls back at t = 3 s
     ASSERT_EQ(fb.calls, 1);
     ws.state = RELAY_TP_OPEN;
-    Poll(5000);  // 8 s after creation: the default timeout is 10 s from the start of the WebSocket attempt
+    // 10.5 s after creation but 7.5 s after the switch: the default timeout
+    // of 10 s counts from the start of the WebSocket attempt.
+    Poll(7500);
     EXPECT_EQ(Status().state, VNET_STATUS_CONNECTING);
-    Poll(5000);  // 10 s after the switch
+    Poll(2500);  // 10 s after the switch
     vnet_status_info st = Status();
     EXPECT_EQ(st.state, VNET_STATUS_FAILED);
     EXPECT_EQ(st.error, VNET_ETIMEDOUT);
@@ -338,13 +340,15 @@ TEST_F(RelayProbe, AFullSizeDatagramToOneselfDecidesBeforeTheGameIsToldItCanSend
     Bytes other = echo;
     other[4] = 3;
     Bytes shorter(echo.begin(), echo.end() - 1);
+    Bytes longer = echo;  // a datagram with the right start but more bytes than we sent
+    longer.push_back(0);
     Bytes port = echo;
     port[6] = 1;
     Bytes content = echo;
     content.back() ^= 1;
     Bytes subnet = echo;
     subnet[3] = 1;
-    for (const Bytes &bad : {other, shorter, port, content, subnet}) {
+    for (const Bytes &bad : {other, shorter, longer, port, content, subnet}) {
         wt.in.push_back(bad);
         Poll();
         EXPECT_EQ(Status().state, VNET_STATUS_CONNECTING);

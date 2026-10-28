@@ -23,10 +23,11 @@ const RELAY_BIN = arg('relay-bin');
 const PEER_BIN = arg('peer-bin');
 const WEB_DIR = arg('web-dir');
 const COUNT = parseInt(arg('count', '150'), 10);
-if (!RELAY_BIN || !PEER_BIN || !WEB_DIR) {
-  console.error('usage: <test>.js --relay-bin PATH --peer-bin PATH --web-dir DIR [--count N]');
+if (!RELAY_BIN) {
+  console.error('usage: <test>.js --relay-bin PATH [--peer-bin PATH --web-dir DIR] [--count N]');
   process.exit(2);
 }
+// (--peer-bin and --web-dir are needed only by the tests that run relay_peer.)
 
 let failures = 0;
 function check(cond, what) {
