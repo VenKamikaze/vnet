@@ -22,8 +22,8 @@ type session struct {
 	kind    byte   // TypeCreate or TypeJoin: the request that made it
 	reqCode string // for TypeJoin, the normalised code asked for
 	room    *room
-	octet   byte // last byte of the vaddr 10.0.0.octet
-	ws      *wsConn
+	octet   byte       // last byte of the vaddr 10.0.0.octet
+	conn    clientConn // the WebSocket or WebTransport connection; nil for UDP sessions
 
 	ip       netip.Addr                     // limiter key of the source that created it (IPv6 as /64)
 	udpAddr  atomic.Pointer[netip.AddrPort] // UDP sessions: where to send. Proven at creation (the handshake cookie), moves only after path validation
@@ -38,8 +38,10 @@ type session struct {
 	chExpires  time.Time
 	chLastSent time.Time
 
-	// Token buckets, touched only by the goroutine that reads this
-	// session's transport.
+	// Token buckets. A UDP or WebSocket session is read by one goroutine; a
+	// WebTransport session has two (its control stream and its datagrams),
+	// so the buckets are used under rateMu.
+	rateMu   sync.Mutex
 	pps, bps bucket
 }
 
@@ -88,6 +90,8 @@ type ipCount struct {
 	rooms     int
 	ws        int // open WebSockets
 	pendingWS int // of those, not yet in a room
+	wt        int // QUIC connections admitted for WebTransport (a session or not)
+	pendingWT int // of those, not yet in a room
 }
 
 type nonceEntry struct {
@@ -100,14 +104,14 @@ type nonceEntry struct {
 type Hub struct {
 	cfg Config
 
-	mu         sync.RWMutex
-	rooms      map[string]*room
-	byToken    map[[TokenLen]byte]*session
-	byNonce    map[[NonceLen]byte]*nonceEntry
-	conns      map[*wsConn]struct{}
-	perIP      map[limKey]*ipCount
-	wsReserved int      // WebSocket upgrades admitted and not yet finished (the check against MaxSessions is made on this)
-	secret     [32]byte // keys the handshake cookies
+	mu        sync.RWMutex
+	rooms     map[string]*room
+	byToken   map[[TokenLen]byte]*session
+	byNonce   map[[NonceLen]byte]*nonceEntry
+	conns     map[clientConn]struct{}
+	perIP     map[limKey]*ipCount
+	connsHeld int      // WebSocket upgrades and WebTransport connections admitted and not yet finished (the check against MaxSessions is made on this)
+	secret    [32]byte // keys the handshake cookies
 	// panicHook, if set (tests), is called with the name of a few critical
 	// sections so a test can make them panic and prove the lock is released.
 	panicHook func(where string)
@@ -124,7 +128,7 @@ func newHub(cfg Config) *Hub {
 		rooms:   make(map[string]*room),
 		byToken: make(map[[TokenLen]byte]*session),
 		byNonce: make(map[[NonceLen]byte]*nonceEntry),
-		conns:   make(map[*wsConn]struct{}),
+		conns:   make(map[clientConn]struct{}),
 		perIP:   make(map[limKey]*ipCount),
 	}
 	if _, err := rand.Read(h.secret[:]); err != nil {
@@ -142,7 +146,7 @@ type hsReq struct {
 	nonce [NonceLen]byte
 	code  string // normalised; only for TypeJoin with a valid code
 	udp   *netip.AddrPort
-	ws    *wsConn
+	conn  clientConn
 	ip    netip.Addr // limiter key of the requester
 }
 
@@ -156,13 +160,20 @@ func keysFor(ip netip.Addr) []limKey {
 }
 
 // capsFor returns the limits that apply to k.
-func (h *Hub) capsFor(k limKey) (sessions, rooms, ws, pending int) {
+func (h *Hub) capsFor(k limKey) ipCaps {
 	f := 1
 	if k.group {
 		f = h.cfg.PrefixFactor
 	}
-	return h.cfg.MaxSessionsPerIP * f, h.cfg.MaxRoomsPerIP * f, h.cfg.MaxWSPerIP * f, h.cfg.MaxPendingWSPerIP * f
+	return ipCaps{
+		sessions: h.cfg.MaxSessionsPerIP * f, rooms: h.cfg.MaxRoomsPerIP * f,
+		ws: h.cfg.MaxWSPerIP * f, pendingWS: h.cfg.MaxPendingWSPerIP * f,
+		wt: h.cfg.MaxWTPerIP * f, pendingWT: h.cfg.MaxPendingWTPerIP * f,
+	}
 }
+
+// ipCaps are the limits that apply to one limKey.
+type ipCaps struct{ sessions, rooms, ws, pendingWS, wt, pendingWT int }
 
 // room admission: would one more session (and room) from ip fit? Caller holds h.mu.
 func (h *Hub) fits(ip netip.Addr, newRoom bool) bool {
@@ -171,8 +182,8 @@ func (h *Hub) fits(ip netip.Addr, newRoom bool) bool {
 		if c == nil {
 			continue
 		}
-		cs, cr, _, _ := h.capsFor(k)
-		if c.sessions >= cs || (newRoom && c.rooms >= cr) {
+		caps := h.capsFor(k)
+		if c.sessions >= caps.sessions || (newRoom && c.rooms >= caps.rooms) {
 			return false
 		}
 	}
@@ -189,7 +200,7 @@ func (h *Hub) charge(ip netip.Addr, f func(*ipCount)) {
 			h.perIP[k] = c
 		}
 		f(c)
-		if c.sessions <= 0 && c.rooms <= 0 && c.ws <= 0 && c.pendingWS <= 0 {
+		if c.sessions <= 0 && c.rooms <= 0 && c.ws <= 0 && c.pendingWS <= 0 && c.wt <= 0 && c.pendingWT <= 0 {
 			delete(h.perIP, k)
 		}
 	}
@@ -227,7 +238,7 @@ func (h *Hub) handshake(r hsReq, now time.Time) (reply []byte, sess *session) {
 			return encodeError(ErrClosed, r.nonce), nil
 		}
 		s := e.sess
-		if s.kind != r.kind || s.reqCode != r.code || s.ws != r.ws {
+		if s.kind != r.kind || s.reqCode != r.code || s.conn != r.conn {
 			h.stats.handshakeRejected.Add(1)
 			return encodeError(ErrNonceReused, r.nonce), nil
 		}
@@ -277,7 +288,7 @@ func (h *Hub) handshake(r hsReq, now time.Time) (reply []byte, sess *session) {
 		}
 	}
 
-	s := &session{nonce: r.nonce, kind: r.kind, reqCode: r.code, ws: r.ws, octet: octet, ip: r.ip}
+	s := &session{nonce: r.nonce, kind: r.kind, reqCode: r.code, conn: r.conn, octet: octet, ip: r.ip}
 	if _, err := rand.Read(s.token[:]); err != nil {
 		panic("relay: no randomness: " + err.Error())
 	}
@@ -377,10 +388,11 @@ func (h *Hub) send(dst netip.AddrPort, b []byte) {
 }
 
 // deliver hands an outbound frame to a member over its transport. buf is
-// only valid for the call, so the WebSocket path copies it.
+// only valid for the call, so the WebSocket and WebTransport paths copy it.
+// It never blocks: a connection that cannot keep up loses frames.
 func (h *Hub) deliver(s *session, b []byte) {
-	if s.ws != nil {
-		s.ws.enqueue(append([]byte(nil), b...))
+	if s.conn != nil {
+		s.conn.enqueue(append([]byte(nil), b...))
 		return
 	}
 	if a := s.udpAddr.Load(); a != nil {
@@ -523,7 +535,7 @@ func (h *Hub) udpAuthenticated(p []byte, src netip.AddrPort, now time.Time, scra
 	h.mu.RLock()
 	s := h.byToken[tok]
 	h.mu.RUnlock()
-	if s == nil || s.ws != nil {
+	if s == nil || s.conn != nil { // a WebSocket or WebTransport session's token is no credential over UDP
 		h.stats.unknownToken.Add(1)
 		var zero [NonceLen]byte
 		h.replyUnauth(src, len(p), encodeError(ErrNoSession, zero), now, false)
@@ -614,20 +626,26 @@ func (h *Hub) pathResponse(s *session, p []byte, src netip.AddrPort, now time.Ti
 // keepalive answers a KEEPALIVE from an authenticated member with a
 // KEEPALIVE, so that the client can tell the relay is alive.
 func (h *Hub) keepalive(s *session, frameLen int, now time.Time) {
-	if !s.pps.allow(now, h.cfg.ClientPPS, h.cfg.ClientPPSBurst, 1) ||
-		!s.bps.allow(now, h.cfg.ClientBPS, h.cfg.ClientBPSBurst, float64(frameLen)) {
+	if !h.allowClient(s, frameLen, now) {
 		h.stats.rateLimited.Add(1)
 		return
 	}
 	h.deliver(s, []byte{TypeKeepalive})
 }
 
+// allowClient charges one frame of frameLen bytes to the member's rate limits.
+func (h *Hub) allowClient(s *session, frameLen int, now time.Time) bool {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	return s.pps.allow(now, h.cfg.ClientPPS, h.cfg.ClientPPSBurst, 1) &&
+		s.bps.allow(now, h.cfg.ClientBPS, h.cfg.ClientBPSBurst, float64(frameLen))
+}
+
 // forward routes one DATA frame from s to the member of s's own room whose
 // vaddr it names. Nothing else is ever a destination. The caller holds h.mu
 // (read).
 func (h *Hub) forward(s *session, d *dataFrame, frameLen int, now time.Time, scratch *[]byte) {
-	if !s.pps.allow(now, h.cfg.ClientPPS, h.cfg.ClientPPSBurst, 1) ||
-		!s.bps.allow(now, h.cfg.ClientBPS, h.cfg.ClientBPSBurst, float64(frameLen)) {
+	if !h.allowClient(s, frameLen, now) {
 		h.stats.rateLimited.Add(1)
 		return
 	}
@@ -662,14 +680,14 @@ func (h *Hub) Sweep() {
 		frame []byte
 	}
 	var notes []note
-	var closeConns []*wsConn
+	var closeConns []clientConn
 
 	drop := func(s *session, reason byte) {
 		if !h.removeLocked(s, now) {
 			return
 		}
-		if s.ws != nil {
-			closeConns = append(closeConns, s.ws)
+		if s.conn != nil {
+			closeConns = append(closeConns, s.conn)
 		} else if a := s.udpAddr.Load(); a != nil {
 			notes = append(notes, note{*a, encodeError(reason, s.nonce)})
 		}
@@ -679,7 +697,11 @@ func (h *Hub) Sweep() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		for _, s := range h.byToken {
-			if now.Sub(s.seen()) > h.cfg.SessionTimeout {
+			// A WebTransport member is alive as long as its QUIC connection
+			// is (the relay pings it and QUIC's idle timeout ends it), as a
+			// WebSocket member is alive while it answers pings: a browser
+			// answers both by itself even when the page's timers are throttled.
+			if now.Sub(s.seen()) > h.cfg.SessionTimeout && !(s.conn != nil && s.conn.transportLive()) {
 				h.stats.sessionsTimedOut.Add(1)
 				drop(s, ErrTimeout)
 			}
@@ -701,7 +723,7 @@ func (h *Hub) Sweep() {
 			}
 		}
 		for c := range h.conns {
-			if c.sess.Load() == nil && now.Sub(c.accepted) > h.cfg.HandshakeTimeout {
+			if c.getSession() == nil && now.Sub(c.acceptedAt()) > h.cfg.HandshakeTimeout {
 				closeConns = append(closeConns, c)
 			}
 		}

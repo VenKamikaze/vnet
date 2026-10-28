@@ -1693,7 +1693,7 @@ func TestWebSocketAdmissionIsAtomic(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if th.h.acquireWS(netip.MustParseAddr(fmt.Sprintf("192.0.2.%d", i%250+1))) {
+			if th.h.acquireConn(kindWS, netip.MustParseAddr(fmt.Sprintf("192.0.2.%d", i%250+1))) {
 				admitted.Add(1)
 			}
 		}(i)
@@ -1702,8 +1702,8 @@ func TestWebSocketAdmissionIsAtomic(t *testing.T) {
 	if admitted.Load() != 5 {
 		t.Fatalf("%d upgrades admitted with MaxSessions=5", admitted.Load())
 	}
-	th.h.releaseWS(netip.MustParseAddr("192.0.2.1"), true)
-	if !th.h.acquireWS(netip.MustParseAddr("192.0.2.77")) {
+	th.h.releaseConn(kindWS, netip.MustParseAddr("192.0.2.1"), true)
+	if !th.h.acquireConn(kindWS, netip.MustParseAddr("192.0.2.77")) {
 		t.Fatal("a released slot was not reusable")
 	}
 }

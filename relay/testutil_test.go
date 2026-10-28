@@ -52,7 +52,8 @@ func newTestHub(t *testing.T, mod func(*Config)) *testHub {
 	clk := newFakeClock()
 	// Per-address caps are exercised by their own tests; everything else
 	// comes from a handful of test addresses.
-	cfg := Config{Now: clk.Now, MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6}
+	cfg := Config{Now: clk.Now, MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6,
+		MaxWTPerIP: 1e6, MaxPendingWTPerIP: 1e6}
 	if mod != nil {
 		mod(&cfg)
 	}
