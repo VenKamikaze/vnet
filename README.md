@@ -22,13 +22,13 @@ As a subdirectory or with `FetchContent` (use `GIT_REPOSITORY`; archive download
 include(FetchContent)
 FetchContent_Declare(vnet
     GIT_REPOSITORY https://github.com/VenKamikaze/vnet.git
-    GIT_TAG        main)            # or a tag / commit
+    GIT_TAG        v0.1.0)          # pin a release tag or commit
 FetchContent_MakeAvailable(vnet)
 
 target_link_libraries(mygame PRIVATE vnet::vnet)
 ```
 
-(Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
+Until `v0.1.0` is tagged, the code lives on the `claude` branch (use `GIT_TAG claude`, or better a commit hash). (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
 
 Or install it and use `find_package`:
 
@@ -67,9 +67,11 @@ int main(void) {
     char buf[VNET_MAX_DATAGRAM];
     vnet_addr from;
     int n = vnet_recvfrom(b, sb, buf, sizeof buf, &from);   /* VNET_EAGAIN if empty */
-    char who[64];
-    vnet_addr_to_string(&from, who, sizeof who);
-    printf("%.*s from %s\n", n, buf, who);
+    if (n >= 0) {
+        char who[64];
+        vnet_addr_to_string(&from, who, sizeof who);
+        printf("%.*s from %s\n", n, buf, who);
+    }
 
     vnet_destroy(a); vnet_destroy(b);
     vnet_loopback_network_destroy(net);
@@ -84,7 +86,7 @@ Any context can be impaired from code (`vnet_config.impair`) or, with no code ch
 VNET_IMPAIR="lat=80,jit=20,loss=5,dup=1,reorder=3,seed=7" ./mygame
 ```
 
-Keys: `lat`, `jit` (ms), `loss`, `dup`, `reorder` (percent, decimals allowed), `rdelay` (extra ms for reordered packets, default 50), `seed`. The same seed, settings and sends give exactly the same outcome. Impairment is applied to what a context *sends*; delayed datagrams are released by `vnet_poll()`, so keep polling once per frame. A malformed `VNET_IMPAIR` makes `vnet_create()` fail rather than silently testing nothing; set `vnet_config.ignore_env` to opt out of the variable.
+Keys: `lat`, `jit` (ms), `loss`, `dup`, `reorder` (percent, decimals allowed), `rdelay` (extra ms for reordered packets, default 50), `seed`. The same seed, settings and sends give exactly the same outcome. **Without `seed=` every process gets seed 0 and therefore the same loss pattern**; give each peer its own (`seed=1`, `seed=2`, ...). Impairment is applied to what a context *sends*; delayed datagrams are released by `vnet_poll()`, so keep polling once per frame. A malformed `VNET_IMPAIR` makes `vnet_create()` fail rather than silently testing nothing; set `vnet_config.ignore_env` to opt out of the variable.
 
 On the loopback backend time is virtual (`vnet_loopback_network_step(net, ms)`), so latency tests never sleep.
 
@@ -94,7 +96,9 @@ On the loopback backend time is virtual (`vnet_loopback_network_step(net, ms)`),
 cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
-The test suite needs GoogleTest (`apt install libgtest-dev`, or it is fetched with `FetchContent` from git). Options: `VNET_BUILD_TESTS`, `VNET_BUILD_SMOKE` (only the plain-C smoke test, for cross builds), `VNET_INSTALL`, `VNET_WARNINGS_AS_ERRORS`.
+`vnet_time(v)` gives the context's clock in milliseconds (virtual time on loopback), so timeout and RTT code can run on loopback in tests.
+
+The test suite needs GoogleTest (`apt install libgtest-dev`, or it is fetched with `FetchContent` from git). The IPv6 UDP test needs a `::1` interface; it skips without one unless `VNET_REQUIRE_IPV6=1` is set in the environment (CI sets it), in which case a missing `::1` fails the test. Options: `VNET_BUILD_TESTS`, `VNET_BUILD_SMOKE` (only the plain-C smoke test, for cross builds), `VNET_INSTALL`, `VNET_WARNINGS_AS_ERRORS`.
 
 Windows via MinGW-w64 cross-compile:
 
