@@ -44,11 +44,17 @@ static EM_BOOL on_open(int type, const EmscriptenWebSocketOpenEvent *e, void *us
     return EM_TRUE;
 }
 
-static EM_BOOL on_fail(int type, const void *e, void *user) {  // error and close
+static EM_BOOL on_error(int type, const EmscriptenWebSocketErrorEvent *e, void *user) {
     (void)type;
     (void)e;
-    ws_tp *t = user;
-    t->state = RELAY_TP_FAILED;
+    ((ws_tp *)user)->state = RELAY_TP_FAILED;
+    return EM_TRUE;
+}
+
+static EM_BOOL on_close(int type, const EmscriptenWebSocketCloseEvent *e, void *user) {
+    (void)type;
+    (void)e;
+    ((ws_tp *)user)->state = RELAY_TP_FAILED;
     return EM_TRUE;
 }
 
@@ -69,7 +75,7 @@ static int tp_state(void *p) { return ((ws_tp *)p)->state; }
 static int tp_send(void *p, const uint8_t *frame, size_t len) {
     ws_tp *t = p;
     if (t->state != RELAY_TP_OPEN) return VNET_ENOTCONN;
-    uint64_t buffered = 0;
+    size_t buffered = 0;
     if (emscripten_websocket_get_buffered_amount(t->ws, &buffered) == EMSCRIPTEN_RESULT_SUCCESS &&
         buffered > MAX_BUFFERED_BYTES)
         return VNET_EAGAIN;  // a drop
@@ -127,8 +133,8 @@ int vnet__relay_ws_init(vnet *v, const vnet_config *cfg) {
         return VNET_ECONNREFUSED;
     }
     emscripten_websocket_set_onopen_callback(t->ws, t, on_open);
-    emscripten_websocket_set_onerror_callback(t->ws, t, (em_websocket_error_callback_func)on_fail);
-    emscripten_websocket_set_onclose_callback(t->ws, t, (em_websocket_close_callback_func)on_fail);
+    emscripten_websocket_set_onerror_callback(t->ws, t, on_error);
+    emscripten_websocket_set_onclose_callback(t->ws, t, on_close);
     emscripten_websocket_set_onmessage_callback(t->ws, t, on_message);
     return vnet__relay_init(v, cfg, &ws_ops, t);
 }

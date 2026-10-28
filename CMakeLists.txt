@@ -27,6 +27,7 @@ else()
     set(_vnet_relay_default OFF)
 endif()
 option(VNET_BUILD_RELAY "Build the Go relay (needs Go) and run its tests and the relay integration tests" ${_vnet_relay_default})
+option(VNET_BUILD_EXAMPLES "Build the example programs (examples/)" ${VNET_IS_TOP_LEVEL})
 option(VNET_WARNINGS_AS_ERRORS "Treat compiler warnings in vnet's own sources as errors" OFF)
 
 include(GNUInstallDirs)
@@ -95,6 +96,19 @@ endif()
 set_target_properties(vnet PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     C_VISIBILITY_PRESET hidden)
+
+if(VNET_BUILD_EXAMPLES)
+    # relay_peer: two players talking through the relay. Native, it uses the
+    # relay over UDP; under Emscripten it becomes a web page (relay_peer.html +
+    # .js + .wasm) that uses the WebSocket backend.
+    add_executable(relay_peer examples/relay_peer.c)
+    target_link_libraries(relay_peer PRIVATE vnet)
+    if(EMSCRIPTEN)
+        set_target_properties(relay_peer PROPERTIES SUFFIX ".html")
+        target_link_options(relay_peer PRIVATE
+            "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/examples/shell.html")
+    endif()
+endif()
 
 if(VNET_BUILD_TESTS OR VNET_BUILD_SMOKE)
     if(VNET_BUILD_TESTS)
