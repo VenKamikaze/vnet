@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(vnet
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "Virtual UDP for games: a small non-blocking datagram API with pluggable backends"
     LANGUAGES C)
 
@@ -18,6 +18,15 @@ endif()
 option(VNET_BUILD_TESTS "Build the vnet tests: GoogleTest suite plus the C smoke test" ${VNET_IS_TOP_LEVEL})
 option(VNET_BUILD_SMOKE "Build only the dependency-free C smoke test (e.g. MinGW cross builds)" OFF)
 option(VNET_INSTALL "Generate install rules for vnet" ${VNET_IS_TOP_LEVEL})
+# The relay server (Go) and the tests that need it. On by default when Go is
+# found; the tests that start the relay are only built then (never skipped).
+find_program(VNET_GO_EXECUTABLE go HINTS /usr/local/go/bin)
+if(VNET_GO_EXECUTABLE AND VNET_IS_TOP_LEVEL AND NOT CMAKE_CROSSCOMPILING)
+    set(_vnet_relay_default ON)
+else()
+    set(_vnet_relay_default OFF)
+endif()
+option(VNET_BUILD_RELAY "Build the Go relay (needs Go) and run its tests and the relay integration tests" ${_vnet_relay_default})
 option(VNET_WARNINGS_AS_ERRORS "Treat compiler warnings in vnet's own sources as errors" OFF)
 
 include(GNUInstallDirs)
@@ -26,6 +35,10 @@ add_library(vnet STATIC
     src/addr.c
     src/impair.c
     src/loopback.c
+    src/random.c
+    src/relay_client.c
+    src/relay_udp.c
+    src/relay_ws.c
     src/udp.c
     src/vnet.c)
 add_library(vnet::vnet ALIAS vnet)
@@ -45,6 +58,12 @@ if(APPLE)
     target_compile_definitions(vnet PRIVATE _DARWIN_C_SOURCE)
 elseif(UNIX)
     target_compile_definitions(vnet PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
+
+if(EMSCRIPTEN)
+    # The browser WebSocket transport (VNET_BACKEND_RELAY_WS) uses Emscripten's
+    # <emscripten/websocket.h>. It needs no ports.
+    target_link_libraries(vnet PUBLIC websocket.js)
 endif()
 
 if(WIN32)

@@ -20,6 +20,13 @@ typedef struct vnet_backend {
     int (*recv)(vnet *v, int s, void *buf, size_t cap, vnet_addr *from);
     void (*poll)(vnet *v);
     void (*destroy)(vnet *v);
+    // Optional (NULL = no setup phase: always READY, no extra address forms).
+    // Fill in everything but the common fields; return the VNET_STATUS_* state.
+    int (*status)(vnet *v, vnet_status_info *out);
+    // Optional extra address forms for vnet_resolve(). Return 0 (done), a
+    // negative VNET_E* code (it was this backend's form but invalid), or 1
+    // (not one of this backend's forms: use the built-in parser).
+    int (*resolve)(vnet *v, const char *host_port, vnet_addr *out);
 } vnet_backend;
 
 typedef struct vnet_imp vnet_imp;
@@ -28,6 +35,9 @@ struct vnet {
     const vnet_backend *be;
     void *bs;  // backend state
     int max_sockets;
+    size_t max_dgram;  // largest datagram the backend accepts: VNET_MAX_DATAGRAM,
+                       // except for the relay's inner UDP socket, which also
+                       // carries the relay framing
     vnet_clock_fn clock;
     void *clock_user;
     vnet_log_fn log;
@@ -43,6 +53,7 @@ void vnet__logf(vnet *v, int level, const char *fmt, ...)
 #endif
     ;
 uint64_t vnet__now(vnet *v);
+uint64_t vnet__system_clock(void *user);
 // Impaired datagrams due now go to the backend (also done by vnet_poll()).
 void vnet__release(vnet *v);
 int vnet__wire_send(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to);
@@ -66,6 +77,37 @@ int vnet__imp_validate(const vnet_impair *cfg);
 void vnet__imp_submit(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to);
 void vnet__imp_release(vnet *v);
 void vnet__imp_purge_socket(vnet *v, int s);
+
+// random.c
+// Fill buf with n bytes from the OS random source (falls back to a time-based
+// mix if there is none). Not for key material: used for handshake nonces.
+void vnet__random(void *buf, size_t n);
+
+// Relay client (relay_client.c). A relay backend is a framing/state-machine
+// core plus a transport that moves whole frames: UDP datagrams (relay_udp.c)
+// or WebSocket messages (relay_ws.c).
+#define RELAY_TP_CONNECTING 0
+#define RELAY_TP_OPEN 1
+#define RELAY_TP_FAILED 2
+#define RELAY_TPF_UDP_STYLE 1u  // frames carry the token, handshake padded and retransmitted
+
+typedef struct relay_transport_ops {
+    const char *name;  // vnet_status_info.transport
+    unsigned flags;
+    int (*state)(void *tp);                                  // RELAY_TP_*
+    int (*send)(void *tp, const uint8_t *frame, size_t len); // 0, or a VNET_E* (EAGAIN = dropped)
+    int (*recv)(void *tp, uint8_t *buf, size_t cap);         // frame length or VNET_EAGAIN
+    void (*destroy)(void *tp);
+} relay_transport_ops;
+
+// Takes ownership of `tp` (destroyed on failure too). Sets v->be / v->bs.
+int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp);
+int vnet__relay_udp_init(vnet *v, const vnet_config *cfg);
+int vnet__relay_ws_init(vnet *v, const vnet_config *cfg);
+// Like vnet_create() with a relay backend over a caller-supplied transport.
+// For tests (scripted relays, WebSocket-style framing on a native build).
+vnet *vnet__create_with_relay_transport(const vnet_config *cfg, const relay_transport_ops *ops,
+                                        void *tp, int *err);
 
 // Backends. Each fills v->be / v->bs (and v->clock if cfg->clock is NULL
 // and the backend has its own default). Return 0 or a VNET_E* code.
