@@ -36,10 +36,11 @@ func main() {
 		maxMembers = fs.Int("max-members", 8, "members per room, including the creator (2..254)")
 		maxRooms   = fs.Int("max-rooms", 1000, "rooms at once")
 		maxSess    = fs.Int("max-sessions", 20000, "members at once (also caps open WebSockets)")
-		perIPSess  = fs.Int("max-sessions-per-ip", 64, "members at once per source address (IPv6: per /64); many players behind one NAT share it")
+		perIPSess  = fs.Int("max-sessions-per-ip", 128, "members at once per source address (IPv6: per /64); many players behind one NAT share it")
 		perIPRooms = fs.Int("max-rooms-per-ip", 16, "rooms created and still alive per source address")
-		perIPWS    = fs.Int("max-ws-per-ip", 64, "open WebSockets per source address")
-		perIPPend  = fs.Int("max-pending-ws-per-ip", 8, "WebSockets per source address that have not entered a room yet")
+		perIPWS    = fs.Int("max-ws-per-ip", 128, "open WebSockets per source address")
+		perIPPend  = fs.Int("max-pending-ws-per-ip", 32, "WebSockets per source address that have not entered a room yet")
+		prefixFac  = fs.Int("ipv6-prefix-factor", 4, "an IPv6 /48 may hold this many times the per-address caps in total")
 		wsQBytes   = fs.Int("ws-queue-bytes", 65536, "bytes queued per WebSocket client before its datagrams are dropped")
 		statsAddr  = fs.String("stats", "", "serve /stats (JSON counters) on this address, e.g. 127.0.0.1:8081; off by default")
 		roomIdle   = fs.Duration("room-idle", 30*time.Minute, "close a room that has carried no data for this long")
@@ -71,6 +72,7 @@ func main() {
 		MaxRoomsPerIP:     *perIPRooms,
 		MaxWSPerIP:        *perIPWS,
 		MaxPendingWSPerIP: *perIPPend,
+		PrefixFactor:      *prefixFac,
 		WSSendQueueBytes:  *wsQBytes,
 		RoomIdleTimeout:   *roomIdle,
 		SessionTimeout:    *sessTO,
@@ -79,8 +81,9 @@ func main() {
 		ClientBPS:         *bps,
 		HandshakePerSec:   *hsRate,
 		HandshakeBurst:    *hsBurst,
-		ReplyPerSec:       *hsRate,
-		ReplyBurst:        *hsBurst,
+		// Every handshake costs two replies (RETRY, then ROOM or ERROR).
+		ReplyPerSec:       *hsRate * 2,
+		ReplyBurst:        *hsBurst * 2,
 		TrustForwardedFor: *trustXFF,
 	}
 	if *origins != "" && *origins != "*" {

@@ -101,6 +101,11 @@ func ap(ip string, port uint16) netip.AddrPort {
 // handshakeFrame builds CREATE_ROOM (code == "") or JOIN_ROOM padded to n
 // bytes (at least the frame itself).
 func handshakeFrame(nonce uint64, code string, n int) []byte {
+	return handshakeFrameC(nonce, code, nil, n)
+}
+
+// handshakeFrameC is a handshake carrying a retry cookie (nil: none yet).
+func handshakeFrameC(nonce uint64, code string, cookie []byte, n int) []byte {
 	l := createLen
 	typ := byte(TypeCreate)
 	if code != "" {
@@ -115,6 +120,13 @@ func handshakeFrame(nonce uint64, code string, n int) []byte {
 	b[1] = ProtocolVersion
 	binary.BigEndian.PutUint64(b[2:], nonce)
 	copy(b[createLen:], code)
+	if cookie != nil {
+		at := createLen
+		if code != "" {
+			at = joinLen
+		}
+		copy(b[at:], cookie)
+	}
 	return b
 }
 
@@ -167,41 +179,58 @@ type vclient struct {
 	room roomReply
 }
 
+// hsFeed delivers a handshake the way a real client behaves: the first
+// request (no cookie) draws a RETRY, which is taken out of the recorded output
+// and answered with the same request carrying the cookie. What remains in the
+// recorded output are the relay's answers to the second request.
+func (th *testHub) hsFeed(src netip.AddrPort, frame []byte) {
+	th.t.Helper()
+	th.feed(src, frame)
+	th.mu.Lock()
+	var retry []byte
+	kept := th.sent[:0]
+	for _, p := range th.sent {
+		if retry == nil && p.to == src && len(p.b) == retryLen && p.b[0] == TypeRetry {
+			retry = p.b
+			continue
+		}
+		kept = append(kept, p)
+	}
+	th.sent = kept
+	th.mu.Unlock()
+	if retry == nil {
+		return // refused outright (bad version, ...)
+	}
+	cookie := retry[2+NonceLen:]
+	at := createLen
+	if frame[0] == TypeJoin {
+		at = joinLen
+	}
+	again := append([]byte(nil), frame...)
+	copy(again[at:], cookie)
+	th.feed(src, again)
+}
+
 func (th *testHub) mustCreate(addr netip.AddrPort, nonce uint64) *vclient {
 	th.t.Helper()
 	th.drain()
-	th.feed(addr, handshakeFrame(nonce, "", MinUDPHandshake))
+	th.hsFeed(addr, handshakeFrame(nonce, "", MinUDPHandshake))
 	pk := th.take(addr)
 	if len(pk) != 1 {
 		th.t.Fatalf("CREATE: want 1 reply, got %d", len(pk))
 	}
-	c := &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
-	th.validate(c)
-	return c
-}
-
-// validate does what a client does as soon as it has its ROOM: send a
-// KEEPALIVE from its address, which proves it receives there. The relay
-// sends nothing to a UDP member before that.
-func (th *testHub) validate(c *vclient) {
-	th.t.Helper()
-	c.keepalive()
-	if pk := th.take(c.addr); len(pk) != 1 || len(pk[0]) != 1 || pk[0][0] != TypeKeepalive {
-		th.t.Fatalf("validation keepalive: %v", pk)
-	}
+	return &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
 }
 
 func (th *testHub) mustJoin(addr netip.AddrPort, nonce uint64, code string) *vclient {
 	th.t.Helper()
 	th.drain()
-	th.feed(addr, handshakeFrame(nonce, code, MinUDPHandshake))
+	th.hsFeed(addr, handshakeFrame(nonce, code, MinUDPHandshake))
 	pk := th.take(addr)
 	if len(pk) != 1 {
 		th.t.Fatalf("JOIN: want 1 reply, got %d", len(pk))
 	}
-	c := &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
-	th.validate(c)
-	return c
+	return &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
 }
 
 func (c *vclient) dataFrame(dstOctet byte, dport, sport uint16, payload []byte) []byte {

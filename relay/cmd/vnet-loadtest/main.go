@@ -67,18 +67,28 @@ func (c *client) read(b []byte) (int, error) {
 func handshake(c *client, code string) error {
 	var nonce [8]byte
 	_, _ = rand.Read(nonce[:])
-	f := []byte{typeCreate, version}
-	f = append(f, nonce[:]...)
-	if code != "" {
-		f[0] = typeJoin
-		f = append(f, code...)
-	}
-	if c.ws == nil && len(f) < 64 {
-		f = append(f, make([]byte, 64-len(f))...)
+	build := func(cookie []byte) []byte {
+		f := []byte{typeCreate, version}
+		f = append(f, nonce[:]...)
+		if code != "" {
+			f[0] = typeJoin
+			f = append(f, code...)
+		}
+		if c.ws == nil { // UDP: the retry cookie follows the fields, and the datagram is padded
+			f = append(f, make([]byte, 16)...)
+			if cookie != nil {
+				copy(f[len(f)-16:], cookie)
+			}
+			if len(f) < 64 {
+				f = append(f, make([]byte, 64-len(f))...)
+			}
+		}
+		return f
 	}
 	buf := make([]byte, 2048)
+	var cookie []byte
 	for try := 0; try < 10; try++ {
-		if err := c.write(f); err != nil {
+		if err := c.write(build(cookie)); err != nil {
 			return err
 		}
 		if c.udp != nil {
@@ -86,6 +96,10 @@ func handshake(c *client, code string) error {
 		}
 		n, err := c.read(buf)
 		if err != nil {
+			continue
+		}
+		if n == 26 && buf[0] == 0x07 { // RETRY: repeat with the cookie
+			cookie = append([]byte(nil), buf[10:26]...)
 			continue
 		}
 		if n == 11 && buf[0] == 0x82 && buf[10] == 5 { // rate limited: back off, same request
@@ -96,17 +110,6 @@ func handshake(c *client, code string) error {
 			c.octet = buf[13]
 			copy(c.token[:], buf[14:30])
 			c.code = string(buf[30:36])
-			if c.ws == nil {
-				// What a real client does at once: prove it receives at its
-				// address (the relay sends a UDP member nothing before that).
-				for k := 0; k < 10; k++ {
-					_ = c.write(append([]byte{typeKeepalive}, c.token[:]...))
-					_ = c.udp.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-					if n, err := c.read(buf); err == nil && n == 1 && buf[0] == typeKeepalive {
-						break
-					}
-				}
-			}
 			return nil
 		}
 		return fmt.Errorf("unexpected reply % x", buf[:n])

@@ -30,10 +30,11 @@ Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper ca
 | `-max-members` | 8 | members per room, creator included (2..254) |
 | `-max-rooms` | 1000 | rooms at once |
 | `-max-sessions` | 20000 | members at once (also caps open WebSockets) |
-| `-max-sessions-per-ip` | 64 | members at once per source address (IPv6: per /64). Everyone behind one NAT shares it |
+| `-max-sessions-per-ip` | 128 | members at once per source address (IPv6: per /64). Everyone behind one NAT shares it, carrier-grade NAT included |
 | `-max-rooms-per-ip` | 16 | rooms created and still alive per source address |
-| `-max-ws-per-ip` | 64 | open WebSockets per source address |
-| `-max-pending-ws-per-ip` | 8 | WebSockets per source address that have not entered a room yet |
+| `-max-ws-per-ip` | 128 | open WebSockets per source address |
+| `-max-pending-ws-per-ip` | 32 | WebSockets per source address that have not entered a room yet. Browsers refused here (HTTP 503) retry for about 4 s |
+| `-ipv6-prefix-factor` | 4 | an IPv6 /48 may hold this many times the per-address caps in total, so many /64s of one subscriber cannot take the whole relay |
 | `-ws-queue-bytes` | 65536 | bytes queued per WebSocket client before its datagrams are dropped (worst-case memory is roughly this times the number of stuck clients) |
 | `-room-idle` | 30m | close a room that has carried no data for this long |
 | `-session-timeout` | 15s | drop a member silent for this long |
@@ -75,6 +76,8 @@ location /vnet {
 ```
 
 Native clients do not use TLS or the proxy: open the UDP port (7777 by default) in the firewall. The UDP path is not encrypted (see the security notes in the protocol document).
+
+**Limits that players behind one address share (for game developers, e.g. Bit Riot brief 12):** every cap above is per source address, so a classroom, a LAN party or a carrier-grade NAT with many players on one public address shares one budget: 128 members, 16 rooms, 128 open WebSockets and 32 sockets that have not entered a room yet at any instant, 20 new handshakes per second (burst 50). A browser that is refused retries by itself for about 4 s (the relay answers 503 and the browser backend retries); a native client gets `ERROR(LIMIT)` (`VNET_ELIMIT`) for the caps on members and rooms. Raise the flags if you expect more, and run the relay behind `-trust-forwarded-for` so that browsers behind a proxy are counted by their own addresses.
 
 Other notes:
 

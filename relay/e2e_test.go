@@ -112,16 +112,16 @@ func (c *udpC) handshake(code string) *udpC {
 	c.nonce = nonceCounter.Add(1) + 1<<40
 	c.write(handshakeFrame(c.nonce, code, MinUDPHandshake))
 	b := c.read(waitLimit)
+	if len(b) != retryLen || b[0] != TypeRetry {
+		c.t.Fatalf("expected a RETRY, got % x", b)
+	}
+	// Repeat the request with the cookie, as a client does.
+	c.write(handshakeFrameC(c.nonce, code, b[2+NonceLen:], MinUDPHandshake))
+	b = c.read(waitLimit)
 	if b == nil {
 		c.t.Fatal("no reply to handshake")
 	}
 	c.room = parseRoom(c.t, b)
-	// What a client does at once: a KEEPALIVE from its address proves it
-	// receives there; the relay sends it nothing before that.
-	c.write(append([]byte{TypeKeepalive}, c.room.token[:]...))
-	if r := c.read(waitLimit); len(r) != 1 || r[0] != TypeKeepalive {
-		c.t.Fatalf("no reply to the validating keepalive: % x", r)
-	}
 	return c
 }
 
@@ -834,6 +834,9 @@ func TestWebSocketsPerAddressCaps(t *testing.T) {
 	// A source cannot sit on unauthenticated sockets: two is the limit.
 	if !refused() {
 		t.Fatal("a third socket that has not entered a room was admitted")
+	}
+	if e.srv.Stats().WSRefused != 1 {
+		t.Fatalf("refusals not counted: %+v", e.srv.Stats())
 	}
 	// Entering a room makes a socket a member and frees a pending slot.
 	a.create()

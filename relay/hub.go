@@ -3,8 +3,11 @@
 package relay
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -22,12 +25,9 @@ type session struct {
 	octet   byte // last byte of the vaddr 10.0.0.octet
 	ws      *wsConn
 
-	created   time.Time
-	ip        netip.Addr                     // limiter key of the source that created it (IPv6 as /64)
-	udpAddr   atomic.Pointer[netip.AddrPort] // UDP sessions: where to send. Moves only after path validation
-	validated atomic.Bool                    // UDP: a frame bearing the token has arrived from udpAddr, so the
-	//                                         member really receives there. Until then nothing is sent to it.
-	lastSeen atomic.Int64 // unix nanos of the last frame or pong
+	ip       netip.Addr                     // limiter key of the source that created it (IPv6 as /64)
+	udpAddr  atomic.Pointer[netip.AddrPort] // UDP sessions: where to send. Proven at creation (the handshake cookie), moves only after path validation
+	lastSeen atomic.Int64                   // unix nanos of the last frame or pong
 
 	// Address validation (UDP): a frame with a valid token from a source other
 	// than udpAddr does not move the session; it earns a PATH_CHALLENGE to
@@ -75,7 +75,14 @@ func (r *room) freeOctet() byte {
 	return 0
 }
 
-// ipCount is what one source address (IPv6: one /64) currently holds.
+// limKey names what the per-source counters are kept for: one address (IPv6:
+// one /64), or, for IPv6, the /48 around it.
+type limKey struct {
+	addr  netip.Addr
+	group bool
+}
+
+// ipCount is what one limKey currently holds.
 type ipCount struct {
 	sessions  int
 	rooms     int
@@ -93,12 +100,17 @@ type nonceEntry struct {
 type Hub struct {
 	cfg Config
 
-	mu      sync.RWMutex
-	rooms   map[string]*room
-	byToken map[[TokenLen]byte]*session
-	byNonce map[[NonceLen]byte]*nonceEntry
-	conns   map[*wsConn]struct{}
-	perIP   map[netip.Addr]*ipCount
+	mu         sync.RWMutex
+	rooms      map[string]*room
+	byToken    map[[TokenLen]byte]*session
+	byNonce    map[[NonceLen]byte]*nonceEntry
+	conns      map[*wsConn]struct{}
+	perIP      map[limKey]*ipCount
+	wsReserved int      // WebSocket upgrades admitted and not yet finished (the check against MaxSessions is made on this)
+	secret     [32]byte // keys the handshake cookies
+	// panicHook, if set (tests), is called with the name of a few critical
+	// sections so a test can make them panic and prove the lock is released.
+	panicHook func(where string)
 
 	ips   *ipLimiter
 	stats stats
@@ -113,7 +125,10 @@ func newHub(cfg Config) *Hub {
 		byToken: make(map[[TokenLen]byte]*session),
 		byNonce: make(map[[NonceLen]byte]*nonceEntry),
 		conns:   make(map[*wsConn]struct{}),
-		perIP:   make(map[netip.Addr]*ipCount),
+		perIP:   make(map[limKey]*ipCount),
+	}
+	if _, err := rand.Read(h.secret[:]); err != nil {
+		panic("relay: no randomness: " + err.Error())
 	}
 	h.ips = newIPLimiter(&h.cfg)
 	return h
@@ -131,20 +146,52 @@ type hsReq struct {
 	ip    netip.Addr // limiter key of the requester
 }
 
-// counts returns (creating if needed) the holdings of ip. Caller holds h.mu.
-func (h *Hub) counts(ip netip.Addr) *ipCount {
-	c := h.perIP[ip]
-	if c == nil {
-		c = &ipCount{}
-		h.perIP[ip] = c
+// keysFor lists the counters an address (already a limiter key) is charged to.
+func keysFor(ip netip.Addr) []limKey {
+	ks := []limKey{{addr: ip}}
+	if ip.Is6() {
+		ks = append(ks, limKey{addr: netip.PrefixFrom(ip, 48).Masked().Addr(), group: true})
 	}
-	return c
+	return ks
 }
 
-// release drops the entry when it is back to zero. Caller holds h.mu.
-func (h *Hub) trim(ip netip.Addr, c *ipCount) {
-	if c.sessions == 0 && c.rooms == 0 && c.ws == 0 && c.pendingWS == 0 {
-		delete(h.perIP, ip)
+// capsFor returns the limits that apply to k.
+func (h *Hub) capsFor(k limKey) (sessions, rooms, ws, pending int) {
+	f := 1
+	if k.group {
+		f = h.cfg.PrefixFactor
+	}
+	return h.cfg.MaxSessionsPerIP * f, h.cfg.MaxRoomsPerIP * f, h.cfg.MaxWSPerIP * f, h.cfg.MaxPendingWSPerIP * f
+}
+
+// room admission: would one more session (and room) from ip fit? Caller holds h.mu.
+func (h *Hub) fits(ip netip.Addr, newRoom bool) bool {
+	for _, k := range keysFor(ip) {
+		c := h.perIP[k]
+		if c == nil {
+			continue
+		}
+		cs, cr, _, _ := h.capsFor(k)
+		if c.sessions >= cs || (newRoom && c.rooms >= cr) {
+			return false
+		}
+	}
+	return true
+}
+
+// charge adds delta to ip's counters through f, and drops entries back at
+// zero. Caller holds h.mu.
+func (h *Hub) charge(ip netip.Addr, f func(*ipCount)) {
+	for _, k := range keysFor(ip) {
+		c := h.perIP[k]
+		if c == nil {
+			c = &ipCount{}
+			h.perIP[k] = c
+		}
+		f(c)
+		if c.sessions <= 0 && c.rooms <= 0 && c.ws <= 0 && c.pendingWS <= 0 {
+			delete(h.perIP, k)
+		}
 	}
 }
 
@@ -184,8 +231,16 @@ func (h *Hub) handshake(r hsReq, now time.Time) (reply []byte, sess *session) {
 			h.stats.handshakeRejected.Add(1)
 			return encodeError(ErrNonceReused, r.nonce), nil
 		}
-		// A repeat from another address gets the same ROOM, but does not move
-		// the session: only a validated path (PATH_CHALLENGE) does that.
+		// The ROOM (and with it the token) goes only to the address the
+		// session was created for, which proved with its cookie that it
+		// receives there. A repeat from anywhere else, even with a cookie of
+		// its own, learns nothing about the session.
+		if r.udp != nil {
+			if cur := s.udpAddr.Load(); cur == nil || *cur != *r.udp {
+				h.stats.handshakeRejected.Add(1)
+				return encodeError(ErrNonceReused, r.nonce), nil
+			}
+		}
 		s.touch(now)
 		h.stats.handshakeRetries.Add(1)
 		return h.roomReply(s), s
@@ -196,9 +251,7 @@ func (h *Hub) handshake(r hsReq, now time.Time) (reply []byte, sess *session) {
 		return encodeError(ErrLimit, r.nonce), nil
 	}
 
-	ipc := h.counts(r.ip)
-	defer h.trim(r.ip, ipc) // an entry created for a refused request must not stay
-	if ipc.sessions >= h.cfg.MaxSessionsPerIP {
+	if !h.fits(r.ip, r.kind == TypeCreate) {
 		h.stats.handshakeRejected.Add(1)
 		return encodeError(ErrLimit, r.nonce), nil
 	}
@@ -206,7 +259,7 @@ func (h *Hub) handshake(r hsReq, now time.Time) (reply []byte, sess *session) {
 	var rm *room
 	var octet byte
 	if r.kind == TypeCreate {
-		if len(h.rooms) >= h.cfg.MaxRooms || ipc.rooms >= h.cfg.MaxRoomsPerIP {
+		if len(h.rooms) >= h.cfg.MaxRooms {
 			h.stats.handshakeRejected.Add(1)
 			return encodeError(ErrLimit, r.nonce), nil
 		}
@@ -230,14 +283,16 @@ func (h *Hub) handshake(r hsReq, now time.Time) (reply []byte, sess *session) {
 	}
 	if r.udp != nil {
 		s.setAddr(*r.udp)
-	} else {
-		s.validated.Store(true) // a WebSocket is its own proof of path
 	}
 	s.touch(now)
-	s.created = now
-	ipc.sessions++
-	if r.kind == TypeCreate {
-		ipc.rooms++
+	isCreate := r.kind == TypeCreate
+	h.charge(r.ip, func(c *ipCount) {
+		c.sessions++
+		if isCreate {
+			c.rooms++
+		}
+	})
+	if isCreate {
 		h.rooms[rm.code] = rm
 		rm.lastData.Store(now.UnixNano())
 		h.stats.roomsCreated.Add(1)
@@ -260,19 +315,16 @@ func (h *Hub) removeLocked(s *session, now time.Time) bool {
 	}
 	delete(h.byToken, s.token)
 	h.byNonce[s.nonce] = &nonceEntry{until: now.Add(h.cfg.NonceTTL)}
-	if c := h.perIP[s.ip]; c != nil {
-		c.sessions--
-		h.trim(s.ip, c)
+	h.charge(s.ip, func(c *ipCount) { c.sessions-- })
+	if h.panicHook != nil {
+		h.panicHook("removeLocked")
 	}
 	rm := s.room
 	if rm.members[s.octet] == s {
 		rm.members[s.octet] = nil
 		rm.n--
 		if rm.n == 0 {
-			if c := h.perIP[rm.creatorIP]; c != nil {
-				c.rooms--
-				h.trim(rm.creatorIP, c)
-			}
+			h.charge(rm.creatorIP, func(c *ipCount) { c.rooms-- })
 			delete(h.rooms, rm.code)
 			h.stats.roomsClosed.Add(1)
 			h.cfg.Logf("room %s closed (empty)", rm.code)
@@ -284,8 +336,8 @@ func (h *Hub) removeLocked(s *session, now time.Time) bool {
 // leave removes a member at its own request (LEAVE, or its WebSocket closing).
 func (h *Hub) leave(s *session) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.removeLocked(s, h.now())
-	h.mu.Unlock()
 }
 
 // replyUnauth sends a reply to a source that has not proved it holds a
@@ -318,10 +370,6 @@ func (h *Hub) deliver(s *session, b []byte) {
 		s.ws.enqueue(append([]byte(nil), b...))
 		return
 	}
-	if !s.validated.Load() {
-		h.stats.unvalidatedDrops.Add(1) // nothing proves anyone receives at this address yet
-		return
-	}
 	if a := s.udpAddr.Load(); a != nil {
 		h.send(*a, b)
 	}
@@ -351,6 +399,46 @@ func (h *Hub) HandleUDP(p []byte, src netip.AddrPort, scratch *[]byte) {
 	}
 }
 
+// cookieFor is the stateless-retry cookie of a handshake: an HMAC, under a
+// secret that never leaves the relay, over the source address, the client's
+// nonce and a coarse time bucket. Only a host that received the RETRY sent to
+// that address can produce it.
+func (h *Hub) cookieFor(src netip.AddrPort, nonce [NonceLen]byte, bucket int64) [CookieLen]byte {
+	m := hmac.New(sha256.New, h.secret[:])
+	a := src.Addr().Unmap().As16()
+	m.Write(a[:])
+	var tail [2 + NonceLen + 8]byte
+	binary.BigEndian.PutUint16(tail[:], src.Port())
+	copy(tail[2:], nonce[:])
+	binary.BigEndian.PutUint64(tail[2+NonceLen:], uint64(bucket))
+	m.Write(tail[:])
+	var out [CookieLen]byte
+	copy(out[:], m.Sum(nil))
+	return out
+}
+
+func (h *Hub) bucketOf(now time.Time) int64 {
+	return now.UnixNano() / int64(h.cfg.RetryCookieBucket)
+}
+
+func (h *Hub) cookieValid(src netip.AddrPort, nonce [NonceLen]byte, cookie []byte, now time.Time) bool {
+	b := h.bucketOf(now)
+	for _, bk := range [2]int64{b, b - 1} {
+		want := h.cookieFor(src, nonce, bk)
+		if hmac.Equal(want[:], cookie) {
+			return true
+		}
+	}
+	return false
+}
+
+// udpHandshake handles CREATE_ROOM / JOIN_ROOM over UDP. The source address of
+// a datagram is forgeable, so nothing is created for a source until it has
+// proved it receives there: a request without a valid cookie is answered
+// with RETRY(cookie) and forgotten (no state, no budget used), and only the
+// repeat that carries the cookie creates the session. The cookie covers the
+// source address and the nonce, so it cannot be moved to another address or
+// request.
 func (h *Hub) udpHandshake(p []byte, src netip.AddrPort, now time.Time) {
 	// Padding rule: a datagram too short to be answered safely is dropped
 	// without a reply and without creating any state.
@@ -358,17 +446,34 @@ func (h *Hub) udpHandshake(p []byte, src netip.AddrPort, now time.Time) {
 		h.stats.malformed.Add(1)
 		return
 	}
-	ip := src.Addr().Unmap()
+	src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
+	ip := src.Addr()
 	var nonce [NonceLen]byte
 	copy(nonce[:], p[2:2+NonceLen])
-	if !h.ips.allowHandshake(ip, now) {
-		h.stats.rateLimited.Add(1)
-		h.replyUnauth(src, len(p), encodeError(ErrRate, nonce), now)
-		return
-	}
 	if p[1] != ProtocolVersion {
 		h.stats.handshakeRejected.Add(1)
 		h.replyUnauth(src, len(p), encodeError(ErrBadVersion, nonce), now)
+		return
+	}
+	cookieAt := createLen
+	if p[0] == TypeJoin {
+		cookieAt = joinLen
+	}
+	cookie := p[cookieAt : cookieAt+CookieLen]
+	if !h.cookieValid(src, nonce, cookie, now) {
+		h.stats.badCookies.Add(1)
+		// Stateless: the reply is a function of the request and the clock.
+		// It is smaller than the request and counted against the sender's
+		// reply budget like any answer to an unproven source.
+		ck := h.cookieFor(src, nonce, h.bucketOf(now))
+		h.stats.retriesSent.Add(1)
+		h.replyUnauth(src, len(p), encodeRetry(nonce, ck), now)
+		return
+	}
+	// The source is proven. Only now do rate limits and state apply.
+	if !h.ips.allowHandshake(ip, now) {
+		h.stats.rateLimited.Add(1)
+		h.replyUnauth(src, len(p), encodeError(ErrRate, nonce), now)
 		return
 	}
 	req := hsReq{kind: p[0], nonce: nonce, ip: ipKey(ip)}
@@ -381,8 +486,7 @@ func (h *Hub) udpHandshake(p []byte, src netip.AddrPort, now time.Time) {
 		}
 		req.code = code
 	}
-	addr := netip.AddrPortFrom(ip, src.Port())
-	req.udp = &addr
+	req.udp = &src
 	reply, _ := h.handshake(req, now)
 	h.replyUnauth(src, len(p), reply, now)
 }
@@ -423,9 +527,7 @@ func (h *Hub) udpAuthenticated(p []byte, src netip.AddrPort, now time.Time, scra
 	// it would let anyone holding a token aim the relay at a victim. So the
 	// session stays where it was, and a frame from elsewhere is answered with
 	// a challenge that only a host receiving at that address can echo.
-	if cur := s.udpAddr.Load(); cur != nil && *cur == src {
-		s.validated.Store(true)
-	} else {
+	if cur := s.udpAddr.Load(); cur == nil || *cur != src {
 		h.challenge(s, src, len(p), now)
 	}
 	switch p[0] {
@@ -439,10 +541,15 @@ func (h *Hub) udpAuthenticated(p []byte, src netip.AddrPort, now time.Time, scra
 			h.stats.malformed.Add(1)
 			return
 		}
-		h.mu.RLock()
-		h.forward(s, &d, len(p), now, scratch)
-		h.mu.RUnlock()
+		h.forwardLocked(s, &d, len(p), now, scratch)
 	}
+}
+
+// forwardLocked is forward under the read lock, released even if forward panics.
+func (h *Hub) forwardLocked(s *session, d *dataFrame, frameLen int, now time.Time, scratch *[]byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.forward(s, d, frameLen, now, scratch)
 }
 
 // challenge sends a PATH_CHALLENGE to src, a source the session is not
@@ -488,7 +595,6 @@ func (h *Hub) pathResponse(s *session, p []byte, src netip.AddrPort, now time.Ti
 		return
 	}
 	s.setAddr(src)
-	s.validated.Store(true)
 	h.stats.pathMigrations.Add(1)
 }
 
@@ -515,6 +621,9 @@ func (h *Hub) forward(s *session, d *dataFrame, frameLen int, now time.Time, scr
 	rm := s.room
 	if rm.members[s.octet] != s {
 		return
+	}
+	if h.panicHook != nil {
+		h.panicHook("forward")
 	}
 	rm.lastData.Store(now.UnixNano())
 	var dst *session
@@ -548,45 +657,42 @@ func (h *Hub) Sweep() {
 		}
 		if s.ws != nil {
 			closeConns = append(closeConns, s.ws)
-		} else if a := s.udpAddr.Load(); a != nil && s.validated.Load() {
+		} else if a := s.udpAddr.Load(); a != nil {
 			notes = append(notes, note{*a, encodeError(reason, s.nonce)})
 		}
 	}
 
-	h.mu.Lock()
-	for _, s := range h.byToken {
-		if now.Sub(s.seen()) > h.cfg.SessionTimeout {
-			h.stats.sessionsTimedOut.Add(1)
-			drop(s, ErrTimeout)
-		} else if s.ws == nil && !s.validated.Load() && now.Sub(s.created) > h.cfg.UnvalidatedTimeout {
-			// Never proved it receives at the address its handshake came from
-			// (a forged source, or a client that vanished at once).
-			h.stats.sessionsTimedOut.Add(1)
-			drop(s, ErrTimeout)
+	func() { // the lock is released even if something in here panics and is recovered
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, s := range h.byToken {
+			if now.Sub(s.seen()) > h.cfg.SessionTimeout {
+				h.stats.sessionsTimedOut.Add(1)
+				drop(s, ErrTimeout)
+			}
 		}
-	}
-	for _, rm := range h.rooms {
-		if now.Sub(time.Unix(0, rm.lastData.Load())) > h.cfg.RoomIdleTimeout {
-			h.stats.roomsIdleClosed.Add(1)
-			h.cfg.Logf("room %s closed (idle)", rm.code)
-			for _, m := range rm.members {
-				if m != nil {
-					drop(m, ErrClosed)
+		for _, rm := range h.rooms {
+			if now.Sub(time.Unix(0, rm.lastData.Load())) > h.cfg.RoomIdleTimeout {
+				h.stats.roomsIdleClosed.Add(1)
+				h.cfg.Logf("room %s closed (idle)", rm.code)
+				for _, m := range rm.members {
+					if m != nil {
+						drop(m, ErrClosed)
+					}
 				}
 			}
 		}
-	}
-	for n, e := range h.byNonce {
-		if e.sess == nil && now.After(e.until) {
-			delete(h.byNonce, n)
+		for n, e := range h.byNonce {
+			if e.sess == nil && now.After(e.until) {
+				delete(h.byNonce, n)
+			}
 		}
-	}
-	for c := range h.conns {
-		if c.sess.Load() == nil && now.Sub(c.accepted) > h.cfg.HandshakeTimeout {
-			closeConns = append(closeConns, c)
+		for c := range h.conns {
+			if c.sess.Load() == nil && now.Sub(c.accepted) > h.cfg.HandshakeTimeout {
+				closeConns = append(closeConns, c)
+			}
 		}
-	}
-	h.mu.Unlock()
+	}()
 
 	for _, n := range notes {
 		h.send(n.addr, n.frame)

@@ -22,7 +22,9 @@ type stats struct {
 	sessionsJoined    atomic.Uint64
 	sessionsTimedOut  atomic.Uint64
 	wsQueueDrops      atomic.Uint64 // frames dropped because a WebSocket client was too slow
-	unvalidatedDrops  atomic.Uint64 // frames for a UDP member whose address has not been validated yet
+	retriesSent       atomic.Uint64 // RETRY frames (stateless: no state is kept for them)
+	badCookies        atomic.Uint64 // handshakes whose cookie was missing, expired or for another source
+	wsRefused         atomic.Uint64 // WebSocket upgrades refused (global or per-address cap)
 	pathChallenges    atomic.Uint64
 	pathMigrations    atomic.Uint64 // sessions moved after a validated path change
 	badPathResponses  atomic.Uint64
@@ -51,7 +53,9 @@ type Stats struct {
 	SessionsJoined    uint64 `json:"sessions_joined"`
 	SessionsTimedOut  uint64 `json:"sessions_timed_out"`
 	WSQueueDrops      uint64 `json:"ws_queue_drops"`
-	UnvalidatedDrops  uint64 `json:"unvalidated_drops"`
+	RetriesSent       uint64 `json:"retries_sent"`
+	BadCookies        uint64 `json:"bad_cookies"`
+	WSRefused         uint64 `json:"ws_refused"`
 	PathChallenges    uint64 `json:"path_challenges"`
 	PathMigrations    uint64 `json:"path_migrations"`
 	BadPathResponses  uint64 `json:"bad_path_responses"`
@@ -74,7 +78,7 @@ func (h *Hub) snapshot() Stats {
 		RoomsCreated:      s.roomsCreated.Load(), RoomsClosed: s.roomsClosed.Load(),
 		RoomsIdleClosed: s.roomsIdleClosed.Load(), SessionsJoined: s.sessionsJoined.Load(),
 		SessionsTimedOut: s.sessionsTimedOut.Load(), WSQueueDrops: s.wsQueueDrops.Load(),
-		UnvalidatedDrops: s.unvalidatedDrops.Load(), PathChallenges: s.pathChallenges.Load(),
+		RetriesSent: s.retriesSent.Load(), BadCookies: s.badCookies.Load(), WSRefused: s.wsRefused.Load(), PathChallenges: s.pathChallenges.Load(),
 		PathMigrations: s.pathMigrations.Load(), BadPathResponses: s.badPathResponses.Load(),
 		Panics: s.panics.Load(),
 	}

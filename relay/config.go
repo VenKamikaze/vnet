@@ -15,10 +15,11 @@ type Config struct {
 	MaxRooms    int // rooms at once; default 1000
 	MaxSessions int // members (UDP + WebSocket) at once, also caps open WebSockets; default 20000
 	// Per source address (IPv6 sources are grouped by /64):
-	MaxSessionsPerIP  int           // members at once; default 64 (everyone behind one NAT shares it)
+	MaxSessionsPerIP  int           // members at once; default 128 (everyone behind one NAT shares it)
 	MaxRoomsPerIP     int           // rooms created and still alive; default 16
-	MaxWSPerIP        int           // open WebSockets; default 64
-	MaxPendingWSPerIP int           // WebSockets that have not entered a room yet; default 8
+	MaxWSPerIP        int           // open WebSockets; default 128
+	MaxPendingWSPerIP int           // WebSockets that have not entered a room yet; default 32
+	PrefixFactor      int           // an IPv6 /48 may hold this many times the per-address caps above; default 4
 	RoomIdleTimeout   time.Duration // a room with no DATA for this long is closed; default 30 min
 
 	// Liveness.
@@ -26,7 +27,7 @@ type Config struct {
 	SessionTimeout        time.Duration // no frame (or WebSocket pong) for this long drops a member; default 15 s
 	HandshakeTimeout      time.Duration // a WebSocket must send CREATE_ROOM/JOIN_ROOM within this; default 10 s
 	NonceTTL              time.Duration // how long a finished handshake nonce is remembered; default 60 s
-	UnvalidatedTimeout    time.Duration // a UDP member that never proved it receives at its address is dropped after this; default 10 s
+	RetryCookieBucket     time.Duration // a handshake cookie is valid for one to two of these; default 16 s
 	PathChallengeInterval time.Duration // at most one address-validation challenge per session in this time; default 1 s
 	PathChallengeTimeout  time.Duration // a challenge can be answered for this long; default 10 s
 	PingInterval          time.Duration // WebSocket ping interval; default 5 s
@@ -41,8 +42,8 @@ type Config struct {
 	// bucket for replies).
 	HandshakePerSec   float64 // CREATE_ROOM/JOIN_ROOM per source IP; default 20
 	HandshakeBurst    float64 // default 50
-	ReplyPerSec       float64 // replies to unauthenticated packets per source IP; default 20
-	ReplyBurst        float64 // default 50
+	ReplyPerSec       float64 // replies to unauthenticated packets per source IP; default 40
+	ReplyBurst        float64 // default 100
 	GlobalReplyPerSec float64 // replies to unauthenticated packets overall; default 5000
 	GlobalReplyBurst  float64 // default 5000
 	MaxTrackedIPs     int     // per-IP limiter entries; default 100000
@@ -78,13 +79,14 @@ func (c Config) withDefaults() (Config, error) {
 	def(&c.MaxMembers, 8)
 	def(&c.MaxRooms, 1000)
 	def(&c.MaxSessions, 20000)
-	def(&c.MaxSessionsPerIP, 64)
+	def(&c.MaxSessionsPerIP, 128)
 	def(&c.MaxRoomsPerIP, 16)
-	def(&c.MaxWSPerIP, 64)
-	def(&c.MaxPendingWSPerIP, 8)
+	def(&c.MaxWSPerIP, 128)
+	def(&c.MaxPendingWSPerIP, 32)
+	def(&c.PrefixFactor, 4)
 	def(&c.WSSendQueueBytes, 65536)
 	defD(&c.WSWriteTimeout, 5*time.Second)
-	defD(&c.UnvalidatedTimeout, 10*time.Second)
+	defD(&c.RetryCookieBucket, 16*time.Second)
 	defD(&c.PathChallengeInterval, time.Second)
 	defD(&c.PathChallengeTimeout, 10*time.Second)
 	defD(&c.RoomIdleTimeout, 30*time.Minute)
@@ -99,8 +101,8 @@ func (c Config) withDefaults() (Config, error) {
 	defF(&c.ClientBPSBurst, 2*c.ClientBPS)
 	defF(&c.HandshakePerSec, 20)
 	defF(&c.HandshakeBurst, 50)
-	defF(&c.ReplyPerSec, 20)
-	defF(&c.ReplyBurst, 50)
+	defF(&c.ReplyPerSec, 40)
+	defF(&c.ReplyBurst, 100)
 	defF(&c.GlobalReplyPerSec, 5000)
 	defF(&c.GlobalReplyBurst, 5000)
 	def(&c.MaxTrackedIPs, 100000)

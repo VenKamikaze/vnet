@@ -166,9 +166,7 @@ func (c *wsConn) handle(msg []byte, now time.Time, scratch *[]byte) bool {
 			h.stats.malformed.Add(1)
 			return true
 		}
-		h.mu.RLock()
-		h.forward(s, &d, len(msg), now, scratch)
-		h.mu.RUnlock()
+		h.forwardLocked(s, &d, len(msg), now, scratch)
 	default:
 		h.stats.malformed.Add(1)
 	}
@@ -222,30 +220,46 @@ func (c *wsConn) handshake(msg []byte, now time.Time) bool {
 	return true
 }
 
-// acquireWS admits a new WebSocket from ip (a limiter key) or refuses it.
+// acquireWS admits a new WebSocket from ip (a limiter key) or refuses it. The
+// check and the reservation are one step under the lock, so concurrent
+// upgrades cannot together exceed the limits.
 func (h *Hub) acquireWS(ip netip.Addr) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(h.conns) >= h.cfg.MaxSessions {
+	if h.wsReserved >= h.cfg.MaxSessions {
 		return false
 	}
-	c := h.counts(ip)
-	if c.ws >= h.cfg.MaxWSPerIP || c.pendingWS >= h.cfg.MaxPendingWSPerIP {
-		h.trim(ip, c)
-		return false
+	for _, k := range keysFor(ip) {
+		if c := h.perIP[k]; c != nil {
+			_, _, cw, cp := h.capsFor(k)
+			if c.ws >= cw || c.pendingWS >= cp {
+				return false
+			}
+		}
 	}
-	c.ws++
-	c.pendingWS++
+	h.wsReserved++
+	h.charge(ip, func(c *ipCount) { c.ws++; c.pendingWS++ })
 	return true
 }
 
-func (h *Hub) wsAuthenticated(c *wsConn) {
-	ip := ipKey(c.ip)
+// releaseWS gives back what acquireWS reserved (pending: the socket never
+// entered a room).
+func (h *Hub) releaseWS(ip netip.Addr, pending bool) {
 	h.mu.Lock()
-	if cnt := h.perIP[ip]; cnt != nil && cnt.pendingWS > 0 {
-		cnt.pendingWS--
-	}
-	h.mu.Unlock()
+	defer h.mu.Unlock()
+	h.wsReserved--
+	h.charge(ip, func(c *ipCount) {
+		c.ws--
+		if pending {
+			c.pendingWS--
+		}
+	})
+}
+
+func (h *Hub) wsAuthenticated(c *wsConn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.charge(ipKey(c.ip), func(cnt *ipCount) { cnt.pendingWS-- })
 }
 
 // recoverPanic keeps a bug in one connection from taking the process down.
@@ -302,6 +316,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	key := ipKey(ip)
 	if !h.acquireWS(key) {
+		h.stats.wsRefused.Add(1)
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
 	}
@@ -318,32 +333,29 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 		out:      make(chan []byte, h.cfg.WSSendQueue),
 		done:     make(chan struct{}),
 	}
-	h.mu.Lock()
 	if err == nil {
-		c.c = conn
-		h.conns[c] = struct{}{}
+		func() {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			c.c = conn
+			h.conns[c] = struct{}{}
+		}()
 	}
-	h.mu.Unlock()
-	// Whatever happens next, the connection's holdings are given back.
+	// Whatever happens next, the connection's holdings are given back, and
+	// the locks are released even if something panics (and is recovered).
 	defer func() {
-		h.mu.Lock()
 		if err == nil {
-			delete(h.conns, c)
-			if sess := c.sess.Load(); sess != nil {
-				h.removeLocked(sess, h.now())
-			}
-		}
-		if cnt := h.perIP[key]; cnt != nil {
-			cnt.ws--
-			if err != nil || c.sess.Load() == nil {
-				cnt.pendingWS--
-			}
-			h.trim(key, cnt)
-		}
-		h.mu.Unlock()
-		if err == nil {
+			func() {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				delete(h.conns, c)
+				if sess := c.sess.Load(); sess != nil {
+					h.removeLocked(sess, h.now())
+				}
+			}()
 			c.close()
 		}
+		h.releaseWS(key, err != nil || c.sess.Load() == nil)
 	}()
 	if err != nil {
 		return // Upgrade has replied

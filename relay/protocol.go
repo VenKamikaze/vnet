@@ -36,6 +36,7 @@ const (
 	TypeData         = 0x10 // both directions
 	// Frame types, relay to client.
 	TypePathChallenge = 0x05
+	TypeRetry         = 0x07 // UDP: "prove you receive at this address, then ask again"
 	TypeRoom          = 0x81
 	TypeError         = 0x82
 )
@@ -61,13 +62,15 @@ const (
 	joinLen      = createLen + CodeLen // ... code
 	roomLen      = 1 + 1 + NonceLen + 4 + TokenLen + CodeLen + 1 + 1
 	errorLen     = 1 + 1 + NonceLen + 1
-	cookieLen    = 8
-	challengeLen = 1 + cookieLen            // PATH_CHALLENGE: type cookie
-	responseLen  = 1 + TokenLen + cookieLen // PATH_RESPONSE: type token cookie (UDP only)
-	udpDataHdr   = 1 + TokenLen + 4 + 2 + 2 // type token addr dport sport
-	wsDataHdr    = 1 + 4 + 2 + 2            // type addr dport sport
-	maxUDPFrame  = udpDataHdr + MaxPayload  // largest valid datagram
-	maxWSMessage = maxUDPFrame              // largest valid WebSocket message
+	cookieLen    = 8                            // PATH_CHALLENGE cookie
+	CookieLen    = 16                           // handshake (RETRY) cookie
+	retryLen     = 1 + 1 + NonceLen + CookieLen // RETRY: type ver nonce cookie
+	challengeLen = 1 + cookieLen                // PATH_CHALLENGE: type cookie
+	responseLen  = 1 + TokenLen + cookieLen     // PATH_RESPONSE: type token cookie (UDP only)
+	udpDataHdr   = 1 + TokenLen + 4 + 2 + 2     // type token addr dport sport
+	wsDataHdr    = 1 + 4 + 2 + 2                // type addr dport sport
+	maxUDPFrame  = udpDataHdr + MaxPayload      // largest valid datagram
+	maxWSMessage = maxUDPFrame                  // largest valid WebSocket message
 )
 
 // Alphabet of room codes: A-Z without I and O, and 2-9. 32 symbols, so that a
@@ -119,6 +122,15 @@ func encodeError(reason byte, nonce [NonceLen]byte) []byte {
 	b[1] = ProtocolVersion
 	copy(b[2:], nonce[:])
 	b[2+NonceLen] = reason
+	return b
+}
+
+func encodeRetry(nonce [NonceLen]byte, cookie [CookieLen]byte) []byte {
+	b := make([]byte, retryLen)
+	b[0] = TypeRetry
+	b[1] = ProtocolVersion
+	copy(b[2:], nonce[:])
+	copy(b[2+NonceLen:], cookie[:])
 	return b
 }
 
