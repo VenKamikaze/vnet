@@ -201,10 +201,10 @@ int vnet_addr_to_string(const vnet_addr *a, char *buf, size_t cap) {
                 k += bestlen - 1;
                 continue;
             }
-            p += sprintf(p, "%x", g[k]);
+            p += snprintf(p, (size_t)(tmp + sizeof tmp - p), "%x", g[k]);
             if (k < 7) *p++ = ':';
         }
-        p += sprintf(p, "]:%u", a->port);
+        p += snprintf(p, (size_t)(tmp + sizeof tmp - p), "]:%u", a->port);
         len = (int)(p - tmp);
     } else {
         return VNET_EINVAL;

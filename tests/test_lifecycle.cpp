@@ -7,7 +7,12 @@ class Lifecycle : public VnetTest {};
 
 static int CountOpenFds() {
     int n = 0;
-    if (DIR *d = opendir("/proc/self/fd")) {
+#if defined(__APPLE__)
+    const char *fd_dir = "/dev/fd";
+#else
+    const char *fd_dir = "/proc/self/fd";
+#endif
+    if (DIR *d = opendir(fd_dir)) {
         while (readdir(d)) n++;
         closedir(d);
     }
@@ -47,6 +52,7 @@ TEST_F(Lifecycle, RepeatedCreateAndDestroyUdpReusesTheSamePortAndLeaksNoFds) {
         if (i % 2) vnet_close(v, s);
         vnet_destroy(v);
     }
+    EXPECT_GT(fds_before, 3) << "fd listing must work on this platform, or the check is vacuous";
     EXPECT_EQ(CountOpenFds(), fds_before);
 }
 
@@ -80,6 +86,50 @@ TEST_F(Lifecycle, ManyContextsInOneProcessAreIndependent) {
     ASSERT_EQ(RecvWait(v[5], s[5], &got), 5);
     for (int i = 0; i < 8; i++)
         if (i != 3) vnet_destroy(v[i]);
+}
+
+TEST_F(Lifecycle, TimeIsTheContextClockOnEveryBackend) {
+    EXPECT_EQ(vnet_time(nullptr), 0u);
+
+    // Loopback: the network's virtual clock, shared by all its hosts.
+    vnet_loopback_network *net = vnet_loopback_network_create();
+    vnet *a = LoopbackHost(net), *b = LoopbackHost(net);
+    EXPECT_EQ(vnet_time(a), 0u);
+    vnet_loopback_network_advance(net, 7);
+    EXPECT_EQ(vnet_time(a), 7u);
+    EXPECT_EQ(vnet_time(b), 7u);
+    vnet_loopback_network_step(net, 33);
+    EXPECT_EQ(vnet_time(a), 40u);
+    vnet_destroy(a);
+    vnet_destroy(b);
+    vnet_loopback_network_destroy(net);
+
+    // An injected clock wins over the backend default (loopback and UDP).
+    static uint64_t t;
+    t = 1234;
+    vnet_config cfg;
+    vnet_config_init(&cfg);
+    cfg.ignore_env = 1;
+    cfg.clock = [](void *) { return t; };
+    vnet *u = vnet_create(&cfg, nullptr);
+    ASSERT_NE(u, nullptr);
+    EXPECT_EQ(vnet_time(u), 1234u);
+    t = 2000;
+    EXPECT_EQ(vnet_time(u), 2000u);
+    vnet_destroy(u);
+
+    // UDP default: real monotonic time that actually advances.
+    vnet *r = UdpHost();
+    uint64_t t0 = vnet_time(r), prev = t0, now = t0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (now < t0 + 5 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        now = vnet_time(r);
+        EXPECT_GE(now, prev) << "monotonic";
+        prev = now;
+    }
+    EXPECT_GE(now, t0 + 5);
+    vnet_destroy(r);
 }
 
 TEST_F(Lifecycle, NullTolerance) {

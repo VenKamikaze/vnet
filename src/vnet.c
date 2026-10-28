@@ -45,7 +45,9 @@ static uint64_t system_clock_ms(void *user) {
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart * 1000 / f.QuadPart);
+    // Split to avoid overflowing QuadPart * 1000 on long uptimes.
+    return (uint64_t)(c.QuadPart / f.QuadPart) * 1000u +
+           (uint64_t)(c.QuadPart % f.QuadPart) * 1000u / (uint64_t)f.QuadPart;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -54,6 +56,8 @@ static uint64_t system_clock_ms(void *user) {
 }
 
 uint64_t vnet__now(vnet *v) { return v->clock(v->clock_user); }
+
+uint64_t vnet_time(vnet *v) { return v ? vnet__now(v) : 0; }
 
 void vnet_config_init(vnet_config *cfg) {
     if (cfg) memset(cfg, 0, sizeof *cfg);
@@ -151,8 +155,9 @@ int vnet_local_addr(vnet *v, int s, vnet_addr *out) {
 }
 
 int vnet__wire_send(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to) {
-    v->stats.wire_datagrams++;
-    return v->be->send(v, s, buf, len, to);
+    int rc = v->be->send(v, s, buf, len, to);
+    if (rc >= 0) v->stats.wire_datagrams++;  // failed sends are not counted
+    return rc;
 }
 
 int vnet_sendto(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to) {

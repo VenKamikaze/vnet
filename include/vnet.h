@@ -30,7 +30,9 @@
  *    truncated, in both directions.
  *
  * Return values: functions returning int return >= 0 on success and a
- * negative VNET_E* code on failure. See vnet_strerror().
+ * negative VNET_E* code on failure. See vnet_strerror(). Future versions
+ * and backends may add further negative codes: treat any negative value you
+ * do not recognise as an error (and VNET_EAGAIN / VNET_EIO as transient).
  *
  * Time: all times are milliseconds. A clock is a function returning a
  * monotonic millisecond count. The default clock of the UDP backend is
@@ -77,7 +79,11 @@ extern "C" {
 #define VNET_ENOSOCK      (-7)  /* no free socket slot (see max_sockets) */
 #define VNET_EAFNOSUPPORT (-8)  /* address family not usable on this
                                    backend/socket */
-#define VNET_EIO          (-9)  /* unexpected OS error; details via the log */
+#define VNET_EIO          (-9)  /* OS error; details via the log. From
+                                   vnet_sendto()/vnet_recvfrom() it is
+                                   transient (e.g. network unreachable):
+                                   treat it like a dropped datagram, not as
+                                   a dead socket */
 #define VNET_ENOTSUP     (-10)  /* backend not available in this build */
 #define VNET_ENOBUFS     (-11)  /* output buffer too small */
 
@@ -152,6 +158,10 @@ int vnet_addr_equal(const vnet_addr *a, const vnet_addr *b);
  * Randomness comes from a private seeded PRNG: the same seed, the same
  * settings, the same sends and the same clock give exactly the same
  * outcome. Contexts that should behave independently need different seeds.
+ * NOTE: the default seed is 0, so if you set VNET_IMPAIR (or
+ * vnet_config.impair) without a seed, EVERY process and context gets the
+ * same seed and therefore the same loss pattern. Give each its own
+ * (e.g. "seed=<player number>").
  *
  * Delayed datagrams are released to the backend by vnet_poll() (and also
  * on each vnet_sendto()), so a game must keep calling vnet_poll().
@@ -197,7 +207,7 @@ int vnet_impair_parse(const char *spec, vnet_impair *out);
  * NUL-terminated line without newline, valid only during the call. */
 typedef void (*vnet_log_fn)(void *user, int level, const char *msg);
 
-/* Monotonic millisecond clock. */
+/* Monotonic millisecond clock (the epoch is arbitrary). */
 typedef uint64_t (*vnet_clock_fn)(void *user);
 
 /* A set of loopback hosts that can reach one another. Opaque. */
@@ -208,7 +218,18 @@ typedef struct vnet_config {
     int max_sockets;              /* 0 = 16 */
 
     /* UDP only */
-    int family;                   /* VNET_FAMILY_*; 0 = ANY */
+    int family;                   /* VNET_FAMILY_*; 0 = ANY:
+                                     ANY   - a dual-stack IPv6 socket that also
+                                             reaches IPv4 peers (IPv4 peers
+                                             appear as plain IPv4 addresses);
+                                             falls back to an IPv4 socket if
+                                             the OS has no IPv6.
+                                     IPV4  - IPv4 only; IPv6 destinations are
+                                             VNET_EAFNOSUPPORT.
+                                     IPV6  - IPv6 only (IPV6_V6ONLY); IPv4
+                                             destinations are
+                                             VNET_EAFNOSUPPORT. Opening fails if
+                                             the OS has no IPv6. */
 
     /* Loopback only */
     vnet_loopback_network *loopback_network; /* NULL = private network, only
@@ -241,8 +262,15 @@ void vnet_config_init(vnet_config *cfg);
 
 /*
  * Create a context. Returns NULL on failure and, if err != NULL, stores a
- * VNET_E* code there. cfg may be NULL (= UDP defaults). A context made on
- * a loopback network must be destroyed before the network is.
+ * VNET_E* code there (VNET_OK on success):
+ *   VNET_EINVAL    bad config: impairment values out of range, malformed
+ *                  VNET_IMPAIR, bad `family` or `loopback_host`
+ *   VNET_ENOTSUP   unknown/unavailable `backend`
+ *   VNET_EADDRINUSE  `loopback_host` already used on that network
+ *   VNET_ENOMEM    out of memory
+ *   VNET_EIO       OS networking could not be initialised (Winsock)
+ * cfg may be NULL (= UDP defaults). A context made on a loopback network
+ * must be destroyed before the network is.
  */
 vnet *vnet_create(const vnet_config *cfg, int *err);
 void  vnet_destroy(vnet *v);   /* closes all its sockets; NULL is a no-op */
@@ -258,11 +286,16 @@ void  vnet_destroy(vnet *v);   /* closes all its sockets; NULL is a no-op */
  * or VNET_EADDRINUSE / VNET_ENOSOCK / VNET_EAFNOSUPPORT / VNET_EIO ...
  */
 int  vnet_open(vnet *v, uint16_t port);
-void vnet_close(vnet *v, int s);   /* also discards its delayed datagrams */
+
+/* Close a socket and discard its queued and delayed datagrams. A handle that
+ * is not open (never opened, already closed, out of range) or a NULL `v` is
+ * silently ignored. Handles may be reused by later vnet_open() calls. */
+void vnet_close(vnet *v, int s);
 
 /* The address `s` is bound to. For a UDP socket bound to all addresses the
  * IP part is the wildcard (0.0.0.0 or ::); give peers 127.0.0.1:port or
- * the real host address. */
+ * the real host address.
+ * Returns 0, VNET_EINVAL (NULL argument), VNET_EBADF or VNET_EIO. */
 int  vnet_local_addr(vnet *v, int s, vnet_addr *out);
 
 /*
@@ -275,6 +308,8 @@ int  vnet_local_addr(vnet *v, int s, vnet_addr *out);
  *   VNET_EBADF     bad socket handle
  *   VNET_EAFNOSUPPORT  destination family not usable from this socket
  *   VNET_EAGAIN    UDP only: the OS send buffer is full; treat as a drop
+ *   VNET_EIO       UDP only: transient OS error (network unreachable ...);
+ *                  treat as a drop
  * len may be 0.
  */
 int vnet_sendto(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to);
@@ -286,6 +321,7 @@ int vnet_sendto(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to
  *   VNET_EMSGSIZE  the next datagram is longer than `cap`; it is
  *                  consumed and discarded, never truncated
  *   VNET_EBADF     bad socket handle
+ *   VNET_EIO       UDP only: unexpected OS error; transient, retry later
  * Datagrams longer than VNET_MAX_DATAGRAM arriving from foreign senders
  * on a UDP socket are dropped and never reported.
  */
@@ -299,16 +335,32 @@ int vnet_recvfrom(vnet *v, int s, void *buf, size_t cap, vnet_addr *from);
  */
 void vnet_poll(vnet *v);
 
+/*
+ * The context's clock in milliseconds (arbitrary epoch, monotonic): the
+ * loopback network's virtual clock on the loopback backend, the system
+ * monotonic clock on UDP, or vnet_config.clock when one was supplied. Use it
+ * for RTT and timeout logic so that the same code runs on virtual time in
+ * tests. Returns 0 for a NULL context.
+ */
+uint64_t vnet_time(vnet *v);
+
 /* ------------------------------------------------------------------ */
 /* Statistics                                                          */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Counters are cumulative since vnet_create() and are never reset (take a
+ * snapshot and subtract to measure an interval). They are plain counters and
+ * wrap only after 2^64 events.
+ */
 typedef struct vnet_stats {
     uint64_t tx_datagrams;       /* accepted by vnet_sendto() */
     uint64_t tx_bytes;
     uint64_t rx_datagrams;       /* returned by vnet_recvfrom() */
     uint64_t rx_bytes;
-    uint64_t wire_datagrams;     /* handed to the backend after impairment */
+    uint64_t wire_datagrams;     /* accepted by the backend after impairment
+                                    (a send the backend rejected, e.g. with
+                                    VNET_EIO, is not counted) */
     uint64_t impair_lost;        /* dropped by loss */
     uint64_t impair_duplicated;  /* extra copies created */
     uint64_t impair_reordered;   /* packets given the reorder delay */
@@ -318,6 +370,7 @@ typedef struct vnet_stats {
     uint64_t unroutable;         /* loopback: no such host/port */
 } vnet_stats;
 
+/* Copy the counters out. A NULL `v` gives zeros. */
 void vnet_get_stats(const vnet *v, vnet_stats *out);
 
 /* ------------------------------------------------------------------ */
@@ -328,12 +381,15 @@ void vnet_get_stats(const vnet *v, vnet_stats *out);
  * Delivery model: vnet_sendto() on one loopback context stages the
  * datagram in the destination socket's queue (after impairment); it
  * becomes receivable when the DESTINATION context next calls vnet_poll().
- * Datagrams are delivered in global send order. With impairment on, the
- * sender must also poll once the delay has elapsed (virtual time).
+ * Datagrams become receivable in the order they reached the wire: send
+ * order when impairment is off, release order (due time, then send order)
+ * when it is on. With impairment on, the sender must also poll once the
+ * delay has elapsed (virtual time).
  *
  * Sending to 127.0.0.1 reaches the sender's own host. Sending to an
  * address that is not a host of the network is silently dropped.
  */
+/* Returns NULL if out of memory. */
 vnet_loopback_network *vnet_loopback_network_create(void);
 void vnet_loopback_network_destroy(vnet_loopback_network *net);
 

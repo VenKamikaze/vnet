@@ -55,6 +55,9 @@ endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(vnet PRIVATE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
+    if(NOT WIN32)  # MinGW's own headers use strcpy, so the guard is POSIX-only
+        target_compile_options(vnet PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/cmake/banned.h)
+    endif()
     if(VNET_WARNINGS_AS_ERRORS)
         target_compile_options(vnet PRIVATE -Werror)
     endif()

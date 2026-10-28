@@ -45,5 +45,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(vnet_tests PRIVATE alloc_counter.cpp)
     target_compile_definitions(vnet_tests PRIVATE VNET_TEST_COUNT_ALLOCS)
     target_link_options(vnet_tests PRIVATE -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc)
+    # IPv6 policy test seam (see ipv6_shim.cpp).
+    target_sources(vnet_tests PRIVATE ipv6_shim.cpp)
+    target_compile_definitions(vnet_tests PRIVATE VNET_TEST_FAKE_IPV6)
+    target_link_options(vnet_tests PRIVATE -Wl,--wrap=socket -Wl,--wrap=setsockopt
+                        -Wl,--wrap=bind -Wl,--wrap=close -Wl,--wrap=sendto)
 endif()
 gtest_discover_tests(vnet_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 60)

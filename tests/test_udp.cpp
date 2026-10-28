@@ -193,7 +193,7 @@ TEST_F(Udp, Ipv6DestinationOnIpv4OnlyContextIsRejected) {
 }
 
 TEST_F(Udp, BurstOfDatagramsAllArrive) {
-    const int N = 200;
+    const int N = 100;  // well inside the default socket receive buffer, even on macOS
     for (int i = 0; i < N; i++) ASSERT_EQ(Send(a, sa, std::to_string(i), to_b), (int)std::to_string(i).size());
     std::vector<bool> seen(N, false);
     int count = 0;
@@ -232,6 +232,13 @@ TEST_F(Udp, SendToUnboundPortIsSilent) {
     EXPECT_EQ(Recv(a, sa, &got), VNET_EAGAIN);
 }
 
+// CI sets VNET_REQUIRE_IPV6=1: a missing ::1 is then a failure, not a skip, so
+// the IPv6 paths cannot silently stop being tested.
+static bool IPv6Required() {
+    const char *e = std::getenv("VNET_REQUIRE_IPV6");
+    return e && *e && std::strcmp(e, "0") != 0;
+}
+
 TEST(UdpFamily, DualStackOrFallbackReachesIpv4PeersAndReportsIpv4Senders) {
     EnvGuard env;
     vnet *x = UdpHost(VNET_FAMILY_ANY), *y = UdpHost(VNET_FAMILY_ANY);
@@ -242,6 +249,12 @@ TEST(UdpFamily, DualStackOrFallbackReachesIpv4PeersAndReportsIpv4Senders) {
     vnet_addr ly{}, lx{};
     vnet_local_addr(y, sy, &ly);
     vnet_local_addr(x, sx, &lx);
+    if (IPv6Required()) {
+        // Where IPv6 exists the dual-stack socket must really be used, so that
+        // the IPv4-mapped conversion below is exercised and not the fallback.
+        EXPECT_EQ(lx.family, VNET_AF_IPV6) << "dual-stack socket expected, got " << Str(lx);
+        EXPECT_EQ(ly.family, VNET_AF_IPV6);
+    }
     vnet_addr to = A("127.0.0.1:1");
     to.port = ly.port;
     ASSERT_EQ(Send(x, sx, "dual", to), 4);
@@ -274,10 +287,13 @@ static bool Ipv6LoopbackAvailable() {
 static bool Ipv6LoopbackAvailable() { return false; }
 #endif
 
-// Environment-dependent: needs an IPv6 loopback interface. Hosts without one
-// (some containers) cannot run it; the explicit skip message says so.
+// Needs an IPv6 loopback interface. Without VNET_REQUIRE_IPV6 a host lacking
+// one (some containers) skips; with it (all CI jobs) that is a failure.
 TEST(UdpFamily, Ipv6LoopbackRoundTrip) {
-    if (!Ipv6LoopbackAvailable()) GTEST_SKIP() << "no IPv6 loopback (::1) on this host";
+    if (!Ipv6LoopbackAvailable()) {
+        if (IPv6Required()) FAIL() << "VNET_REQUIRE_IPV6 is set but ::1 is not available";
+        GTEST_SKIP() << "no IPv6 loopback (::1) on this host";
+    }
     EnvGuard env;
     vnet *x = UdpHost(VNET_FAMILY_IPV6), *y = UdpHost(VNET_FAMILY_IPV6);
     ASSERT_TRUE(x && y);
@@ -302,6 +318,74 @@ TEST(UdpFamily, Ipv6LoopbackRoundTrip) {
     vnet_destroy(x);
     vnet_destroy(y);
 }
+
+#if defined(VNET_TEST_FAKE_IPV6)
+extern "C" int g_fake_ipv6;
+extern "C" int g_fake_v6only_last;
+extern "C" int g_fail_sendto;
+
+// A send the OS rejects (network unreachable) is reported as transient
+// VNET_EIO and is not counted as having reached the wire.
+TEST(UdpErrors, FailedOsSendIsEioAndNotCountedOnTheWire) {
+    EnvGuard env;
+    vnet *a = UdpHost();
+    int sa = vnet_open(a, 0);
+    vnet_addr to = A("127.0.0.1:9");
+    g_fail_sendto = 1;
+    EXPECT_EQ(Send(a, sa, "x", to), VNET_EIO);
+    vnet_stats st;
+    vnet_get_stats(a, &st);
+    EXPECT_EQ(st.tx_datagrams, 0u);
+    EXPECT_EQ(st.wire_datagrams, 0u);
+    g_fail_sendto = 0;
+    EXPECT_EQ(Send(a, sa, "x", to), 1);
+    vnet_get_stats(a, &st);
+    EXPECT_EQ(st.wire_datagrams, 1u);
+    vnet_destroy(a);
+
+    // Impaired: accepted at send time, the release fails later.
+    vnet_impair im = {};
+    im.loss_pct = 0.0001f;  // impairment on, effectively no loss
+    a = UdpHost(VNET_FAMILY_IPV4, &im);
+    sa = vnet_open(a, 0);
+    g_fail_sendto = 1;
+    EXPECT_EQ(Send(a, sa, "x", to), 1);
+    vnet_get_stats(a, &st);
+    EXPECT_EQ(st.tx_datagrams, 1u);
+    EXPECT_EQ(st.wire_datagrams, 0u);
+    g_fail_sendto = 0;
+    vnet_destroy(a);
+}
+
+// Runs on hosts without IPv6 too (emulated sockets, see ipv6_shim.cpp).
+TEST(UdpFamily, Ipv6OnlyModeSetsV6OnlyAndRefusesIpv4Destinations) {
+    EnvGuard env;
+    g_fake_ipv6 = 1;
+    for (bool impaired : {false, true}) {
+        vnet_impair im = {};
+        im.latency_ms = 10;
+        g_fake_v6only_last = -1;
+        vnet *x = UdpHost(VNET_FAMILY_IPV6, impaired ? &im : nullptr);
+        ASSERT_NE(x, nullptr);
+        int sx = vnet_open(x, 0);
+        ASSERT_GE(sx, 0);
+        EXPECT_EQ(g_fake_v6only_last, 1) << "IPV6 mode must set IPV6_V6ONLY";
+        EXPECT_EQ(Send(x, sx, "v4", A("127.0.0.1:9")), VNET_EAFNOSUPPORT) << "impaired=" << impaired;
+        vnet_stats st;
+        vnet_get_stats(x, &st);
+        EXPECT_EQ(st.tx_datagrams, 0u);
+        vnet_destroy(x);
+    }
+    // ANY mode is dual-stack: V6ONLY must be cleared.
+    g_fake_v6only_last = -1;
+    vnet *y = UdpHost(VNET_FAMILY_ANY);
+    ASSERT_NE(y, nullptr);
+    ASSERT_GE(vnet_open(y, 0), 0);
+    EXPECT_EQ(g_fake_v6only_last, 0);
+    vnet_destroy(y);
+    g_fake_ipv6 = 0;
+}
+#endif
 
 TEST(UdpFamily, InvalidFamilyIsRejected) {
     vnet_config cfg;

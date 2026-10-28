@@ -288,6 +288,45 @@ TEST_F(Impair, NetworkStepMakesBothDirectionsDueTrafficReceivable) {
     vnet_loopback_network_destroy(net);
 }
 
+// Frames are much longer than the jitter, so many datagrams become due inside
+// one step. They must still reach the receiver in due-time order (as a 1 ms
+// step would deliver them), not in the order they were sent.
+TEST_F(Impair, CoarseFramesStillReleaseInDueOrder) {
+    auto arrival_order = [&](int step_ms) {
+        vnet_impair im = {};
+        im.latency_ms = 50;
+        im.jitter_ms = 40;
+        im.seed = 21;
+        Peers p = Make(im);
+        std::vector<int> order;
+        auto drain = [&]() {
+            std::string s;
+            while (Recv(p.b, p.sb, &s) >= 0) order.push_back(std::stoi(s));
+        };
+        const int kFrame = 33, kFrames = 60, kPerFrame = 10;
+        for (int f = 0; f < kFrames; f++) {
+            for (int k = 0; k < kPerFrame; k++) Send(p.a, p.sa, std::to_string(f * kPerFrame + k), p.to);
+            for (int t = 0; t < kFrame; t += step_ms) {
+                vnet_loopback_network_step(p.net, (uint64_t)step_ms);
+                drain();
+            }
+        }
+        for (int t = 0; t < 330; t += step_ms) {
+            vnet_loopback_network_step(p.net, (uint64_t)step_ms);
+            drain();
+        }
+        Free(p);
+        return order;
+    };
+    std::vector<int> fine = arrival_order(1);    // each tick releases only what is due then
+    std::vector<int> coarse = arrival_order(33); // many due at once
+    ASSERT_EQ(fine.size(), 600u);
+    int inversions = 0;
+    for (size_t i = 1; i < fine.size(); i++) inversions += fine[i] < fine[i - 1];
+    EXPECT_GT(inversions, 50) << "the scenario must actually reorder";
+    EXPECT_EQ(coarse, fine);
+}
+
 TEST_F(Impair, JitterStaysWithinBoundsAndActuallyVaries) {
     vnet_impair im = {};
     im.latency_ms = 50;
