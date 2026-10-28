@@ -2,6 +2,15 @@
 // Native UDP backend: non-blocking BSD sockets (POSIX) / Winsock.
 #include "vnet_internal.h"
 
+#if defined(__EMSCRIPTEN__)
+// Browsers have no UDP sockets: use the relay backends there.
+int vnet__udp_init(vnet *v, const vnet_config *cfg) {
+    (void)v;
+    (void)cfg;
+    return VNET_ENOTSUP;
+}
+#else
+
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +56,10 @@ typedef int sock_t;
 typedef socklen_t sa_len_t;
 typedef void *sockopt_t;
 #endif
+
+// Receive buffer: room for the largest max_dgram (the relay's inner socket
+// carries VNET_MAX_DATAGRAM plus relay framing) plus one byte to detect oversize.
+#define VNET_UDP_RECV_BUF (VNET_MAX_DATAGRAM + 64 + 1)
 
 typedef struct udp_sock {
     int used;
@@ -274,11 +287,12 @@ static int udp_recv(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
     if (!sk) return VNET_EBADF;
     // One byte more than the maximum so that oversize datagrams are detected,
     // not silently truncated into something plausible.
-    uint8_t tmp[VNET_MAX_DATAGRAM + 1];
+    uint8_t tmp[VNET_UDP_RECV_BUF];
     for (;;) {
         struct sockaddr_storage ss;
         sa_len_t sl = sizeof ss;
-        int n = (int)recvfrom(sk->fd, (char *)tmp, sizeof tmp, 0, (struct sockaddr *)&ss, &sl);
+        // One byte more than max_dgram so that oversize datagrams are detected.
+        int n = (int)recvfrom(sk->fd, (char *)tmp, (int)v->max_dgram + 1, 0, (struct sockaddr *)&ss, &sl);
         if (n < 0) {
             int e = SOCK_ERRNO();
             if (e == E_WOULDBLOCK || e == E_AGAIN) return VNET_EAGAIN;
@@ -290,7 +304,7 @@ static int udp_recv(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
             vnet__logf(v, VNET_LOG_DEBUG, "recvfrom failed (%d)", e);
             return VNET_EIO;
         }
-        if ((size_t)n > VNET_MAX_DATAGRAM) {
+        if ((size_t)n > v->max_dgram) {
             v->stats.rx_oversize++;
             continue;
         }
@@ -315,7 +329,7 @@ static void udp_destroy(vnet *v) {
 }
 
 static const vnet_backend udp_backend = {
-    "udp", udp_open, udp_close, udp_local_addr, udp_check_send, udp_send, udp_recv, udp_poll, udp_destroy,
+    "udp", udp_open, udp_close, udp_local_addr, udp_check_send, udp_send, udp_recv, udp_poll, udp_destroy, NULL, NULL,
 };
 
 int vnet__udp_init(vnet *v, const vnet_config *cfg) {
@@ -346,3 +360,5 @@ int vnet__udp_init(vnet *v, const vnet_config *cfg) {
     v->bs = st;
     return VNET_OK;
 }
+
+#endif /* !__EMSCRIPTEN__ */

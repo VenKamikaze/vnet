@@ -127,8 +127,11 @@ static int parse_port(const char *s, size_t n, uint16_t *out) {
 }
 
 int vnet_resolve(vnet *v, const char *host_port, vnet_addr *out) {
-    (void)v;  // built-in forms only; relay backends will extend this
     if (!host_port || !out) return VNET_EINVAL;
+    if (v && v->be->resolve) {  // backend-specific forms (relay: "room-host:PORT")
+        int rc = v->be->resolve(v, host_port, out);
+        if (rc != 1) return rc;
+    }
     vnet_addr a;
     memset(&a, 0, sizeof a);
     size_t n = strlen(host_port);

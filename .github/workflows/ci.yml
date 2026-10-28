@@ -35,6 +35,13 @@ jobs:
         with:
           fetch-depth: 0   # the FetchContent consumer check clones this checkout
 
+      # The relay (Go) is built by CMake and tested by ctest (relay_go_tests and
+      # the integration tests that start it).
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"
+          cache-dependency-path: relay/go.sum
+
       - name: Make sure IPv6 loopback (::1) exists
         if: runner.os == 'Linux'
         run: |
@@ -83,11 +90,75 @@ jobs:
           cmake --build "$RUNNER_TEMP/fetch-build"
           "$RUNNER_TEMP/fetch-build/consumer"
 
-  mingw:
-    name: MinGW-w64 cross build (smoke under Wine)
+  relay:
+    name: relay (Go) / vet, race tests, Docker image
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"
+          cache-dependency-path: relay/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: Tests under the race detector
+        run: go test -race -count=1 ./...
+      - name: Fuzz targets (30 s each)
+        run: |
+          go test -run XXX -fuzz FuzzHandleUDP -fuzztime 30s .
+          go test -run XXX -fuzz FuzzHandleWS -fuzztime 30s .
+      - name: Build the Docker image
+        run: docker build -t vnet-relay .
+      - name: Run the container and talk to it
+        run: |
+          docker run -d --name relay -p 127.0.0.1:7777:7777/udp -p 127.0.0.1:8080:8080 vnet-relay
+          for i in $(seq 50); do curl -fsS http://127.0.0.1:8080/healthz && break; sleep 0.2; done
+          curl -fsS http://127.0.0.1:8080/stats
+          docker rm -f relay
+
+  browser:
+    name: browser (Emscripten + Chromium via Playwright)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"
+          cache-dependency-path: relay/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Cache emsdk
+        uses: actions/cache@v4
+        with:
+          path: .emsdk
+          key: emsdk-${{ hashFiles('scripts/setup-emsdk.sh') }}
+      - name: Install the pinned emsdk
+        run: scripts/setup-emsdk.sh
+      - name: Install Playwright and Chromium
+        run: |
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null
+          npm install playwright@1.63.0
+          npx playwright install --with-deps chromium
+          echo "NODE_PATH=$RUNNER_TEMP/pw/node_modules" >> "$GITHUB_ENV"
+      - name: Build everything and run the browser test
+        run: scripts/test-browser.sh "$RUNNER_TEMP/browser"
+
+  mingw:
+    name: MinGW-w64 cross build (smoke and relay under Wine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.7"
+          cache-dependency-path: relay/go.sum
       - name: Install toolchain and Wine
         run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
       - name: Configure and build
@@ -103,3 +174,5 @@ jobs:
         run: |
           WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
           WINEDEBUG=-all "$WINE" build-mingw/tests/vnet_smoke.exe
+      - name: Windows relay_peer.exe against the Go relay (both directions)
+        run: scripts/test-mingw-relay.sh "$RUNNER_TEMP/mingw-relay"

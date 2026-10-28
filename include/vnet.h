@@ -5,8 +5,12 @@
  * A small, dependency-free, non-blocking datagram API with pluggable
  * backends:
  *
- *   VNET_BACKEND_UDP       native UDP sockets (BSD sockets / Winsock)
- *   VNET_BACKEND_LOOPBACK  in-process, deterministic, for tests
+ *   VNET_BACKEND_UDP        native UDP sockets (BSD sockets / Winsock)
+ *   VNET_BACKEND_LOOPBACK   in-process, deterministic, for tests
+ *   VNET_BACKEND_RELAY_UDP  native client of the vnet relay (rooms, virtual
+ *                           addresses 10.0.0.N); see doco/relay-protocol.md
+ *   VNET_BACKEND_RELAY_WS   browser (Emscripten) client of the vnet relay
+ *                           over a WebSocket
  *
  * Any backend can be wrapped by an impairment layer (latency, jitter,
  * loss, duplication, reordering) driven by a seeded PRNG.
@@ -17,12 +21,16 @@
  * ---------------------------------------------------------------------
  * Guarantees
  * ---------------------------------------------------------------------
- *  - Nothing in this API blocks, sleeps or spawns threads.
+ *  - Nothing in this API blocks, sleeps or spawns threads. (One exception:
+ *    vnet_create() with VNET_BACKEND_RELAY_UDP resolves a relay HOST NAME
+ *    with getaddrinfo(), which can block; a numeric address never does.)
  *  - There is no global state. Every vnet_create() gives an independent
  *    context; create/destroy can be repeated freely.
  *  - After setup, steady-state send/receive/poll performs no heap
  *    allocation (queues are sized and allocated in vnet_create() and
- *    vnet_open()).
+ *    vnet_open()). That is vnet's own code: in a browser build, Emscripten's
+ *    WebSocket glue (and the browser) allocate for every message that
+ *    arrives or is sent.
  *  - Threading: a vnet context, and every loopback network and context
  *    attached to it, must be used from one thread at a time. Separate
  *    UDP contexts may be used from separate threads.
@@ -52,7 +60,7 @@ extern "C" {
 #endif
 
 #define VNET_VERSION_MAJOR 0
-#define VNET_VERSION_MINOR 1
+#define VNET_VERSION_MINOR 2
 #define VNET_VERSION_PATCH 0
 
 /*
@@ -86,6 +94,19 @@ extern "C" {
                                    a dead socket */
 #define VNET_ENOTSUP     (-10)  /* backend not available in this build */
 #define VNET_ENOBUFS     (-11)  /* output buffer too small */
+/* Relay backends. They are reported by vnet_status() (FAILED), and ENOTCONN
+ * also by vnet_sendto() / vnet_local_addr(). */
+#define VNET_ETIMEDOUT   (-12)  /* the relay did not answer, or went silent */
+#define VNET_ENOTCONN    (-13)  /* not in a room: still connecting, or the
+                                   session has failed or ended */
+#define VNET_ENOROOM     (-14)  /* no room with that code */
+#define VNET_EROOMFULL   (-15)  /* the room has no free address */
+#define VNET_ELIMIT      (-16)  /* the relay refused: a server limit (rooms,
+                                   members) or a rate limit */
+#define VNET_EPROTO      (-17)  /* relay protocol error or version mismatch */
+#define VNET_ECLOSED     (-18)  /* the session ended: the relay dropped us
+                                   (timeout, room closed, restart) */
+#define VNET_ECONNREFUSED (-19) /* the relay could not be reached */
 
 /* Human-readable text for a VNET_* code (never NULL; static storage). */
 const char *vnet_strerror(int err);
@@ -123,7 +144,10 @@ typedef struct vnet vnet;
  * IPv4. The port is required (0 is accepted so that it can express
  * "any port", but vnet_sendto() rejects port 0).
  * Returns 0, or VNET_EINVAL. `v` is only used so that backends may add
- * their own address forms; it may be NULL for the built-in forms.
+ * their own address forms; it may be NULL for the built-in forms. Relay
+ * contexts add "room-host:PORT" = 10.0.0.1:PORT, the room creator (this
+ * works before the room has been entered). Their addresses are plain
+ * 10.0.0.N:PORT IPv4 addresses, so everything else here applies to them.
  */
 int vnet_resolve(vnet *v, const char *host_port, vnet_addr *out);
 
@@ -192,6 +216,9 @@ int vnet_impair_parse(const char *spec, vnet_impair *out);
 
 #define VNET_BACKEND_UDP      0   /* the default: a zeroed config is UDP */
 #define VNET_BACKEND_LOOPBACK 1
+#define VNET_BACKEND_RELAY_UDP 2  /* native client of the relay */
+#define VNET_BACKEND_RELAY_WS  3  /* browser client of the relay (Emscripten
+                                     builds only; VNET_ENOTSUP elsewhere) */
 
 #define VNET_FAMILY_ANY 0   /* UDP: dual-stack IPv6 socket if available,
                                else IPv4 */
@@ -237,8 +264,9 @@ typedef struct vnet_config {
     const char *loopback_host;    /* this host's IPv4 address, e.g.
                                      "127.1.0.7"; NULL = next free 127.1.x.y
                                      (127.1.0.1, 127.1.0.2, ...) */
-    int rx_queue_len;             /* per-socket receive queue, datagrams;
-                                     0 = 128. Overflow drops, like UDP. */
+    int rx_queue_len;             /* per-socket receive queue, datagrams
+                                     (loopback and relay backends); 0 = 128.
+                                     Overflow drops, like UDP. */
 
     /* Impairment (any backend) */
     vnet_impair impair;
@@ -249,6 +277,28 @@ typedef struct vnet_config {
                                      falls back to impair.seed). A malformed
                                      value makes vnet_create() fail with
                                      VNET_EINVAL. 1: never read it. */
+
+    /* Relay backends (VNET_BACKEND_RELAY_UDP / _WS). Strings must stay valid
+     * only for the duration of vnet_create(). */
+    const char *relay;            /* RELAY_UDP: "host:port" or "[v6]:port" of
+                                     the relay's UDP port (a host name is
+                                     resolved once, inside vnet_create()).
+                                     RELAY_WS: "ws://host:port/vnet" or
+                                     "wss://host/vnet". */
+    const char *room;             /* NULL or "": create a new room (you become
+                                     10.0.0.1, "room-host"). Otherwise join the
+                                     room with this 6-symbol code (case
+                                     insensitive). */
+    int relay_timeout_ms;         /* give up (VNET_ETIMEDOUT) if no room has
+                                     been entered after this long; 0 = 10000 */
+    int keepalive_ms;             /* keepalive interval once in a room; 0 = the
+                                     relay's suggestion (5000). Otherwise
+                                     100..5000, else VNET_EINVAL: the relay drops
+                                     a silent member after 15 s by default, so
+                                     keep it at or below a third of that. The
+                                     session is declared lost (VNET_ETIMEDOUT)
+                                     after three intervals without any frame
+                                     from the relay. */
 
     /* Optional hooks */
     vnet_clock_fn clock;          /* NULL = backend default (see top) */
@@ -268,12 +318,16 @@ void vnet_config_init(vnet_config *cfg);
  *   VNET_ENOTSUP   unknown/unavailable `backend`
  *   VNET_EADDRINUSE  `loopback_host` already used on that network
  *   VNET_ENOMEM    out of memory
- *   VNET_EIO       OS networking could not be initialised (Winsock)
+ *   VNET_EIO       OS networking could not be initialised (Winsock), or a
+ *                  relay backend found no secure random source for its
+ *                  handshake nonce
  * cfg may be NULL (= UDP defaults). A context made on a loopback network
  * must be destroyed before the network is.
  */
 vnet *vnet_create(const vnet_config *cfg, int *err);
-void  vnet_destroy(vnet *v);   /* closes all its sockets; NULL is a no-op */
+void  vnet_destroy(vnet *v);   /* closes all its sockets; NULL is a no-op. A
+                                  relay context leaves its room (best effort,
+                                  one LEAVE frame) */
 
 /* ------------------------------------------------------------------ */
 /* Sockets                                                             */
@@ -295,6 +349,9 @@ void vnet_close(vnet *v, int s);
 /* The address `s` is bound to. For a UDP socket bound to all addresses the
  * IP part is the wildcard (0.0.0.0 or ::); give peers 127.0.0.1:port or
  * the real host address.
+ * Relay contexts: the virtual address 10.0.0.N and the port; before the room
+ * has been entered (see vnet_status()) VNET_ENOTCONN, because the address is
+ * not known yet.
  * Returns 0, VNET_EINVAL (NULL argument), VNET_EBADF or VNET_EIO. */
 int  vnet_local_addr(vnet *v, int s, vnet_addr *out);
 
@@ -310,6 +367,9 @@ int  vnet_local_addr(vnet *v, int s, vnet_addr *out);
  *   VNET_EAGAIN    UDP only: the OS send buffer is full; treat as a drop
  *   VNET_EIO       UDP only: transient OS error (network unreachable ...);
  *                  treat as a drop
+ *   VNET_ENOTCONN  relay only: not in a room (see vnet_status()); nothing
+ *                  is sent. A destination that is not in your room is not an
+ *                  error: it is dropped by the relay, like any lost datagram.
  * len may be 0.
  */
 int vnet_sendto(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to);
@@ -334,6 +394,48 @@ int vnet_recvfrom(vnet *v, int s, void *buf, size_t cap, vnet_addr *from);
  * poll receivable. Async backends (relay, browser) do their I/O here.
  */
 void vnet_poll(vnet *v);
+
+/* ------------------------------------------------------------------ */
+/* Status                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Some backends need time to become usable: the relay backends connect and
+ * enter a room asynchronously, driven by vnet_poll(). vnet_status() tells a
+ * game where it is, so it can show "connecting..." and give up with a
+ * message. It is generic: every backend answers it.
+ */
+#define VNET_STATUS_CONNECTING 1  /* setting up; datagrams cannot be sent yet */
+#define VNET_STATUS_READY      2  /* usable. UDP and loopback: always. Relay:
+                                     in a room, with a virtual address */
+#define VNET_STATUS_FAILED     3  /* unusable; `error` says why. Final: create
+                                     a new context to try again */
+
+typedef struct vnet_status_info {
+    int state;               /* VNET_STATUS_* */
+    int error;               /* FAILED: the VNET_E* reason (VNET_ETIMEDOUT,
+                                VNET_ENOROOM, VNET_EROOMFULL, VNET_ECONNREFUSED,
+                                VNET_ECLOSED ...). Otherwise 0 */
+    const char *transport;   /* static name: "udp", "loopback", "relay-udp",
+                                "relay-ws" (later backends add their own) */
+    char room[8];            /* relay: the room code (NUL-terminated) once
+                                READY, else "" */
+    vnet_addr self;          /* relay: this context's virtual address
+                                (10.0.0.N, port 0) once READY; family
+                                VNET_AF_NONE otherwise */
+    /* New fields are only ever added at the end of this struct. */
+} vnet_status_info;
+
+/*
+ * Returns the state (VNET_STATUS_*) and, if `out` is not NULL, fills it in.
+ * Returns VNET_EINVAL for a NULL context. Cheap; call it as often as you
+ * like, after vnet_poll(). While the state is CONNECTING:
+ *   vnet_open() works (ports are local),
+ *   vnet_sendto() returns VNET_ENOTCONN (nothing is queued),
+ *   vnet_recvfrom() returns VNET_EAGAIN.
+ * After FAILED the same applies, with the reason in `error`.
+ */
+int vnet_status(vnet *v, vnet_status_info *out);
 
 /*
  * The context's clock in milliseconds (arbitrary epoch, monotonic): the
@@ -365,9 +467,11 @@ typedef struct vnet_stats {
     uint64_t impair_duplicated;  /* extra copies created */
     uint64_t impair_reordered;   /* packets given the reorder delay */
     uint64_t impair_overflow;    /* dropped: delay queue full */
-    uint64_t rx_overflow;        /* dropped: receive queue full (loopback) */
-    uint64_t rx_oversize;        /* dropped: > VNET_MAX_DATAGRAM (UDP) */
-    uint64_t unroutable;         /* loopback: no such host/port */
+    uint64_t rx_overflow;        /* dropped: receive queue full (loopback,
+                                    relay) */
+    uint64_t rx_oversize;        /* dropped: > VNET_MAX_DATAGRAM (UDP, relay) */
+    uint64_t unroutable;         /* loopback: no such host/port; relay: a
+                                    datagram for a port you have not opened */
 } vnet_stats;
 
 /* Copy the counters out. A NULL `v` gives zeros. */

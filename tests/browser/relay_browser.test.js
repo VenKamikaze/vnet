@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: MIT
+//
+// Browser integration test for the vnet relay: Chromium (Playwright) running
+// the Emscripten build of examples/relay_peer.c shares rooms with a native
+// relay_peer process, through a real relay started on loopback ports.
+//
+//   node relay_browser.test.js --relay-bin PATH --peer-bin PATH --web-dir DIR [--count N]
+//
+// Needs `playwright` (require() must find it; set NODE_PATH if it is
+// installed elsewhere) and a Chromium that Playwright can launch.
+'use strict';
+const { chromium } = require('playwright');
+const { spawn } = require('child_process');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
+
+function arg(name, def) {
+  const i = process.argv.indexOf('--' + name);
+  return i >= 0 ? process.argv[i + 1] : def;
+}
+const RELAY_BIN = arg('relay-bin');
+const PEER_BIN = arg('peer-bin');
+const WEB_DIR = arg('web-dir');
+const COUNT = parseInt(arg('count', '150'), 10);
+if (!RELAY_BIN || !PEER_BIN || !WEB_DIR) {
+  console.error('usage: relay_browser.test.js --relay-bin PATH --peer-bin PATH --web-dir DIR [--count N]');
+  process.exit(2);
+}
+
+let failures = 0;
+function check(cond, what) {
+  if (cond) console.log('  ok    ' + what);
+  else { console.log('  FAIL  ' + what); failures++; }
+}
+const withTimeout = (p, ms, what) => Promise.race([
+  p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout waiting for ' + what)), ms))]);
+
+// ---- child processes
+
+function startRelay(extraArgs = []) {
+  const child = spawn(RELAY_BIN, ['-udp', '127.0.0.1:0', '-http', '127.0.0.1:0', '-stats', '127.0.0.1:0', ...extraArgs],
+    { stdio: ['ignore', 'pipe', 'inherit'], env: { PATH: process.env.PATH } });
+  const rl = readline.createInterface({ input: child.stdout });
+  const ready = new Promise((resolve, reject) => {
+    rl.on('line', (line) => {
+      const m = /^LISTEN udp=(\S+) http=(\S+) stats=(\S+)/.exec(line);
+      if (m) resolve({ child, udp: m[1], http: m[2], stats: m[3] });
+    });
+    child.on('exit', (c) => reject(new Error('relay exited early: ' + c)));
+  });
+  return withTimeout(ready, 15000, 'the relay to start');
+}
+
+function getJSON(hostport, p) {
+  return new Promise((resolve, reject) => {
+    http.get({ host: hostport.split(':')[0], port: hostport.split(':')[1], path: p }, (res) => {
+      let b = '';
+      res.on('data', (d) => (b += d));
+      res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+}
+
+// A native relay_peer. Resolves {code, result()} once it has entered its room.
+function startPeer(relayUdp, room) {
+  const args = ['--relay', relayUdp, '--count', String(COUNT), '--timeout', '40000'];
+  if (room) args.push('--room', room);
+  const child = spawn(PEER_BIN, args, { stdio: ['ignore', 'pipe', 'inherit'] });
+  const rl = readline.createInterface({ input: child.stdout });
+  const peer = { child, code: null, roomLine: null, result: null };
+  peer.exited = new Promise((resolve) => child.on('exit', (c) => resolve(c)));
+  peer.entered = new Promise((resolve, reject) => {
+    rl.on('line', (line) => {
+      let m;
+      if ((m = /^ROOM (\S+) (\S+) (\S+)/.exec(line))) { peer.code = m[1]; peer.roomLine = line; resolve(peer); }
+      if ((m = /^RESULT (.*)/.exec(line))) { peer.result = JSON.parse(m[1]); resolve(peer); }
+    });
+    child.on('exit', () => resolve(peer));
+  });
+  return peer;
+}
+
+// ---- static files for the Emscripten output
+
+function serveWeb() {
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm' };
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const f = path.join(WEB_DIR, path.normalize(u.pathname).replace(/^(\.\.[/\\])+/, ''));
+    if (!f.startsWith(path.resolve(WEB_DIR)) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) {
+      res.writeHead(404); res.end('not found'); return;
+    }
+    res.writeHead(200, { 'Content-Type': types[path.extname(f)] || 'application/octet-stream' });
+    fs.createReadStream(f).pipe(res);
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+}
+
+// ---- browser pages
+
+async function openPeerPage(browser, webOrigin, wsUrl, room) {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(String(e)));
+  const q = new URLSearchParams({ relay: wsUrl, count: String(COUNT), timeout: '40000' });
+  if (room) q.set('room', room);
+  await page.goto(`${webOrigin}/relay_peer.html?${q}`);
+  return { ctx, page, errors };
+}
+const pageResult = (p) =>
+  withTimeout(p.page.waitForFunction(() => window.vnetResult, null, { timeout: 45000, polling: 20 }).then((h) => h.jsonValue()), 50000, 'the page result');
+const pageRoom = async (p) => {
+  await p.page.waitForFunction(() => window.vnetLog.some((l) => /^ROOM /.test(l)), null, { timeout: 20000, polling: 20 });
+  const line = await p.page.evaluate(() => window.vnetLog.find((l) => /^ROOM /.test(l)));
+  return { code: line.split(' ')[1], line };
+};
+
+async function main() {
+  const relay = await startRelay();
+  const web = await serveWeb();
+  const webOrigin = `http://127.0.0.1:${web.address().port}`;
+  const wsUrl = `ws://${relay.http}/vnet`;
+  const browser = await chromium.launch();
+  console.log(`relay udp=${relay.udp} ws=${wsUrl}; ${COUNT} datagrams each way`);
+
+  try {
+    // 1. A native client creates the room, a browser joins it.
+    console.log('native host, browser guest');
+    {
+      const host = startPeer(relay.udp, null);
+      await withTimeout(host.entered, 15000, 'the native host to enter its room');
+      check(host.code && /^[A-HJ-NP-Z2-9]{6}$/.test(host.code), `room code ${host.code}`);
+      check(/ 10\.0\.0\.1:0 /.test(host.roomLine), 'the creator is 10.0.0.1 (' + host.roomLine + ')');
+      const guest = await openPeerPage(browser, webOrigin, wsUrl, host.code);
+      const r = await pageResult(guest);
+      check(r.ok === true, 'browser guest result ' + JSON.stringify(r));
+      check(r.sent === COUNT && r.received === COUNT, `browser sent ${r.sent}, received ${r.received} in order`);
+      const code = await withTimeout(host.exited, 20000, 'the native host to finish');
+      check(code === 0 && host.result && host.result.ok && host.result.received === COUNT && host.result.sent === COUNT,
+        'native host result ' + JSON.stringify(host.result));
+      check(guest.errors.length === 0, 'no page errors ' + guest.errors.join('; '));
+      const line = await guest.page.evaluate(() => window.vnetLog.find((l) => /^ROOM /.test(l)));
+      check(/ 10\.0\.0\.2:0 relay-ws$/.test(line), 'the browser guest is 10.0.0.2 on relay-ws (' + line + ')');
+      await guest.ctx.close();
+    }
+
+    // 2. A browser creates the room, a native client joins it.
+    console.log('browser host, native guest');
+    {
+      const host = await openPeerPage(browser, webOrigin, wsUrl, null);
+      const { code, line } = await pageRoom(host);
+      check(/ 10\.0\.0\.1:0 relay-ws$/.test(line), `browser host created ${code} as 10.0.0.1`);
+      const guest = startPeer(relay.udp, code);
+      const gr = await withTimeout(guest.entered.then(() => guest.exited), 45000, 'the native guest to finish');
+      check(gr === 0 && guest.result && guest.result.ok && guest.result.received === COUNT, 'native guest result ' + JSON.stringify(guest.result));
+      const r = await pageResult(host);
+      check(r.ok === true && r.sent === COUNT && r.received === COUNT, 'browser host result ' + JSON.stringify(r));
+      check(host.errors.length === 0, 'no page errors ' + host.errors.join('; '));
+      await host.ctx.close();
+    }
+
+    // 3. Two browsers, one native bystander in another room (must see nothing).
+    console.log('two browsers (WebSocket to WebSocket)');
+    {
+      const host = await openPeerPage(browser, webOrigin, wsUrl, null);
+      const { code } = await pageRoom(host);
+      const guest = await openPeerPage(browser, webOrigin, wsUrl, code);
+      const [rh, rg] = await Promise.all([pageResult(host), pageResult(guest)]);
+      check(rh.ok && rg.ok && rh.received === COUNT && rg.received === COUNT, `host ${JSON.stringify(rh)} guest ${JSON.stringify(rg)}`);
+      await host.ctx.close(); await guest.ctx.close();
+    }
+
+    // 4. Failures reach the page as a status, not a hang.
+    console.log('failure paths');
+    {
+      const nope = await openPeerPage(browser, webOrigin, wsUrl, 'ZZZZZZ');
+      const r = await pageResult(nope);
+      check(r.ok === false && /no such room/.test(r.error), 'unknown room: ' + JSON.stringify(r));
+      await nope.ctx.close();
+      const bad = await openPeerPage(browser, webOrigin, 'ws://127.0.0.1:1/vnet', null);
+      const r2 = await pageResult(bad);
+      check(r2.ok === false && /relay unreachable/.test(r2.error), 'relay down: ' + JSON.stringify(r2));
+      await bad.ctx.close();
+    }
+
+    // 5. A relay that answers 503 because this address has too many sockets
+    // pending (many browsers behind one NAT): the page retries and gets in.
+    console.log('503 on connect is retried');
+    {
+      const busy = await startRelay(['-max-pending-ws-per-ip', '1']);
+      try {
+        const busyWs = `ws://${busy.http}/vnet`;
+        // Hold the only pending slot with a socket that never says anything.
+        const hold = new WebSocket(busyWs);
+        await new Promise((res, rej) => { hold.onopen = res; hold.onerror = () => rej(new Error('hold socket failed')); });
+        const page = await openPeerPage(browser, webOrigin, busyWs, null);
+        let refused = 0;
+        for (let i = 0; i < 300 && refused < 1; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+          refused = (await getJSON(busy.stats, '/stats')).ws_refused;
+        }
+        check(refused >= 1, `the relay refused the page's first connection (${refused} refusals)`);
+        hold.close();  // the slot frees; the page's retry gets in
+        const { code, line } = await pageRoom(page);
+        check(/ 10\.0\.0\.1:0 relay-ws$/.test(line), `the page got into room ${code} after being refused`);
+        check(page.errors.length === 0, 'no page errors');
+        await page.ctx.close();
+      } finally {
+        busy.child.kill('SIGTERM');
+      }
+    }
+
+    // Closing a page closes its WebSocket; the relay notices asynchronously.
+    let st = await getJSON(relay.stats, '/stats');
+    for (let i = 0; i < 500 && st.sessions !== 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      st = await getJSON(relay.stats, '/stats');
+    }
+    check(st.rooms_created === 3, `3 rooms were created (${st.rooms_created})`);
+    check(st.malformed === 0 && st.rate_limited === 0, `relay saw no malformed frames and no rate limiting (${st.malformed}, ${st.rate_limited})`);
+    check(st.sessions === 0 && st.rooms === 0, `all sessions left and every room closed (${st.sessions} sessions, ${st.rooms} rooms)`);
+  } finally {
+    await browser.close();
+    web.close();
+    relay.child.kill('SIGTERM');
+  }
+}
+
+main().then(() => {
+  console.log(failures ? `\n${failures} check(s) FAILED` : '\nall browser checks passed');
+  process.exit(failures ? 1 : 0);
+}, (e) => { console.error('ERROR:', e); process.exit(1); });
