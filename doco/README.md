@@ -13,7 +13,7 @@ Each brief (`NN-*.md`) is one implement → review → merge cycle. Brief number
 
 | # | Brief | Depends on | Status |
 |---|---|---|---|
-| 06 | [vnet core: API, loopback and native UDP](06-vnet-core.md) | — | todo |
+| 06 | [vnet core: API, loopback and native UDP](06-vnet-core.md) | — | done |
 | 10 | [Relay and WebSocket transport](10-vnet-relay-websocket.md) | 06 | todo |
 | 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | todo |
 

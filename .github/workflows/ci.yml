@@ -1,0 +1,105 @@
+name: CI
+
+# Work branches (vnet/NN-*) are merged locally, so they need push builds. A
+# pull request from the same repository would run twice (push + PR): the
+# concurrency group below cancels the older run for the same ref.
+on:
+  push:
+    branches: [main, claude, "vnet/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}${{ matrix.sanitize && ' / asan+ubsan' || '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cc: gcc,   cxx: g++,     sanitize: false }
+          - { os: ubuntu-latest, cc: clang, cxx: clang++, sanitize: false }
+          - { os: ubuntu-latest, cc: gcc,   cxx: g++,     sanitize: true }
+          # Not verifiable from the authoring environment (no macOS there).
+          - { os: macos-latest,  cc: clang, cxx: clang++, sanitize: false }
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      # The IPv6 UDP test must run on every job: a missing ::1 is a failure.
+      VNET_REQUIRE_IPV6: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the FetchContent consumer check clones this checkout
+
+      - name: Make sure IPv6 loopback (::1) exists
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          ip -6 addr show dev lo
+          ip -6 addr show dev lo | grep -q 'inet6 ::1' || { echo "::1 missing on lo"; exit 1; }
+
+      - name: Install GoogleTest (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtest-dev
+
+      # macOS: tests fetch GoogleTest with FetchContent (git, not an archive).
+
+      - name: Configure
+        run: |
+          flags=""
+          if [ "${{ matrix.sanitize }}" = "true" ]; then
+            flags="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g"
+          fi
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DVNET_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_C_FLAGS="$flags" -DCMAKE_CXX_FLAGS="$flags" \
+            -DCMAKE_EXE_LINKER_FLAGS="$flags"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install and consume via find_package
+        if: matrix.sanitize == false
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/vnet-prefix"
+          cmake -S tests/consumer -B "$RUNNER_TEMP/consumer-build" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/vnet-prefix"
+          cmake --build "$RUNNER_TEMP/consumer-build"
+          "$RUNNER_TEMP/consumer-build/consumer"
+
+      - name: Consume via FetchContent (GIT_REPOSITORY)
+        if: matrix.sanitize == false
+        run: |
+          cmake -S tests/consumer_fetch -B "$RUNNER_TEMP/fetch-build" \
+            -DVNET_REPO="file://$GITHUB_WORKSPACE" -DVNET_REV="$(git rev-parse HEAD)"
+          cmake --build "$RUNNER_TEMP/fetch-build"
+          "$RUNNER_TEMP/fetch-build/consumer"
+
+  mingw:
+    name: MinGW-w64 cross build (smoke under Wine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain and Wine
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 wine64
+      - name: Configure and build
+        run: |
+          cmake -S . -B build-mingw \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+            -DVNET_BUILD_TESTS=OFF -DVNET_BUILD_SMOKE=ON \
+            -DVNET_WARNINGS_AS_ERRORS=ON
+          cmake --build build-mingw
+      - name: Run smoke test under Wine
+        run: |
+          WINE=$(command -v wine64 || command -v wine || echo /usr/lib/wine/wine64)
+          WINEDEBUG=-all "$WINE" build-mingw/tests/vnet_smoke.exe
