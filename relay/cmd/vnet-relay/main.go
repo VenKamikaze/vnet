@@ -41,6 +41,8 @@ func main() {
 		keepalive  = fs.Duration("keepalive", 5*time.Second, "keepalive interval advertised to clients")
 		pps        = fs.Float64("client-pps", 600, "per-client sustained packets per second")
 		bps        = fs.Float64("client-bps", 600000, "per-client sustained bytes per second")
+		hsRate     = fs.Float64("handshake-rate", 20, "CREATE_ROOM/JOIN_ROOM per second per source IP (many players behind one NAT share it)")
+		hsBurst    = fs.Float64("handshake-burst", 50, "handshake burst per source IP")
 		origins    = fs.String("origins", "*", "comma-separated Origin hosts allowed to open a WebSocket, or *")
 		trustXFF   = fs.Bool("trust-forwarded-for", false, "take client IPs from X-Forwarded-For (only behind a trusted proxy)")
 		verbose    = fs.Bool("v", false, "log room creation and closure")
@@ -64,6 +66,10 @@ func main() {
 		KeepaliveInterval: *keepalive,
 		ClientPPS:         *pps,
 		ClientBPS:         *bps,
+		HandshakePerSec:   *hsRate,
+		HandshakeBurst:    *hsBurst,
+		ReplyPerSec:       *hsRate,
+		ReplyBurst:        *hsBurst,
 		TrustForwardedFor: *trustXFF,
 	}
 	if *origins != "" && *origins != "*" {
