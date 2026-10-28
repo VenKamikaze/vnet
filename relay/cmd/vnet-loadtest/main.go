@@ -96,6 +96,17 @@ func handshake(c *client, code string) error {
 			c.octet = buf[13]
 			copy(c.token[:], buf[14:30])
 			c.code = string(buf[30:36])
+			if c.ws == nil {
+				// What a real client does at once: prove it receives at its
+				// address (the relay sends a UDP member nothing before that).
+				for k := 0; k < 10; k++ {
+					_ = c.write(append([]byte{typeKeepalive}, c.token[:]...))
+					_ = c.udp.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+					if n, err := c.read(buf); err == nil && n == 1 && buf[0] == typeKeepalive {
+						break
+					}
+				}
+			}
 			return nil
 		}
 		return fmt.Errorf("unexpected reply % x", buf[:n])

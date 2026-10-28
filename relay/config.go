@@ -11,17 +11,25 @@ import (
 // "use the default" (see withDefaults); nothing is unlimited.
 type Config struct {
 	// Rooms.
-	MaxMembers      int           // members per room incl. the creator (2..254); default 8
-	MaxRooms        int           // rooms at once; default 1000
-	MaxSessions     int           // members (UDP + WebSocket) at once, also caps open WebSockets; default 20000
-	RoomIdleTimeout time.Duration // a room with no DATA for this long is closed; default 30 min
+	MaxMembers  int // members per room incl. the creator (2..254); default 8
+	MaxRooms    int // rooms at once; default 1000
+	MaxSessions int // members (UDP + WebSocket) at once, also caps open WebSockets; default 20000
+	// Per source address (IPv6 sources are grouped by /64):
+	MaxSessionsPerIP  int           // members at once; default 64 (everyone behind one NAT shares it)
+	MaxRoomsPerIP     int           // rooms created and still alive; default 16
+	MaxWSPerIP        int           // open WebSockets; default 64
+	MaxPendingWSPerIP int           // WebSockets that have not entered a room yet; default 8
+	RoomIdleTimeout   time.Duration // a room with no DATA for this long is closed; default 30 min
 
 	// Liveness.
-	KeepaliveInterval time.Duration // advertised to clients in ROOM; default 5 s
-	SessionTimeout    time.Duration // no frame (or WebSocket pong) for this long drops a member; default 15 s
-	HandshakeTimeout  time.Duration // a WebSocket must send CREATE_ROOM/JOIN_ROOM within this; default 10 s
-	NonceTTL          time.Duration // how long a finished handshake nonce is remembered; default 60 s
-	PingInterval      time.Duration // WebSocket ping interval; default 5 s
+	KeepaliveInterval     time.Duration // advertised to clients in ROOM; default 5 s
+	SessionTimeout        time.Duration // no frame (or WebSocket pong) for this long drops a member; default 15 s
+	HandshakeTimeout      time.Duration // a WebSocket must send CREATE_ROOM/JOIN_ROOM within this; default 10 s
+	NonceTTL              time.Duration // how long a finished handshake nonce is remembered; default 60 s
+	UnvalidatedTimeout    time.Duration // a UDP member that never proved it receives at its address is dropped after this; default 10 s
+	PathChallengeInterval time.Duration // at most one address-validation challenge per session in this time; default 1 s
+	PathChallengeTimeout  time.Duration // a challenge can be answered for this long; default 10 s
+	PingInterval          time.Duration // WebSocket ping interval; default 5 s
 
 	// Per-client limits (token buckets; excess frames are dropped).
 	ClientPPS      float64 // sustained packets per second; default 600
@@ -40,9 +48,11 @@ type Config struct {
 	MaxTrackedIPs     int     // per-IP limiter entries; default 100000
 
 	// WebSocket.
-	WSSendQueue       int      // frames queued per WebSocket client before drops; default 128
-	AllowedOrigins    []string // Origin hosts allowed to open a WebSocket; empty or "*" = any
-	TrustForwardedFor bool     // take the client IP from X-Forwarded-For (only behind a trusted proxy)
+	WSSendQueue       int           // frames queued per WebSocket client before drops; default 128
+	WSSendQueueBytes  int           // bytes queued per WebSocket client before drops; default 65536
+	WSWriteTimeout    time.Duration // a WebSocket write that takes longer closes the connection; default 5 s
+	AllowedOrigins    []string      // Origin hosts allowed to open a WebSocket; empty or "*" = any
+	TrustForwardedFor bool          // take the client IP from X-Forwarded-For (only behind a trusted proxy)
 
 	// Test and logging hooks.
 	Now  func() time.Time
@@ -68,6 +78,15 @@ func (c Config) withDefaults() (Config, error) {
 	def(&c.MaxMembers, 8)
 	def(&c.MaxRooms, 1000)
 	def(&c.MaxSessions, 20000)
+	def(&c.MaxSessionsPerIP, 64)
+	def(&c.MaxRoomsPerIP, 16)
+	def(&c.MaxWSPerIP, 64)
+	def(&c.MaxPendingWSPerIP, 8)
+	def(&c.WSSendQueueBytes, 65536)
+	defD(&c.WSWriteTimeout, 5*time.Second)
+	defD(&c.UnvalidatedTimeout, 10*time.Second)
+	defD(&c.PathChallengeInterval, time.Second)
+	defD(&c.PathChallengeTimeout, 10*time.Second)
 	defD(&c.RoomIdleTimeout, 30*time.Minute)
 	defD(&c.KeepaliveInterval, 5*time.Second)
 	defD(&c.SessionTimeout, 15*time.Second)
@@ -100,6 +119,9 @@ func (c Config) withDefaults() (Config, error) {
 	}
 	if c.KeepaliveInterval < time.Second {
 		return c, fmt.Errorf("KeepaliveInterval must be at least 1 s (it is advertised in whole seconds)")
+	}
+	if c.KeepaliveInterval*3 > c.SessionTimeout {
+		return c, fmt.Errorf("KeepaliveInterval (%v) must be at most a third of SessionTimeout (%v), or healthy clients would time out", c.KeepaliveInterval, c.SessionTimeout)
 	}
 	return c, nil
 }

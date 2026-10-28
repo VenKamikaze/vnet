@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,13 +30,15 @@ type env struct {
 	clock *fakeClock
 	udp   *net.UDPAddr
 	http  *httptest.Server
+	stats *httptest.Server
 	wsURL string
 }
 
 func newEnv(t *testing.T, mod func(*Config)) *env {
 	t.Helper()
 	clk := newFakeClock()
-	cfg := Config{Now: clk.Now, PingInterval: time.Hour}
+	cfg := Config{Now: clk.Now, PingInterval: time.Hour,
+		MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -48,9 +51,10 @@ func newEnv(t *testing.T, mod func(*Config)) *env {
 		t.Fatal(err)
 	}
 	ts := httptest.NewServer(srv.Handler())
-	e := &env{t: t, srv: srv, clock: clk, udp: addr.(*net.UDPAddr), http: ts,
+	st := httptest.NewServer(srv.StatsHandler())
+	e := &env{t: t, srv: srv, clock: clk, udp: addr.(*net.UDPAddr), http: ts, stats: st,
 		wsURL: "ws" + strings.TrimPrefix(ts.URL, "http") + "/vnet"}
-	t.Cleanup(func() { ts.Close(); srv.Close() })
+	t.Cleanup(func() { ts.Close(); st.Close(); srv.Close() })
 	return e
 }
 
@@ -112,6 +116,12 @@ func (c *udpC) handshake(code string) *udpC {
 		c.t.Fatal("no reply to handshake")
 	}
 	c.room = parseRoom(c.t, b)
+	// What a client does at once: a KEEPALIVE from its address proves it
+	// receives there; the relay sends it nothing before that.
+	c.write(append([]byte{TypeKeepalive}, c.room.token[:]...))
+	if r := c.read(waitLimit); len(r) != 1 || r[0] != TypeKeepalive {
+		c.t.Fatalf("no reply to the validating keepalive: % x", r)
+	}
 	return c
 }
 
@@ -531,13 +541,46 @@ func TestWebSocketSessionTimeoutAndPongs(t *testing.T) {
 }
 
 func TestWebSocketSlowClientLosesFramesNotTheRelay(t *testing.T) {
-	e := newEnv(t, func(c *Config) { c.WSSendQueue = 4 })
+	e := newEnv(t, func(c *Config) { c.WSSendQueue = 4; c.WSSendQueueBytes = 1 << 20 })
 	c := &wsConn{hub: e.srv.hub, out: make(chan []byte, 4), done: make(chan struct{})}
-	for i := 0; i < 10; i++ {
-		c.enqueue([]byte{byte(i)})
+	// enqueue must never block the caller (a stuck client must not stall the
+	// goroutine that forwards for everybody else): fail by assertion, not by
+	// the test binary's timeout.
+	finished := make(chan struct{})
+	go func() {
+		for i := 0; i < 10; i++ {
+			c.enqueue([]byte{byte(i)})
+		}
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueue blocked on a full queue")
 	}
 	if len(c.out) != 4 || e.srv.Stats().WSQueueDrops != 6 {
 		t.Fatalf("queued %d, dropped %d", len(c.out), e.srv.Stats().WSQueueDrops)
+	}
+}
+
+func TestWebSocketSendQueueIsBoundedInBytes(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.WSSendQueue = 1000; c.WSSendQueueBytes = 2500 })
+	c := &wsConn{hub: e.srv.hub, out: make(chan []byte, 1000), done: make(chan struct{})}
+	for i := 0; i < 10; i++ {
+		c.enqueue(make([]byte, 1000))
+	}
+	if len(c.out) != 2 || e.srv.Stats().WSQueueDrops != 8 {
+		t.Fatalf("queued %d frames (limit 2500 bytes of 1000-byte frames), dropped %d", len(c.out), e.srv.Stats().WSQueueDrops)
+	}
+	if c.qbytes.Load() != 2000 {
+		t.Fatalf("byte count %d", c.qbytes.Load())
+	}
+	// Draining gives the room back.
+	<-c.out
+	c.qbytes.Add(-1000)
+	c.enqueue(make([]byte, 1000))
+	if len(c.out) != 2 {
+		t.Fatal("space freed by the writer was not reusable")
 	}
 }
 
@@ -596,7 +639,15 @@ func TestTimeoutAndRoomIdleOverRealSockets(t *testing.T) {
 func TestStatsAndHealth(t *testing.T) {
 	e := newEnv(t, nil)
 	dialUDP(t, e.udp).create()
-	resp, err := http.Get(e.http.URL + "/stats")
+	resp, err := http.Get(e.stats.URL + "/stats")
+	if err == nil && resp.StatusCode == 200 {
+		// The public listener must not serve it.
+		pub, perr := http.Get(e.http.URL + "/stats")
+		if perr != nil || pub.StatusCode != http.StatusNotFound {
+			t.Fatalf("/stats is served on the public handler: %v %v", perr, pub)
+		}
+		pub.Body.Close()
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,4 +751,310 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+// Regression: an unauthenticated client could crash the whole relay. Replies
+// queued for the writer goroutine (ERRORs for bad JOINs) were still being
+// written when the read goroutine answered a bad first frame with a write of
+// its own, and gorilla/websocket panics on concurrent writes, in a goroutine
+// nobody recovers. All writes to a connection must be serialised.
+//
+// The race window is a few microseconds on a healthy connection, so the test
+// makes it wide: the writer is stuck inside a write (the client "stopped
+// reading") while the bad frame arrives.
+func TestWebSocketBadFrameWhileTheWriterIsBusyDoesNotCrashTheRelay(t *testing.T) {
+	clk := newFakeClock()
+	srv, err := New(Config{Now: clk.Now, PingInterval: time.Hour, WSWriteTimeout: 300 * time.Millisecond,
+		HandshakePerSec: 1e6, HandshakeBurst: 1e6,
+		MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer(srv.Handler())
+	gl := &gatedListener{Listener: ts.Listener}
+	ts.Listener = gl
+	ts.Start()
+	t.Cleanup(func() { ts.Close(); srv.Close() })
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/vnet"
+
+	for round := 0; round < 3; round++ {
+		gl.setBlocked(false)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		waitFor(t, "the connection", func() bool { return srv.Stats().WebSockets == 1 })
+		gl.setBlocked(true)
+		// Bad JOINs: each queues an ERROR(ROOM_NOT_FOUND); the first one
+		// leaves the writer stuck in a write.
+		for j := 0; j < 10; j++ {
+			if err := conn.WriteMessage(websocket.BinaryMessage, handshakeFrame(uint64(round*100+j+1), "000000", 0)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		waitFor(t, "replies to queue behind the stuck writer", func() bool {
+			srv.hub.mu.RLock()
+			defer srv.hub.mu.RUnlock()
+			for c := range srv.hub.conns {
+				if len(c.out) >= 5 {
+					return true
+				}
+			}
+			return false
+		})
+		// Now the bad frame: reject() writes its ERROR while the writer is mid-write.
+		if err := conn.WriteMessage(websocket.BinaryMessage, []byte{0x55}); err != nil {
+			t.Fatal(err)
+		}
+		// The write timeout ends the stuck write, the connection goes, and
+		// the relay is still there.
+		waitFor(t, "the connection to be closed", func() bool { return srv.Stats().WebSockets == 0 })
+	}
+	gl.setBlocked(false)
+	resp, err := http.Get(ts.URL + "/healthz")
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("the relay is gone: %v", err)
+	}
+	resp.Body.Close()
+	if srv.Stats().Panics != 0 {
+		t.Fatalf("recovered panics: %+v", srv.Stats())
+	}
+}
+
+func TestWebSocketsPerAddressCaps(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.MaxWSPerIP = 3; c.MaxPendingWSPerIP = 2 })
+	refused := func() bool {
+		_, resp, err := websocket.DefaultDialer.Dial(e.wsURL, nil)
+		return err != nil && resp != nil && resp.StatusCode == http.StatusServiceUnavailable
+	}
+	a := dialWS(t, e.wsURL)
+	b := dialWS(t, e.wsURL)
+	waitFor(t, "two pending sockets", func() bool { return e.srv.Stats().WebSockets == 2 })
+	// A source cannot sit on unauthenticated sockets: two is the limit.
+	if !refused() {
+		t.Fatal("a third socket that has not entered a room was admitted")
+	}
+	// Entering a room makes a socket a member and frees a pending slot.
+	a.create()
+	c := dialWS(t, e.wsURL)
+	waitFor(t, "three sockets", func() bool { return e.srv.Stats().WebSockets == 3 })
+	b.create()
+	c.create()
+	// Nothing is pending any more, so only the cap on open sockets can refuse.
+	if !refused() {
+		t.Fatal("a fourth open socket from one address was admitted")
+	}
+	// Closing gives the capacity back, and nothing leaks.
+	c.conn.Close()
+	waitFor(t, "slot freed", func() bool { return e.srv.Stats().WebSockets == 2 })
+	dialWS(t, e.wsURL)
+	waitFor(t, "three sockets again", func() bool { return e.srv.Stats().WebSockets == 3 })
+}
+
+func TestWebSocketHandshakeTimeoutReleasesThePendingSlot(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.MaxPendingWSPerIP = 1 })
+	dialWS(t, e.wsURL)
+	waitFor(t, "registered", func() bool { return e.srv.Stats().WebSockets == 1 })
+	if _, resp, err := websocket.DefaultDialer.Dial(e.wsURL, nil); err == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("second pending socket admitted: %v", err)
+	}
+	e.clock.Advance(e.srv.cfg.HandshakeTimeout + time.Second)
+	e.srv.Sweep()
+	waitFor(t, "slot released", func() bool { return e.srv.Stats().WebSockets == 0 })
+	dialWS(t, e.wsURL)
+}
+
+// gatedListener wraps the connections it accepts so that a test can make
+// their writes block ("the client has stopped reading") and later release
+// them. A blocked Write honours the write deadline, like a real socket does.
+type gatedListener struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []*gatedConn
+	block bool
+}
+
+type gatedConn struct {
+	net.Conn
+	l  *gatedListener
+	mu sync.Mutex
+	dl time.Time
+}
+
+func (l *gatedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	g := &gatedConn{Conn: c, l: l}
+	l.mu.Lock()
+	l.conns = append(l.conns, g)
+	l.mu.Unlock()
+	return g, nil
+}
+
+// setBlocked makes writes on every connection (accepted before or after) block or flow.
+func (l *gatedListener) setBlocked(b bool) {
+	l.mu.Lock()
+	l.block = b
+	l.mu.Unlock()
+}
+
+func (g *gatedConn) SetWriteDeadline(t time.Time) error {
+	g.mu.Lock()
+	g.dl = t
+	g.mu.Unlock()
+	return g.Conn.SetWriteDeadline(t)
+}
+
+func (g *gatedConn) SetDeadline(t time.Time) error {
+	g.mu.Lock()
+	g.dl = t
+	g.mu.Unlock()
+	return g.Conn.SetDeadline(t)
+}
+
+func (g *gatedConn) Write(b []byte) (int, error) {
+	for {
+		g.l.mu.Lock()
+		blocked := g.l.block
+		g.l.mu.Unlock()
+		if !blocked {
+			return g.Conn.Write(b)
+		}
+		g.mu.Lock()
+		dl := g.dl
+		g.mu.Unlock()
+		if !dl.IsZero() && time.Now().After(dl) {
+			return 0, os.ErrDeadlineExceeded
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A sweeper that waits for each stuck client in turn would stall every
+// timeout behind them.
+func TestSweepDoesNotStallBehindClientsThatStopReading(t *testing.T) {
+	clk := newFakeClock()
+	srv, err := New(Config{Now: clk.Now, PingInterval: time.Hour, WSSendQueue: 100000, WSSendQueueBytes: 64 << 20,
+		ClientPPS: 1e6, ClientPPSBurst: 1e6, ClientBPS: 1e9, ClientBPSBurst: 1e9,
+		MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	udp, err := srv.ListenUDP("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer(srv.Handler())
+	gl := &gatedListener{Listener: ts.Listener}
+	ts.Listener = gl
+	ts.Start()
+	t.Cleanup(func() { gl.setBlocked(false); ts.Close(); srv.Close() })
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/vnet"
+
+	const stuck = 6
+	host := dialUDP(t, udp.(*net.UDPAddr)).create()
+	var clients []*wsC
+	for i := 0; i < stuck; i++ {
+		clients = append(clients, dialWS(t, wsURL).join(host.room.code))
+	}
+	// From now on no client reads: the relay's writes block. Feed each member
+	// until its writer is stuck with frames queued behind it.
+	gl.setBlocked(true)
+	for _, w := range clients {
+		for k := 0; k < 20; k++ {
+			host.write(host.dataFrame(w.vaddr(), 1, 2, make([]byte, 100)))
+		}
+	}
+	pending(t, host) // everything is routed
+	for _, w := range clients {
+		if queuedFrames(srv, w) < 5 {
+			t.Fatalf("member %d is not stuck behind a blocked write (%d queued)", w.octet(), queuedFrames(srv, w))
+		}
+	}
+	// Everybody goes quiet; the sweeper must close all of them promptly.
+	clk.Advance(srv.cfg.SessionTimeout + time.Second)
+	t0 := time.Now()
+	srv.Sweep()
+	took := time.Since(t0)
+	if took > 300*time.Millisecond {
+		t.Fatalf("Sweep took %v with %d clients that stopped reading", took, stuck)
+	}
+	if srv.Stats().Sessions != 0 {
+		t.Fatalf("%+v", srv.Stats())
+	}
+	// Their connections do go away once the (short) close deadline passes.
+	waitFor(t, "stuck connections closed", func() bool { return srv.Stats().WebSockets == 0 })
+}
+
+// queuedFrames is the number of frames waiting in the send queue of the relay's
+// connection for w (found through the member's session).
+func queuedFrames(srv *Server, w *wsC) int {
+	srv.hub.mu.RLock()
+	defer srv.hub.mu.RUnlock()
+	if s := srv.hub.byToken[w.room.token]; s != nil && s.ws != nil {
+		return len(s.ws.out)
+	}
+	return -1
+}
+
+// FuzzHandleWS sends arbitrary message sequences over a real WebSocket to a
+// relay that has a room in it. The relay must survive (no panic: a panic in a
+// connection goroutine would end the process) and its bookkeeping must stay
+// consistent.
+func FuzzHandleWS(f *testing.F) {
+	srv, err := New(Config{HandshakePerSec: 1e9, HandshakeBurst: 1e9, MaxPendingWSPerIP: 1e9, MaxWSPerIP: 1e9,
+		MaxSessionsPerIP: 1e9, MaxRoomsPerIP: 1e9, MaxSessions: 1e6, MaxRooms: 1e6})
+	if err != nil {
+		f.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	f.Cleanup(func() { ts.Close(); srv.Close() })
+	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/vnet"
+
+	f.Add([]byte{TypeCreate, ProtocolVersion, 1, 2, 3, 4, 5, 6, 7, 8, 0x55})
+	f.Add(append([]byte{4}, handshakeFrame(1, "000000", 0)...))
+	f.Add([]byte{0x55})
+	f.Add([]byte{TypeData, 10, 0, 0, 1})
+	f.Fuzz(func(t *testing.T, in []byte) {
+		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+		if err != nil {
+			t.Skip("dial refused") // only if the relay is at a limit; the invariant checks below catch a dead one
+		}
+		defer conn.Close()
+		// The input is a list of messages: each starts with a length byte.
+		for len(in) > 0 {
+			n := int(in[0]) % 64
+			in = in[1:]
+			if n > len(in) {
+				n = len(in)
+			}
+			typ := websocket.BinaryMessage
+			if n > 0 && in[0] == 0xff {
+				typ = websocket.TextMessage
+			}
+			if conn.WriteMessage(typ, in[:n]) != nil {
+				break
+			}
+			in = in[n:]
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				break
+			}
+		}
+		conn.Close()
+		st := srv.Stats()
+		if st.Panics != 0 {
+			t.Fatalf("recovered panic: %+v", st)
+		}
+		resp, err := http.Get(ts.URL + "/healthz")
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("the relay stopped answering: %v", err)
+		}
+		resp.Body.Close()
+	})
 }

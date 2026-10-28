@@ -22,6 +22,11 @@ type stats struct {
 	sessionsJoined    atomic.Uint64
 	sessionsTimedOut  atomic.Uint64
 	wsQueueDrops      atomic.Uint64 // frames dropped because a WebSocket client was too slow
+	unvalidatedDrops  atomic.Uint64 // frames for a UDP member whose address has not been validated yet
+	pathChallenges    atomic.Uint64
+	pathMigrations    atomic.Uint64 // sessions moved after a validated path change
+	badPathResponses  atomic.Uint64
+	panics            atomic.Uint64 // recovered panics (a bug; the relay keeps running)
 }
 
 // Stats is a snapshot of the relay's counters and gauges.
@@ -46,6 +51,11 @@ type Stats struct {
 	SessionsJoined    uint64 `json:"sessions_joined"`
 	SessionsTimedOut  uint64 `json:"sessions_timed_out"`
 	WSQueueDrops      uint64 `json:"ws_queue_drops"`
+	UnvalidatedDrops  uint64 `json:"unvalidated_drops"`
+	PathChallenges    uint64 `json:"path_challenges"`
+	PathMigrations    uint64 `json:"path_migrations"`
+	BadPathResponses  uint64 `json:"bad_path_responses"`
+	Panics            uint64 `json:"panics"`
 }
 
 func (h *Hub) snapshot() Stats {
@@ -64,5 +74,8 @@ func (h *Hub) snapshot() Stats {
 		RoomsCreated:      s.roomsCreated.Load(), RoomsClosed: s.roomsClosed.Load(),
 		RoomsIdleClosed: s.roomsIdleClosed.Load(), SessionsJoined: s.sessionsJoined.Load(),
 		SessionsTimedOut: s.sessionsTimedOut.Load(), WSQueueDrops: s.wsQueueDrops.Load(),
+		UnvalidatedDrops: s.unvalidatedDrops.Load(), PathChallenges: s.pathChallenges.Load(),
+		PathMigrations: s.pathMigrations.Load(), BadPathResponses: s.badPathResponses.Load(),
+		Panics: s.panics.Load(),
 	}
 }

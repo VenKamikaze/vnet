@@ -28,14 +28,16 @@ const (
 	MinUDPHandshake = 64
 
 	// Frame types, client to relay.
-	TypeCreate    = 0x01
-	TypeJoin      = 0x02
-	TypeLeave     = 0x03
-	TypeKeepalive = 0x04 // both directions
-	TypeData      = 0x10 // both directions
+	TypeCreate       = 0x01
+	TypeJoin         = 0x02
+	TypeLeave        = 0x03
+	TypeKeepalive    = 0x04 // both directions
+	TypePathResponse = 0x06 // client to relay: answers a PATH_CHALLENGE
+	TypeData         = 0x10 // both directions
 	// Frame types, relay to client.
-	TypeRoom  = 0x81
-	TypeError = 0x82
+	TypePathChallenge = 0x05
+	TypeRoom          = 0x81
+	TypeError         = 0x82
 )
 
 // Error reasons carried in ERROR frames.
@@ -59,6 +61,9 @@ const (
 	joinLen      = createLen + CodeLen // ... code
 	roomLen      = 1 + 1 + NonceLen + 4 + TokenLen + CodeLen + 1 + 1
 	errorLen     = 1 + 1 + NonceLen + 1
+	cookieLen    = 8
+	challengeLen = 1 + cookieLen            // PATH_CHALLENGE: type cookie
+	responseLen  = 1 + TokenLen + cookieLen // PATH_RESPONSE: type token cookie (UDP only)
 	udpDataHdr   = 1 + TokenLen + 4 + 2 + 2 // type token addr dport sport
 	wsDataHdr    = 1 + 4 + 2 + 2            // type addr dport sport
 	maxUDPFrame  = udpDataHdr + MaxPayload  // largest valid datagram

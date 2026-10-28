@@ -36,6 +36,17 @@ func (b *bucket) allow(now time.Time, rate, burst, cost float64) bool {
 	return true
 }
 
+// ipKey is the identity limits are kept under: an IPv4 address as is, an IPv6
+// address as its /64 (one subscriber typically controls a whole /64, so
+// per-address limits would be free to dodge by rotating the host part).
+func ipKey(a netip.Addr) netip.Addr {
+	a = a.Unmap()
+	if a.Is6() {
+		return netip.PrefixFrom(a, 64).Masked().Addr()
+	}
+	return a
+}
+
 type ipEntry struct {
 	handshake bucket
 	reply     bucket
@@ -71,6 +82,7 @@ func (l *ipLimiter) entry(ip netip.Addr, now time.Time) *ipEntry {
 
 // allowHandshake reports whether ip may start another handshake.
 func (l *ipLimiter) allowHandshake(ip netip.Addr, now time.Time) bool {
+	ip = ipKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	e := l.entry(ip, now)
@@ -83,6 +95,7 @@ func (l *ipLimiter) allowHandshake(ip netip.Addr, now time.Time) bool {
 // allowReply reports whether the relay may answer an unauthenticated packet
 // from ip: it must pass both the per-IP bucket and the global one.
 func (l *ipLimiter) allowReply(ip netip.Addr, now time.Time) bool {
+	ip = ipKey(ip)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if e := l.entry(ip, now); e != nil {

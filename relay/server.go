@@ -74,19 +74,34 @@ func (s *Server) ListenUDP(addr string) (net.Addr, error) {
 				}
 				continue
 			}
-			s.hub.HandleUDP(buf[:n], src, &scratch)
+			s.handleUDP(buf[:n], src, &scratch)
 		}
 	}()
 	return conn.LocalAddr(), nil
 }
 
-// Handler serves /vnet (WebSocket), /healthz and /stats.
+// handleUDP processes one datagram; a panic (a bug) costs that datagram, not
+// the process.
+func (s *Server) handleUDP(p []byte, src netip.AddrPort, scratch *[]byte) {
+	defer s.hub.recoverPanic("udp")
+	s.hub.HandleUDP(p, src, scratch)
+}
+
+// Handler serves /vnet (WebSocket) and /healthz. It is meant for the public
+// listener, so it does not expose /stats: see StatsHandler.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/vnet", s.serveWS)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	return mux
+}
+
+// StatsHandler serves /stats (counters as JSON). Serve it on a private
+// address.
+func (s *Server) StatsHandler() http.Handler {
+	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(s.Stats())
@@ -106,9 +121,14 @@ func (s *Server) Run(ctx context.Context) {
 		case <-s.stop:
 			return
 		case <-t.C:
-			s.hub.Sweep()
+			s.sweep()
 		}
 	}
+}
+
+func (s *Server) sweep() {
+	defer s.hub.recoverPanic("sweep")
+	s.hub.Sweep()
 }
 
 // Close stops the UDP reader and closes every WebSocket.

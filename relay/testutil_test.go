@@ -50,7 +50,9 @@ type testHub struct {
 func newTestHub(t *testing.T, mod func(*Config)) *testHub {
 	t.Helper()
 	clk := newFakeClock()
-	cfg := Config{Now: clk.Now}
+	// Per-address caps are exercised by their own tests; everything else
+	// comes from a handful of test addresses.
+	cfg := Config{Now: clk.Now, MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -173,7 +175,20 @@ func (th *testHub) mustCreate(addr netip.AddrPort, nonce uint64) *vclient {
 	if len(pk) != 1 {
 		th.t.Fatalf("CREATE: want 1 reply, got %d", len(pk))
 	}
-	return &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
+	c := &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
+	th.validate(c)
+	return c
+}
+
+// validate does what a client does as soon as it has its ROOM: send a
+// KEEPALIVE from its address, which proves it receives there. The relay
+// sends nothing to a UDP member before that.
+func (th *testHub) validate(c *vclient) {
+	th.t.Helper()
+	c.keepalive()
+	if pk := th.take(c.addr); len(pk) != 1 || len(pk[0]) != 1 || pk[0][0] != TypeKeepalive {
+		th.t.Fatalf("validation keepalive: %v", pk)
+	}
 }
 
 func (th *testHub) mustJoin(addr netip.AddrPort, nonce uint64, code string) *vclient {
@@ -184,7 +199,9 @@ func (th *testHub) mustJoin(addr netip.AddrPort, nonce uint64, code string) *vcl
 	if len(pk) != 1 {
 		th.t.Fatalf("JOIN: want 1 reply, got %d", len(pk))
 	}
-	return &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
+	c := &vclient{th: th, addr: addr, room: parseRoom(th.t, pk[0])}
+	th.validate(c)
+	return c
 }
 
 func (c *vclient) dataFrame(dstOctet byte, dport, sport uint16, payload []byte) []byte {

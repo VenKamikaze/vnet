@@ -36,6 +36,12 @@ func main() {
 		maxMembers = fs.Int("max-members", 8, "members per room, including the creator (2..254)")
 		maxRooms   = fs.Int("max-rooms", 1000, "rooms at once")
 		maxSess    = fs.Int("max-sessions", 20000, "members at once (also caps open WebSockets)")
+		perIPSess  = fs.Int("max-sessions-per-ip", 64, "members at once per source address (IPv6: per /64); many players behind one NAT share it")
+		perIPRooms = fs.Int("max-rooms-per-ip", 16, "rooms created and still alive per source address")
+		perIPWS    = fs.Int("max-ws-per-ip", 64, "open WebSockets per source address")
+		perIPPend  = fs.Int("max-pending-ws-per-ip", 8, "WebSockets per source address that have not entered a room yet")
+		wsQBytes   = fs.Int("ws-queue-bytes", 65536, "bytes queued per WebSocket client before its datagrams are dropped")
+		statsAddr  = fs.String("stats", "", "serve /stats (JSON counters) on this address, e.g. 127.0.0.1:8081; off by default")
 		roomIdle   = fs.Duration("room-idle", 30*time.Minute, "close a room that has carried no data for this long")
 		sessTO     = fs.Duration("session-timeout", 15*time.Second, "drop a member silent for this long")
 		keepalive  = fs.Duration("keepalive", 5*time.Second, "keepalive interval advertised to clients")
@@ -61,6 +67,11 @@ func main() {
 		MaxMembers:        *maxMembers,
 		MaxRooms:          *maxRooms,
 		MaxSessions:       *maxSess,
+		MaxSessionsPerIP:  *perIPSess,
+		MaxRoomsPerIP:     *perIPRooms,
+		MaxWSPerIP:        *perIPWS,
+		MaxPendingWSPerIP: *perIPPend,
+		WSSendQueueBytes:  *wsQBytes,
 		RoomIdleTimeout:   *roomIdle,
 		SessionTimeout:    *sessTO,
 		KeepaliveInterval: *keepalive,
@@ -108,12 +119,26 @@ func main() {
 			}
 		}()
 	}
+	var statsBound string
+	var statsSrv *http.Server
+	if *statsAddr != "" {
+		ln, err := net.Listen("tcp", *statsAddr)
+		if err != nil {
+			log.Fatalf("stats: %v", err)
+		}
+		statsBound = ln.Addr().String()
+		statsSrv = &http.Server{Handler: srv.StatsHandler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = statsSrv.Serve(ln) }()
+	}
 	// One machine-readable line for scripts and tests: the bound addresses
 	// (useful with port 0).
-	fmt.Printf("LISTEN udp=%s http=%s\n", udpBound, httpBound)
+	fmt.Printf("LISTEN udp=%s http=%s stats=%s\n", udpBound, httpBound, statsBound)
 	_ = os.Stdout.Sync()
 
 	srv.Run(ctx) // returns on SIGINT/SIGTERM after closing the server
+	if statsSrv != nil {
+		_ = statsSrv.Close()
+	}
 	if httpSrv != nil {
 		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

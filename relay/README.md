@@ -19,7 +19,7 @@ docker build -t vnet-relay relay/
 docker run --rm -p 7777:7777/udp -p 8080:8080 vnet-relay -v
 ```
 
-On start it prints one line, `LISTEN udp=<addr> http=<addr>` (the bound addresses; use `-udp 127.0.0.1:0` for a free port), which scripts and tests read.
+On start it prints one line, `LISTEN udp=<addr> http=<addr> stats=<addr>` (the bound addresses, `stats=` empty when off; use `-udp 127.0.0.1:0` for a free port), which scripts and tests read.
 
 Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper case, `-` becomes `_`: `VNET_RELAY_MAX_MEMBERS=4`); the command line wins.
 
@@ -30,16 +30,22 @@ Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper ca
 | `-max-members` | 8 | members per room, creator included (2..254) |
 | `-max-rooms` | 1000 | rooms at once |
 | `-max-sessions` | 20000 | members at once (also caps open WebSockets) |
+| `-max-sessions-per-ip` | 64 | members at once per source address (IPv6: per /64). Everyone behind one NAT shares it |
+| `-max-rooms-per-ip` | 16 | rooms created and still alive per source address |
+| `-max-ws-per-ip` | 64 | open WebSockets per source address |
+| `-max-pending-ws-per-ip` | 8 | WebSockets per source address that have not entered a room yet |
+| `-ws-queue-bytes` | 65536 | bytes queued per WebSocket client before its datagrams are dropped (worst-case memory is roughly this times the number of stuck clients) |
 | `-room-idle` | 30m | close a room that has carried no data for this long |
 | `-session-timeout` | 15s | drop a member silent for this long |
 | `-keepalive` | 5s | keepalive interval suggested to clients |
 | `-client-pps`, `-client-bps` | 600, 600000 | per-client sustained packet and byte rates (bursts are twice that) |
 | `-handshake-rate`, `-handshake-burst` | 20, 50 | room create/join attempts per second per source IP. Many players behind one NAT share this |
 | `-origins` | `*` | allowed `Origin` hosts for WebSockets, comma separated |
-| `-trust-forwarded-for` | off | use `X-Forwarded-For` as the client IP (only behind a proxy you control) |
+| `-trust-forwarded-for` | off | use the rightmost `X-Forwarded-For` entry as the client IP (only behind a proxy you control) |
+| `-stats` | off | serve `/stats` on this address, e.g. `127.0.0.1:8081` |
 | `-v` | off | log room creation and closure |
 
-`/stats` returns counters as JSON (rooms, members, frames, drops by reason). It is for operators: do not route it through a public proxy.
+The public listener serves only `/vnet` and `/healthz`. `/stats` (counters as JSON: rooms, members, frames, drops by reason, path validations) is **off by default**: give `-stats` a private address (localhost or an internal interface) to turn it on.
 
 ## TLS (`wss://`) in front of the relay
 
@@ -53,7 +59,7 @@ relay.example.org {
 }
 ```
 
-Browsers then connect to `wss://relay.example.org/vnet`. Start the relay with `-http 127.0.0.1:8080 -trust-forwarded-for` so the per-IP limits see real client addresses (Caddy sets `X-Forwarded-For` itself).
+Browsers then connect to `wss://relay.example.org/vnet`. Start the relay with `-http 127.0.0.1:8080 -trust-forwarded-for` so the per-address limits see real client addresses (Caddy sets `X-Forwarded-For` itself, and the relay trusts the rightmost entry, which is the one the proxy wrote).
 
 **nginx:**
 
@@ -63,7 +69,7 @@ location /vnet {
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_set_header X-Forwarded-For $remote_addr;   # not $proxy_add_x_forwarded_for: clients could forge the first entry
+    proxy_set_header X-Forwarded-For $remote_addr;   # set, not appended: nothing the client sent gets through
     proxy_read_timeout 1h;
 }
 ```
@@ -73,7 +79,7 @@ Native clients do not use TLS or the proxy: open the UDP port (7777 by default) 
 Other notes:
 
 - One relay process is one failure domain: a restart drops all rooms (clients see `VNET_ECLOSED` within one keepalive interval).
-- Capacity: one core handles the 200-client load test (50 rooms of 4, 30 packets per second each) at about 10% CPU and 10 MB of memory over UDP, 27% and 20 MB over WebSockets; see `scripts/loadtest.sh`.
+- Capacity: one core handles the 200-client load test (50 rooms of 4, 30 packets per second each) at about 10% CPU and 6 MB of memory over UDP, 23% and 21 MB over WebSockets; see `scripts/loadtest.sh`.
 - Run it unprivileged. It needs no files and no outbound connections.
 
 ## Development

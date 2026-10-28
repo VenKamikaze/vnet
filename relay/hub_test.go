@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +16,11 @@ import (
 // ---------------------------------------------------------------- rooms
 
 func TestCreateGivesHostAddressAndCode(t *testing.T) {
-	th := newTestHub(t, func(c *Config) { c.MaxMembers = 5; c.KeepaliveInterval = 7 * time.Second })
+	th := newTestHub(t, func(c *Config) {
+		c.MaxMembers = 5
+		c.KeepaliveInterval = 7 * time.Second
+		c.SessionTimeout = 30 * time.Second
+	})
 	c := th.mustCreate(ap("192.0.2.1", 1000), 1)
 	if c.room.octet != 1 {
 		t.Fatalf("creator vaddr = 10.0.0.%d, want 10.0.0.1 (the host convention)", c.room.octet)
@@ -744,6 +750,7 @@ func TestPerClientPacketRate(t *testing.T) {
 	th := newTestHub(t, func(c *Config) { c.ClientPPS, c.ClientPPSBurst = 10, 10 })
 	host := th.mustCreate(ap("192.0.2.1", 1), 1)
 	th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
+	th.clock.Advance(time.Hour) // refill the buckets the validation keepalives used
 	th.drain()
 	for i := 0; i < 100; i++ {
 		host.send(2, 1, 1, []byte{byte(i)})
@@ -786,6 +793,7 @@ func TestPerClientByteRate(t *testing.T) {
 	th := newTestHub(t, func(c *Config) { c.ClientBPS, c.ClientBPSBurst = 1000, 3000 })
 	host := th.mustCreate(ap("192.0.2.1", 1), 1)
 	th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
+	th.clock.Advance(time.Hour)
 	th.drain()
 	// 3000 bytes of budget; each frame is udpDataHdr+100 = 125 bytes.
 	for i := 0; i < 100; i++ {
@@ -905,33 +913,276 @@ func TestIdleRoomIsClosedEvenWithKeepalives(t *testing.T) {
 	}
 }
 
-func TestNATRebindingFollowsTheToken(t *testing.T) {
+// pathResponse is a client's PATH_RESPONSE frame.
+func (c *vclient) pathResponse(cookie []byte) []byte {
+	return append(append([]byte{TypePathResponse}, c.room.token[:]...), cookie...)
+}
+
+// challengeTo returns the cookie of the single PATH_CHALLENGE sent to addr in
+// out, failing if there is not exactly one frame for it.
+func challengeCookie(t *testing.T, out [][]byte) []byte {
+	t.Helper()
+	if len(out) != 1 || len(out[0]) != challengeLen || out[0][0] != TypePathChallenge {
+		t.Fatalf("want one PATH_CHALLENGE, got %v", out)
+	}
+	return out[0][1:]
+}
+
+func TestRealNATRebindingMigratesOnlyAfterTheEcho(t *testing.T) {
 	th := newTestHub(t, nil)
 	host := th.mustCreate(ap("192.0.2.1", 1), 1)
 	guest := th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
 	th.drain()
-	// The guest's NAT mapping changes: same token, new source port and IP.
 	moved := ap("198.51.100.77", 40000)
-	th.feed(moved, guest.tokenFrame(TypeKeepalive))
-	if pk := th.take(moved); len(pk) != 1 || pk[0][0] != TypeKeepalive {
-		t.Fatalf("no keepalive reply at the new address: %v", pk)
+
+	// The guest's NAT mapping changes: same token, another source.
+	req := guest.tokenFrame(TypeKeepalive)
+	th.feed(moved, req)
+	out := th.drain()
+	var atMoved [][]byte
+	for _, p := range out {
+		if p.to == moved {
+			atMoved = append(atMoved, p.b)
+		}
 	}
-	host.send(2, 1, 1, []byte("after-rebind"))
+	cookie := challengeCookie(t, atMoved)
+	if len(atMoved[0]) >= len(req) {
+		t.Fatal("the challenge must be smaller than the frame that triggered it")
+	}
+	// Not moved yet: traffic still goes to the old, validated address.
+	host.send(2, 1, 1, []byte("before-echo"))
 	got := th.drain()
+	if len(got) != 1 || got[0].to != guest.addr {
+		t.Fatalf("session moved before the echo: %v", got)
+	}
+	// The echo from the new address moves it.
+	th.feed(moved, guest.pathResponse(cookie))
+	host.send(2, 1, 1, []byte("after-echo"))
+	got = th.drain()
 	if len(got) != 1 || got[0].to != moved {
-		t.Fatalf("data went to %v, want %v", got, moved)
+		t.Fatalf("session did not follow the validated path: %v", got)
 	}
-	// The old address no longer receives anything for the guest.
 	if th.h.byToken[guest.room.token].octet != 2 {
-		t.Fatal("vaddr changed on rebinding")
+		t.Fatal("vaddr changed on migration")
 	}
-	// A retried handshake from the new address rebinds too.
-	third := ap("198.51.100.78", 1)
-	th.feed(third, handshakeFrame(2, host.room.code, MinUDPHandshake))
-	th.take(third)
-	host.send(2, 1, 1, []byte("again"))
-	if got := th.drain(); len(got) != 1 || got[0].to != third {
-		t.Fatalf("handshake retry did not rebind: %v", got)
+	if th.h.snapshot().PathMigrations != 1 {
+		t.Fatalf("%+v", th.h.snapshot())
+	}
+	// The old address is no longer the session's: its frames now get challenged.
+	th.clock.Advance(2 * time.Second)
+	th.drain()
+	th.feed(guest.addr, guest.tokenFrame(TypeKeepalive))
+	old := 0
+	for _, b := range th.take(guest.addr) {
+		if len(b) == challengeLen {
+			old++
+		}
+	}
+	if old != 1 {
+		t.Fatal("old address was not challenged")
+	}
+}
+
+func TestSpoofedSourceCannotRedirectASession(t *testing.T) {
+	th := newTestHub(t, nil)
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	guest := th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
+	th.drain()
+	victim := ap("203.0.113.9", 53)
+
+	// An attacker who holds the guest's token forges frames "from" the victim.
+	for _, typ := range []byte{TypeKeepalive, TypeData} {
+		var f []byte
+		if typ == TypeKeepalive {
+			f = guest.tokenFrame(TypeKeepalive)
+		} else {
+			f = guest.dataFrame(1, 1, 1, []byte("x"))
+		}
+		th.feed(victim, f)
+	}
+	out := th.drain()
+	toVictim := 0
+	for _, p := range out {
+		if p.to == victim {
+			toVictim++
+			if len(p.b) != challengeLen {
+				t.Fatalf("the victim was sent something other than a challenge: % x", p.b)
+			}
+		}
+	}
+	if toVictim != 1 {
+		t.Fatalf("victim received %d packets from two forged frames, want 1 challenge", toVictim)
+	}
+	// Relayed traffic still goes to the real guest, never to the victim.
+	for i := 0; i < 20; i++ {
+		host.send(2, 1, 1, []byte("for-the-guest"))
+	}
+	for _, p := range th.drain() {
+		if p.to == victim {
+			t.Fatalf("relay sent data to the victim: % x", p.b)
+		}
+	}
+	// A flood of forged frames, even from many different victims, produces at
+	// most one challenge per interval for the whole session.
+	for i := 0; i < 500; i++ {
+		th.feed(ap(fmt.Sprintf("203.0.%d.%d", i/250, i%250+1), 53), guest.tokenFrame(TypeKeepalive))
+	}
+	n := 0
+	for _, p := range th.drain() {
+		if len(p.b) == challengeLen {
+			n++
+		}
+	}
+	if n != 0 {
+		t.Fatalf("%d challenges inside the interval", n)
+	}
+	th.clock.Advance(2 * time.Second)
+	th.feed(ap("203.0.250.1", 53), guest.tokenFrame(TypeKeepalive))
+	n = 0
+	for _, p := range th.drain() {
+		if len(p.b) == challengeLen {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d challenges after the interval, want 1", n)
+	}
+}
+
+func TestPathResponsesAreChecked(t *testing.T) {
+	th := newTestHub(t, nil)
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	guest := th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
+	th.drain()
+	n1 := ap("198.51.100.1", 1000)
+	other := ap("198.51.100.2", 2000)
+	th.feed(n1, guest.tokenFrame(TypeKeepalive))
+	cookie := challengeCookie(t, th.take(n1))
+	toGuest := func() bool {
+		host.send(2, 1, 1, []byte("probe"))
+		got := th.drain()
+		return len(got) == 1 && got[0].to == n1
+	}
+	bad := append([]byte(nil), cookie...)
+	bad[0] ^= 1
+	th.feed(n1, guest.pathResponse(bad))       // wrong cookie
+	th.feed(other, guest.pathResponse(cookie)) // right cookie, wrong address
+	wrongTok := &vclient{th: th, addr: n1, room: roomReply{token: guest.room.token}}
+	wrongTok.room.token[0] ^= 1
+	th.feed(n1, wrongTok.pathResponse(cookie))  // right cookie, wrong token
+	th.feed(n1, guest.pathResponse(cookie[:7])) // truncated
+	if toGuest() {
+		t.Fatal("a bad PATH_RESPONSE moved the session")
+	}
+	if th.h.snapshot().BadPathResponses < 2 {
+		t.Fatalf("%+v", th.h.snapshot())
+	}
+	// Expired.
+	th.clock.Advance(th.h.cfg.PathChallengeTimeout + time.Second)
+	th.feed(n1, guest.pathResponse(cookie))
+	if toGuest() {
+		t.Fatal("an expired challenge was accepted")
+	}
+	// Fresh challenge, right answer: moves; the same answer again is no longer valid.
+	th.feed(n1, guest.tokenFrame(TypeKeepalive))
+	cookie2 := challengeCookie(t, th.take(n1))
+	th.feed(n1, guest.pathResponse(cookie2))
+	if !toGuest() {
+		t.Fatal("the right answer did not move the session")
+	}
+	// The same answer again is refused (and counted), not a second migration.
+	before := th.h.snapshot()
+	th.feed(n1, guest.pathResponse(cookie2))
+	if after := th.h.snapshot(); after.PathMigrations != before.PathMigrations || after.BadPathResponses != before.BadPathResponses+1 {
+		t.Fatalf("a repeated PATH_RESPONSE was accepted: %+v -> %+v", before, after)
+	}
+	// A completed validation cannot be replayed: move on to another address,
+	// then repeat the old answer from the first one.
+	th.clock.Advance(2 * time.Second)
+	th.feed(other, guest.tokenFrame(TypeKeepalive))
+	cookie3 := challengeCookie(t, th.take(other))
+	th.feed(other, guest.pathResponse(cookie3))
+	th.feed(n1, guest.pathResponse(cookie2))
+	host.send(2, 1, 1, []byte("probe"))
+	got := th.drain()
+	if len(got) != 1 || got[0].to != other {
+		t.Fatalf("a replayed PATH_RESPONSE moved the session: %v", got)
+	}
+}
+
+func TestChallengesAtOneVictimAreRateLimited(t *testing.T) {
+	// Many sessions (each with its own token) all spoofing one victim: the
+	// per-session interval is not enough, the per-address reply limit is.
+	th := newTestHub(t, func(c *Config) { c.ReplyPerSec, c.ReplyBurst = 5, 10; c.MaxMembers = 200 })
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	var members []*vclient
+	for i := 0; i < 100; i++ {
+		members = append(members, th.mustJoin(ap(fmt.Sprintf("192.0.3.%d", i+1), 1000), uint64(100+i), host.room.code))
+	}
+	th.drain()
+	victim := ap("203.0.113.9", 53)
+	for _, m := range members {
+		th.feed(victim, m.tokenFrame(TypeKeepalive))
+	}
+	toVictim := 0
+	for _, p := range th.drain() {
+		if p.to == victim {
+			toVictim++
+		}
+	}
+	if toVictim > 10 {
+		t.Fatalf("the victim received %d challenges from 100 sessions (burst limit 10)", toVictim)
+	}
+}
+
+func TestHandshakeRetryFromAnotherAddressDoesNotMoveTheSession(t *testing.T) {
+	th := newTestHub(t, nil)
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	guest := th.mustJoin(ap("192.0.2.2", 1), 2, host.room.code)
+	th.drain()
+	elsewhere := ap("203.0.113.40", 4000)
+	th.feed(elsewhere, handshakeFrame(2, host.room.code, MinUDPHandshake)) // a repeat of the guest's JOIN
+	if pk := th.take(elsewhere); len(pk) != 1 || pk[0][0] != TypeRoom {
+		t.Fatalf("retry got %v", pk)
+	}
+	host.send(2, 1, 1, []byte("x"))
+	if got := th.drain(); len(got) != 1 || got[0].to != guest.addr {
+		t.Fatalf("a handshake repeat moved the session: %v", got)
+	}
+}
+
+func TestNothingIsSentToAMemberBeforeItProvesItReceives(t *testing.T) {
+	th := newTestHub(t, nil)
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	// A JOIN whose source is forged: the ROOM reply goes to the victim, who
+	// never answers.
+	victim := ap("203.0.113.9", 53)
+	th.drain()
+	th.feed(victim, handshakeFrame(5, host.room.code, MinUDPHandshake))
+	if pk := th.take(victim); len(pk) != 1 || pk[0][0] != TypeRoom {
+		t.Fatalf("setup: %v", pk)
+	}
+	for i := 0; i < 50; i++ {
+		host.send(2, 1, 1, []byte("aimed-at-the-victim"))
+	}
+	if got := th.drain(); len(got) != 0 {
+		t.Fatalf("%d packets sent to an unvalidated address", len(got))
+	}
+	if th.h.snapshot().UnvalidatedDrops != 50 {
+		t.Fatalf("%+v", th.h.snapshot())
+	}
+	// It is dropped without a notice (which would be one more packet at the victim).
+	th.clock.Advance(th.h.cfg.UnvalidatedTimeout + time.Second)
+	host.keepalive() // keep the host itself alive across the sweep
+	th.drain()
+	th.h.Sweep()
+	for _, p := range th.drain() {
+		if p.to == victim {
+			t.Fatalf("a packet was sent to the unvalidated address on expiry")
+		}
+	}
+	if th.h.snapshot().Sessions != 1 {
+		t.Fatalf("%+v", th.h.snapshot())
 	}
 }
 
@@ -1021,4 +1272,137 @@ func FuzzHandleUDP(f *testing.F) {
 			}
 		}
 	})
+}
+
+// ------------------------------------------------- per-address capacity
+
+func TestIPKeyGroupsIPv6By64(t *testing.T) {
+	same := func(a, b string) bool {
+		return ipKey(netip.MustParseAddr(a)) == ipKey(netip.MustParseAddr(b))
+	}
+	if !same("2001:db8:1:2::1", "2001:db8:1:2:ffff:ffff:ffff:ffff") {
+		t.Error("two hosts of one /64 must share a key")
+	}
+	if same("2001:db8:1:2::1", "2001:db8:1:3::1") {
+		t.Error("different /64s must not share a key")
+	}
+	if !same("::ffff:192.0.2.7", "192.0.2.7") {
+		t.Error("an IPv4-mapped address is the IPv4 address")
+	}
+	if same("192.0.2.7", "192.0.2.8") {
+		t.Error("IPv4 addresses are keyed whole")
+	}
+}
+
+func TestHandshakeBudgetIsPerIPv6Prefix(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.HandshakePerSec, c.HandshakeBurst = 1, 3 })
+	// Five hosts of one /64 share the budget of three...
+	for i := 1; i <= 5; i++ {
+		th.feed(netip.MustParseAddrPort(fmt.Sprintf("[2001:db8:1:2::%x]:1000", i)), handshakeFrame(uint64(i), "", MinUDPHandshake))
+	}
+	if th.h.snapshot().Rooms != 3 {
+		t.Fatalf("%d rooms from one /64 in a burst, want 3 (rotating the host part must not help)", th.h.snapshot().Rooms)
+	}
+	// ...another /64 has its own.
+	th.feed(netip.MustParseAddrPort("[2001:db8:1:3::1]:1000"), handshakeFrame(99, "", MinUDPHandshake))
+	if th.h.snapshot().Rooms != 4 {
+		t.Fatal("a different /64 was limited")
+	}
+}
+
+func TestPerAddressSessionCap(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.MaxSessionsPerIP = 3; c.MaxMembers = 8 })
+	host := th.mustCreate(ap("192.0.2.1", 1), 1)
+	th.mustJoin(ap("192.0.2.1", 2), 2, host.room.code)
+	g3 := th.mustJoin(ap("192.0.2.1", 3), 3, host.room.code)
+	th.drain()
+	th.feed(ap("192.0.2.1", 4), handshakeFrame(4, host.room.code, MinUDPHandshake))
+	if pk := th.take(ap("192.0.2.1", 4)); len(pk) != 1 || errReason(t, pk[0]) != ErrLimit {
+		t.Fatalf("a fourth session from one address: %v", pk)
+	}
+	if th.h.snapshot().Sessions != 3 {
+		t.Fatalf("%+v", th.h.snapshot())
+	}
+	// Other addresses are unaffected; leaving frees capacity.
+	th.mustJoin(ap("192.0.2.2", 1), 5, host.room.code)
+	g3.leave()
+	th.mustJoin(ap("192.0.2.1", 6), 6, host.room.code)
+	// The accounting returns to zero, no entry is left behind.
+	th2 := newTestHub(t, func(c *Config) { c.MaxSessionsPerIP = 1 })
+	c := th2.mustCreate(ap("192.0.2.9", 1), 1)
+	c.leave()
+	if len(th2.h.perIP) != 0 {
+		t.Fatalf("per-address counters leaked: %v", th2.h.perIP)
+	}
+	th2.feed(ap("192.0.2.9", 1), handshakeFrame(7, "ZZZZZZ", MinUDPHandshake)) // refused join
+	if len(th2.h.perIP) != 0 {
+		t.Fatalf("a refused request left a counter: %v", th2.h.perIP)
+	}
+}
+
+func TestPerAddressRoomCap(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.MaxRoomsPerIP = 2 })
+	a := th.mustCreate(ap("192.0.2.1", 1), 1)
+	th.mustCreate(ap("192.0.2.1", 2), 2)
+	th.drain()
+	th.feed(ap("192.0.2.1", 3), handshakeFrame(3, "", MinUDPHandshake))
+	if pk := th.take(ap("192.0.2.1", 3)); len(pk) != 1 || errReason(t, pk[0]) != ErrLimit {
+		t.Fatalf("a third room from one address: %v", pk)
+	}
+	// Joining is not creating.
+	th.mustJoin(ap("192.0.2.1", 4), 4, a.room.code)
+	// The creator leaving does not release the room while others keep it alive
+	// (that was the way to hold rooms open)...
+	a.leave()
+	th.drain()
+	th.feed(ap("192.0.2.1", 5), handshakeFrame(5, "", MinUDPHandshake))
+	if pk := th.take(ap("192.0.2.1", 5)); len(pk) != 1 || errReason(t, pk[0]) != ErrLimit {
+		t.Fatalf("room cap released while the room lived on: %v", pk)
+	}
+	// ...but when it dies, it does.
+	th.clock.Advance(time.Hour)
+	th.h.Sweep()
+	th.mustCreate(ap("192.0.2.1", 6), 6)
+}
+
+func TestPanicsAreRecoveredAndCounted(t *testing.T) {
+	th := newTestHub(t, nil)
+	func() {
+		defer th.h.recoverPanic("test")
+		panic("boom")
+	}()
+	if th.h.snapshot().Panics != 1 {
+		t.Fatal("panic not counted")
+	}
+}
+
+func TestConfigRejectsKeepaliveThatWouldTimeOutHealthyClients(t *testing.T) {
+	if _, err := New(Config{KeepaliveInterval: 10 * time.Second, SessionTimeout: 15 * time.Second}); err == nil {
+		t.Fatal("a keepalive interval above a third of the session timeout was accepted")
+	}
+	if _, err := New(Config{KeepaliveInterval: 5 * time.Second, SessionTimeout: 15 * time.Second}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestForwardedForUsesTheEntryOurProxyAdded(t *testing.T) {
+	srv, err := New(Config{TrustForwardedFor: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("GET", "/vnet", nil)
+	r.RemoteAddr = "127.0.0.1:5555"
+	r.Header.Set("X-Forwarded-For", "6.6.6.6, 198.51.100.4")
+	if got := srv.clientIP(r); got != netip.MustParseAddr("198.51.100.4") {
+		t.Fatalf("client IP %v: the leftmost entry is written by the client", got)
+	}
+	r.Header.Set("X-Forwarded-For", "garbage")
+	if got := srv.clientIP(r); got != netip.MustParseAddr("127.0.0.1") {
+		t.Fatalf("unparsable header: %v", got)
+	}
+	srv2, _ := New(Config{})
+	r.Header.Set("X-Forwarded-For", "6.6.6.6")
+	if got := srv2.clientIP(r); got != netip.MustParseAddr("127.0.0.1") {
+		t.Fatalf("header trusted without the flag: %v", got)
+	}
 }
