@@ -36,7 +36,7 @@ int TpRecv(void *p, uint8_t *buf, size_t cap) {
 }
 void TpDestroy(void *p) { static_cast<ScriptTp *>(p)->destroyed = true; }
 
-const relay_transport_ops kOps = {"relay-ws", 0, TpState, TpSend, TpRecv, TpDestroy};
+const relay_transport_ops kOps = {"relay-ws", 0, TpState, TpSend, TpRecv, TpDestroy, nullptr};
 
 class RelayWsStyle : public VnetTest {
 protected:

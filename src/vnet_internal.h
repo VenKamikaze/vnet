@@ -101,16 +101,48 @@ typedef struct relay_transport_ops {
     int (*send)(void *tp, const uint8_t *frame, size_t len); // 0, or a VNET_E* (EAGAIN = dropped)
     int (*recv)(void *tp, uint8_t *buf, size_t cap);         // frame length or VNET_EAGAIN
     void (*destroy)(void *tp);
+    // Optional. The largest DATA frame (type byte included) the transport
+    // promises to carry, once it is open. If that is less than
+    // RELAY_WT_DATA_MAX the core checks what really fits before it reports
+    // READY (a datagram-size probe). NULL: no such limit.
+    size_t (*max_data_frame)(void *tp);
 } relay_transport_ops;
+
+// A way to open the transport to fall back to. `arg` is the copy of the bytes
+// given to vnet__relay_init_fallback() (it outlives vnet_create()'s strings).
+// Returns 0 and fills ops/tp, or a VNET_E* code.
+typedef int (*relay_fallback_fn)(vnet *v, const void *arg, const relay_transport_ops **ops, void **tp);
 
 // Takes ownership of `tp` (destroyed on failure too). Sets v->be / v->bs.
 int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp);
+// The same, with a fallback: if the transport fails before the room is
+// entered (or does not come up within primary_timeout_ms, or turns out not to
+// carry a full-size datagram), `fb` opens another and the handshake starts over
+// on it. Used by VNET_BACKEND_RELAY_AUTO.
+int vnet__relay_init_fallback(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp,
+                              unsigned primary_timeout_ms, relay_fallback_fn fb, const void *fb_arg,
+                              size_t fb_arg_len);
 int vnet__relay_udp_init(vnet *v, const vnet_config *cfg);
 int vnet__relay_ws_init(vnet *v, const vnet_config *cfg);
+int vnet__relay_wt_init(vnet *v, const vnet_config *cfg);
+int vnet__relay_auto_init(vnet *v, const vnet_config *cfg);
+// Transport constructors (the WebSocket and WebTransport ones also exist in
+// native builds, where they return VNET_ENOTSUP).
+int vnet__relay_wt_check_args(const char *url, const char *cert_sha256, uint8_t hash[32], int *hashlen);
+int vnet__wt_parse_hash(const char *hex, uint8_t out[32]);
+// "wss://host[:port]/path" -> "https://host[:port]/path" in out[cap]; -1 if
+// ws has no WebTransport form.
+int vnet__relay_auto_derive_wt_url(const char *ws, char *out, size_t cap);
+int vnet__relay_ws_make(vnet *v, const char *url, const relay_transport_ops **ops, void **tp);
+int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const relay_transport_ops **ops, void **tp);
 // Like vnet_create() with a relay backend over a caller-supplied transport.
 // For tests (scripted relays, WebSocket-style framing on a native build).
 vnet *vnet__create_with_relay_transport(const vnet_config *cfg, const relay_transport_ops *ops,
                                         void *tp, int *err);
+// The same with a fallback (see vnet__relay_init_fallback).
+vnet *vnet__create_with_relay_fallback(const vnet_config *cfg, const relay_transport_ops *ops, void *tp,
+                                       unsigned primary_timeout_ms, relay_fallback_fn fb, const void *fb_arg,
+                                       size_t fb_arg_len, int *err);
 
 // Backends. Each fills v->be / v->bs (and v->clock if cfg->clock is NULL
 // and the backend has its own default). Return 0 or a VNET_E* code.

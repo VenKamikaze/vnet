@@ -55,4 +55,18 @@
 // The largest frame in either direction.
 #define RELAY_MAX_FRAME (RELAY_DATA_HDR_UDP + VNET_MAX_DATAGRAM)
 
+// WebTransport: control frames travel on one stream, each preceded by a 2-byte
+// big-endian length of at most RELAY_WT_CTL_MAX; DATA is a datagram in the
+// WebSocket layout (no token). The datagram has to hold a whole DATA frame.
+#define RELAY_WT_CTL_MAX 64
+#define RELAY_WT_DATA_MAX (RELAY_DATA_HDR_WS + VNET_MAX_DATAGRAM)
+
+// After entering a room over a transport that cannot promise to carry
+// RELAY_WT_DATA_MAX bytes (a browser reports a conservative maxDatagramSize),
+// the client checks what really fits by sending itself a full-size datagram
+// (port 0, which no socket can have) and waiting for it to come back.
+#define RELAY_PROBE_PORT 0
+#define RELAY_PROBE_RETRY_MS 250u
+#define RELAY_PROBE_TIMEOUT_MS 1500u
+
 #endif

@@ -10,7 +10,15 @@
  *   relay_peer --relay ws://localhost:8080/vnet ...   browser builds: a WebSocket URL
  *
  * Options: --count N (datagrams each way, default 100), --port P (default
- * 5000), --timeout MS (default 30000).
+ * 5000), --timeout MS (default 30000), --maxlen N (largest payload sent,
+ * default 899, at most 1093), --verbose (print the library's log as "LOG ..."
+ * lines), and for browser builds:
+ *   --backend ws|wt|auto   ws (default for ws:// and wss:// URLs), wt (WebTransport
+ *                          only; --relay is an https:// URL), auto (WebTransport,
+ *                          then WebSocket; --relay is the WebSocket URL)
+ *   --relay-wt URL         auto: the WebTransport URL (default: derived from a wss:// --relay)
+ *   --cert-hash HEX        SHA-256 of the relay's -dev-cert certificate
+ *   --wt-timeout MS        auto: how long WebTransport gets before the fallback (default 3000)
  *
  * After entering the room it prints "ROOM <code> <virtual address>". The guest
  * sends HELLO to "room-host:5000" until the host answers WELCOME; then each
@@ -74,7 +82,14 @@ static void wr32(uint8_t *p, uint32_t x) {
 }
 
 /* Message i of a sender: length and bytes are a function of (i, sender role). */
-static size_t payload_len(int i) { return (size_t)((i * 37) % 900); }
+static size_t g_maxlen = 899; /* largest payload: message = 7 header bytes + this, so at most VNET_MAX_DATAGRAM */
+/* Every tenth message is as long as allowed, so that the largest datagram is always exercised. */
+static size_t payload_len(int i) { return i % 10 == 9 ? g_maxlen : (size_t)((i * 37) % ((int)g_maxlen + 1)); }
+static void log_line(void *user, int level, const char *msg) {
+    (void)user;
+    printf("LOG %d %s\n", level, msg);
+    fflush(stdout);
+}
 static uint8_t payload_byte(int i, size_t j, int from_host) {
     return (uint8_t)((unsigned)i * 31u + (unsigned)j + (from_host ? 0x40u : 0x80u));
 }
@@ -106,7 +121,7 @@ static void send_msg(peer *p, const void *buf, size_t len) {
 }
 
 static void send_data(peer *p, int i) {
-    uint8_t buf[1 + 4 + 2 + 900];
+    uint8_t buf[VNET_MAX_DATAGRAM];
     size_t n = payload_len(i);
     buf[0] = MSG_DATA;
     wr32(buf + 1, (uint32_t)i);
@@ -262,7 +277,8 @@ static void sleep_ms(void) {
 
 int main(int argc, char **argv) {
     static peer p; /* zero-initialised */
-    const char *relay = NULL, *room = NULL;
+    const char *relay = NULL, *room = NULL, *backend = NULL, *relay_wt = NULL, *cert_hash = NULL;
+    int wt_timeout = 0, verbose = 0;
     p.count = 100;
     p.port = 5000;
     p.timeout_ms = 30000;
@@ -274,11 +290,23 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--count") && val) p.count = atoi(argv[++i]);
         else if (!strcmp(a, "--port") && val) p.port = (unsigned)atoi(argv[++i]);
         else if (!strcmp(a, "--timeout") && val) p.timeout_ms = (uint64_t)atoll(argv[++i]);
+        else if (!strcmp(a, "--maxlen") && val) g_maxlen = (size_t)atoll(argv[++i]);
+        else if (!strcmp(a, "--backend") && val) backend = argv[++i];
+        else if (!strcmp(a, "--relay-wt") && val) relay_wt = argv[++i];
+        else if (!strcmp(a, "--cert-hash") && val) cert_hash = argv[++i];
+        else if (!strcmp(a, "--wt-timeout") && val) wt_timeout = atoi(argv[++i]);
+        else if (!strcmp(a, "--verbose")) verbose = 1;
         else {
-            fprintf(stderr, "usage: %s --relay HOST:PORT|ws://HOST:PORT/vnet [--room CODE] [--count N] [--port P] [--timeout MS]\n",
+            fprintf(stderr,
+                    "usage: %s --relay HOST:PORT|ws://HOST:PORT/vnet [--room CODE] [--count N] [--port P] [--timeout MS]\n"
+                    "          [--maxlen N] [--verbose] [--backend ws|wt|auto] [--relay-wt URL] [--cert-hash HEX] [--wt-timeout MS]\n",
                     argv[0]);
             return 2;
         }
+    }
+    if (g_maxlen > VNET_MAX_DATAGRAM - 7) {
+        fprintf(stderr, "--maxlen is at most %d\n", VNET_MAX_DATAGRAM - 7);
+        return 2;
     }
     if (!relay || p.count < 1 || p.count > 100000 || p.port == 0 || p.port > 65535) {
         fprintf(stderr, "bad arguments\n");
@@ -291,7 +319,20 @@ int main(int argc, char **argv) {
     vnet_config_init(&cfg);
     cfg.backend = (!strncmp(relay, "ws://", 5) || !strncmp(relay, "wss://", 6)) ? VNET_BACKEND_RELAY_WS
                                                                                    : VNET_BACKEND_RELAY_UDP;
+    if (backend) {
+        if (!strcmp(backend, "ws")) cfg.backend = VNET_BACKEND_RELAY_WS;
+        else if (!strcmp(backend, "wt")) cfg.backend = VNET_BACKEND_RELAY_WT;
+        else if (!strcmp(backend, "auto")) cfg.backend = VNET_BACKEND_RELAY_AUTO;
+        else {
+            fprintf(stderr, "unknown --backend\n");
+            return 2;
+        }
+    }
     cfg.relay = relay;
+    cfg.relay_wt = relay_wt;
+    cfg.relay_cert_sha256 = cert_hash;
+    cfg.wt_timeout_ms = wt_timeout;
+    if (verbose) cfg.log = log_line;
     cfg.room = room;
     cfg.rx_queue_len = 512;
     int err = 0;

@@ -13,6 +13,14 @@ int vnet__relay_ws_init(vnet *v, const vnet_config *cfg) {
     (void)cfg;
     return VNET_ENOTSUP;  // WebSocket transport exists in browser builds only
 }
+
+int vnet__relay_ws_make(vnet *v, const char *url, const relay_transport_ops **ops, void **tp) {
+    (void)v;
+    (void)url;
+    (void)ops;
+    (void)tp;
+    return VNET_ENOTSUP;
+}
 #else
 
 #include <emscripten/websocket.h>
@@ -166,11 +174,12 @@ static void tp_destroy(void *p) {
     free(t);
 }
 
-static const relay_transport_ops ws_ops = {"relay-ws", 0, tp_state, tp_send, tp_recv, tp_destroy};
+static const relay_transport_ops ws_ops = {"relay-ws", 0, tp_state, tp_send, tp_recv, tp_destroy, NULL};
 
-int vnet__relay_ws_init(vnet *v, const vnet_config *cfg) {
-    if (!cfg->relay || (strncmp(cfg->relay, "ws://", 5) != 0 && strncmp(cfg->relay, "wss://", 6) != 0))
-        return VNET_EINVAL;
+// Open a WebSocket to `url` (ws:// or wss://). On success *ops and *tp are
+// set; the caller owns the transport.
+int vnet__relay_ws_make(vnet *v, const char *url, const relay_transport_ops **ops, void **tp) {
+    if (!url || (strncmp(url, "ws://", 5) != 0 && strncmp(url, "wss://", 6) != 0)) return VNET_EINVAL;
     if (!emscripten_websocket_is_supported()) return VNET_ENOTSUP;
     ws_tp *t = calloc(1, sizeof *t);
     if (!t) return VNET_ENOMEM;
@@ -181,18 +190,28 @@ int vnet__relay_ws_init(vnet *v, const vnet_config *cfg) {
     }
     t->state = RELAY_TP_CONNECTING;
     t->backoff_ms = CONNECT_BACKOFF_FIRST_MS;
-    size_t urllen = strlen(cfg->relay);
+    size_t urllen = strlen(url);
     if (urllen >= sizeof t->url) {
         tp_destroy(t);
         return VNET_EINVAL;
     }
-    memcpy(t->url, cfg->relay, urllen + 1);
+    memcpy(t->url, url, urllen + 1);
     if (open_socket(t) != 0) {
-        vnet__logf(v, VNET_LOG_ERROR, "cannot create WebSocket for \"%s\"", cfg->relay);
+        vnet__logf(v, VNET_LOG_ERROR, "cannot create WebSocket for \"%s\"", url);
         tp_destroy(t);
         return VNET_ECONNREFUSED;
     }
-    return vnet__relay_init(v, cfg, &ws_ops, t);
+    *ops = &ws_ops;
+    *tp = t;
+    return VNET_OK;
+}
+
+int vnet__relay_ws_init(vnet *v, const vnet_config *cfg) {
+    const relay_transport_ops *ops = NULL;
+    void *tp = NULL;
+    int rc = vnet__relay_ws_make(v, cfg->relay, &ops, &tp);
+    if (rc != VNET_OK) return rc;
+    return vnet__relay_init(v, cfg, ops, tp);
 }
 
 #endif /* __EMSCRIPTEN__ */

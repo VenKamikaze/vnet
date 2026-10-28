@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Browser integration test: builds the Go relay, the native relay_peer and the
-# Emscripten relay_peer (wasm), then runs tests/browser/relay_browser.test.js,
-# which drives Chromium with Playwright against a relay started on loopback.
+# Browser integration tests: builds the Go relay, the native relay_peer and the
+# Emscripten relay_peer (wasm), then runs tests/browser/relay_browser.test.js
+# (WebSocket) and tests/browser/wt_browser.test.js (WebTransport, with a
+# development certificate and the fallback to WebSocket), which drive Chromium
+# with Playwright against relays started on loopback.
 #
 # Prerequisites: go, cmake, node with `playwright` resolvable by require()
 # (NODE_PATH), a Chromium that Playwright can launch, and an activated emsdk
@@ -34,6 +36,10 @@ emcmake cmake -S "$root" -B "$out/wasm" -DCMAKE_BUILD_TYPE=Release \
     -DVNET_BUILD_TESTS=OFF -DVNET_BUILD_RELAY=OFF -DVNET_INSTALL=OFF -DVNET_WARNINGS_AS_ERRORS=ON >/dev/null
 cmake --build "$out/wasm" --target relay_peer -j 4
 
-echo "== Chromium"
+echo "== Chromium: WebSocket"
 node "$root/tests/browser/relay_browser.test.js" \
+    --relay-bin "$out/vnet-relay" --peer-bin "$out/native/relay_peer" --web-dir "$out/wasm" "${@:2}"
+
+echo "== Chromium: WebTransport and the fallback"
+node "$root/tests/browser/wt_browser.test.js" \
     --relay-bin "$out/vnet-relay" --peer-bin "$out/native/relay_peer" --web-dir "$out/wasm" "${@:2}"
