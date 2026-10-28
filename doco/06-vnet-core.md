@@ -5,7 +5,7 @@
 - **Depends on:**
   - nothing in this repo
   - none of BitRiot's briefs either: this runs in parallel with BitRiot's determinism track (01–05b)
-- **Status:** todo
+- **Status:** done
 
 ## Goal
 
@@ -33,7 +33,7 @@ Refine it, but keep the shape: C11, a single public header `vnet.h`, and `extern
 ```c
 typedef struct vnet vnet;                 // one network context ("host"); no global state
 typedef struct vnet_addr { uint8_t family; uint8_t bytes[16]; uint16_t port; } vnet_addr; // or opaque + accessors
-vnet *vnet_create(const vnet_config *cfg);   // backend: VNET_BACKEND_UDP | _LOOPBACK (later _RELAY_*); NULL + error on failure
+vnet *vnet_create(const vnet_config *cfg, int *err);   // backend: VNET_BACKEND_UDP | _LOOPBACK (later _RELAY_*); NULL + *err (VNET_E* code) on failure
 void  vnet_destroy(vnet *v);
 int   vnet_open(vnet *v, uint16_t port);     // socket handle within v; port 0 = ephemeral
 void  vnet_close(vnet *v, int s);
@@ -106,4 +106,47 @@ A **context handle** is what lets several loopback "hosts" exist in one process,
 
 ## Outcome
 
-*(fill in when done)*
+Landed on `vnet/06-core`. Everything in scope is implemented and tested; nothing was cut.
+
+**What is there**
+
+- `include/vnet.h`: the single public header, documented per function, error code, threading/blocking guarantee and payload limit. Valid C11 and C++ (a test compiles it as C).
+- `src/`: `vnet.c` (core, validation, stats, logging), `addr.c` (own numeric IPv4/IPv6 parser and RFC 5952 formatter), `impair.c`, `loopback.c`, `udp.c` (POSIX and Winsock behind `#ifdef _WIN32`).
+- CMake: static target `vnet` with alias `vnet::vnet`; works through `add_subdirectory`, `FetchContent` (`GIT_REPOSITORY`) and `find_package(vnet)` after `cmake --install` (exported targets, version file, `SameMajorVersion`). Tests and install rules are on only when vnet is the top-level project.
+- `.github/workflows/ci.yml`: ubuntu-latest (gcc, clang, gcc with ASan+UBSan, `-Werror`), macOS (clang), an install-and-`find_package` check, and a MinGW cross build whose smoke test runs under Wine.
+- `README.md`: how to consume it, a two-socket example, `VNET_IMPAIR`, building and testing.
+
+**API deviations from the sketch**
+
+- `vnet_create(cfg, int *err)` takes an optional error out-parameter, because the sketch said "NULL + error" without saying where the error goes.
+- `vnet_open` binds the wildcard address (UDP) or the host's virtual address (loopback). UDP sockets are dual-stack IPv6 when the OS allows it, otherwise IPv4 (`vnet_config.family` forces one). IPv4-mapped source and destination addresses are converted so a peer always compares equal to what `vnet_resolve()` returns.
+- `vnet_resolve` is numeric only (plus the literal `localhost`), so it can never block on DNS.
+- `vnet_sendto` returns the byte count on success; `vnet_recvfrom` returns the datagram length. Zero-length datagrams are allowed.
+- A too-small receive buffer returns `VNET_EMSGSIZE` and consumes the datagram (never silent truncation). UDP datagrams over `VNET_MAX_DATAGRAM` from foreign senders are dropped and counted (`rx_oversize`).
+- Additions: `vnet_config_init`, `vnet_get_stats`/`vnet_stats`, `vnet_impair_parse`, and the loopback network API (`vnet_loopback_network_create/destroy/time/advance/step`).
+- Impairment (`vnet_impair`, applied to what a context sends): `latency_ms`, `jitter_ms`, `loss_pct`, `duplicate_pct`, `reorder_pct`, `reorder_delay_ms` (0 = 50 ms) and `seed`. Delayed datagrams are released by `vnet_poll()` and on every `vnet_sendto()`. The PRNG is splitmix64 with a fixed draw order, so changing one percentage does not shift the draws of the others.
+- `VNET_IMPAIR` **replaces** the configured impairment when set (so a developer's shell can degrade any build) unless `vnet_config.ignore_env` is 1; a malformed value makes `vnet_create` fail with `VNET_EINVAL` instead of testing nothing.
+- Time is milliseconds everywhere, through an optional `vnet_clock_fn`. The loopback backend defaults to a virtual clock owned by the loopback network, so impairment tests are exact and never sleep. `vnet_loopback_network_step(net, ms)` advances the clock, releases every context's due datagrams, then polls every context.
+- Loopback delivery model: a send stages the datagram at the destination; it is receivable only after the **destination** calls `vnet_poll()`. Delivery order is global send order. Sending to `127.0.0.1` reaches the sender's own host. Unknown destinations vanish (counted as `unroutable`), as with UDP.
+- Limits: `max_sockets` (default 16), `rx_queue_len` (loopback, default 128 datagrams per socket), `impair_queue_len` (default 256 delayed datagrams). All memory is allocated in `vnet_create`/`vnet_open`; a test counts heap calls over 20000 send/recv/poll rounds on both backends and sees none.
+
+**Tests** (GoogleTest, 102 tests, plus the plain-C smoke test: 103 ctest entries)
+
+- Addresses (including a 5000-address random round trip), loopback, UDP over 127.0.0.1, impairment (rates within 5 sigma over 10-20k packets, exact latency, jitter bounds, bit-identical traces for equal seeds), `VNET_IMPAIR` handling, lifecycle (500 loopback and 300 UDP create/destroy cycles, fd-leak check, same port rebound every time), steady-state allocation.
+- Mutation check: 33 deliberate breakages (oversize check removed or turned into truncation, EAGAIN, delivery-on-poll, deterministic seeding, loss/latency/duplication/reorder/jitter, env handling, address parsing, socket leaks and so on) were each applied to a scratch copy. 31 make at least one test fail (a blocking-socket mutation is caught by the 60 s per-test timeout), raising `VNET_MAX_DATAGRAM` fails the build through a `_Static_assert`, and one pure memory leak (close not freeing the queue) is caught by LeakSanitizer in the ASan run, not by the plain build. Two gaps found along the way got new tests (bidirectional `step()`; a pattern fix in the mutation list).
+- Clean under ASan+UBSan and under clang with `-Werror`; 40 consecutive runs under CPU load had no failures. UDP tests poll with a bounded real-time deadline; impairment on UDP uses an injected clock.
+- Environment-dependent: `UdpFamily.Ipv6LoopbackRoundTrip` needs a `::1` interface and reports a skip where there is none. The authoring container has no IPv6 at all, so **IPv6 UDP send/receive is untested here**; IPv6 address parsing and formatting are fully tested, and the dual-stack-to-IPv4 fallback path ran for real. The allocation test uses GNU ld `--wrap`, so it is Linux only.
+
+**MinGW**
+
+`mingw-w64` from apt (GCC 13, x86_64 and i686) builds `libvnet.a` and the plain-C smoke test with `-Wall -Wextra -Wpedantic -Werror`. The x86_64 smoke test **runs under Wine 9.0**: UDP over 127.0.0.1, EAGAIN, oversize rejection, port-in-use, loopback latency and address round trip all pass on the real Winsock code path. i686 builds and links but was not run (64-bit Wine only). So `BITRIOT_NETPLAY` can default to ON on MinGW (this was verified for a cross build, not a native MSYS2 build, and the GoogleTest suite is not run on Windows). Wine here had no IPv6, so it fell back to IPv4 sockets.
+
+**Consumer check** (throwaway C++ project outside the repo): linking `vnet::vnet` and including `<vnet.h>` worked via `add_subdirectory`, via `FetchContent` with `GIT_REPOSITORY file://...` and `GIT_TAG vnet/06-core`, and via `find_package(vnet 0.1)` against a `cmake --install`ed prefix; a request for version 1.0 is correctly refused. `tests/consumer` repeats the install check in CI.
+
+**Not verified / follow-ups**
+
+- The macOS CI job and the GitHub Actions workflow itself could not be run here; the Linux job steps (system GTest, FetchContent GTest from git, ASan config, install and consume) and the MinGW/Wine steps were reproduced locally.
+- IPv6 UDP is untested in this container (see above).
+- UDP sockets always bind the wildcard address; there is no bind-to-interface, broadcast or multicast. Add only if a consumer needs it.
+- A loopback context should be destroyed before its network; if the network goes first the context degrades safely (sends become `unroutable`) rather than crashing.
+- For brief 07: call `vnet_poll()` every frame on UDP when `VNET_IMPAIR` is used, give each process a distinct `seed=` so their loss patterns differ, and note `vnet_resolve` takes `host:port` only (no DNS).
