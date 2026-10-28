@@ -4,6 +4,8 @@
 // keepalives, framing and failure handling, without sleeping.
 #include "relay_test_util.h"
 
+#include <set>
+
 extern unsigned long g_alloc_calls;
 
 class RelayClient : public VnetTest {
@@ -42,9 +44,20 @@ protected:
         }
     }
 
-    void Enter(int octet = 1, const char *code = "ABCDEF", int max_members = 8, int keepalive_s = 5) {
+    // Enter the room. A client says "I receive here" at once (the relay sends
+    // a UDP member nothing before that); like a relay, answer it, which stops
+    // the client's fast repeats. Pass confirm=false to look at that phase.
+    void Enter(int octet = 1, const char *code = "ABCDEF", int max_members = 8, int keepalive_s = 5,
+               bool confirm = true) {
         relay.Send(RoomFrame(req, octet, code, max_members, keepalive_s));
         ASSERT_TRUE(PollUntilState(VNET_STATUS_READY));
+        Bytes ka;
+        ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka)) << "no immediate KEEPALIVE after ROOM";
+        ASSERT_EQ(ka.size(), (size_t)(1 + RELAY_TOKEN_LEN));
+        if (confirm) {
+            relay.Send(Bytes{RELAY_T_KEEPALIVE});
+            vnet_poll(v);
+        }
     }
 
     // Poll until the client has received `n` more datagrams on socket s.
@@ -503,6 +516,174 @@ TEST_F(RelayClient, ConfiguredKeepaliveWins) {
     clk.now += 1;
     vnet_poll(v);
     EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+}
+
+TEST_F(RelayClient, SaysItIsThereAtOnceAndRepeatsUntilTheRelayAnswers) {
+    // The relay sends a UDP member nothing until a frame bearing its token has
+    // arrived from its address. The first KEEPALIVE comes with the ROOM, and
+    // it repeats every 500 ms (not every 5 s) until the relay has answered.
+    Start();
+    Enter(1, "ABCDEF", 8, 5, /*confirm=*/false);  // consumed the first one
+    Bytes b;
+    clk.now += 499;
+    vnet_poll(v);
+    EXPECT_FALSE(relay.TryRecv(&b));
+    clk.now += 1;
+    vnet_poll(v);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+    clk.now += 500;
+    vnet_poll(v);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+    // The answer ends the fast repeats: the next one is a regular interval away.
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    vnet_poll(v);
+    clk.now += 4999;
+    vnet_poll(v);
+    EXPECT_FALSE(relay.TryRecv(&b));
+    clk.now += 1;
+    vnet_poll(v);
+    EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+}
+
+TEST_F(RelayClient, DataFromTheRelayAlsoMeansThePathIsConfirmed) {
+    Start();
+    Enter(1, "ABCDEF", 8, 5, /*confirm=*/false);
+    int s = vnet_open(v, 4000);
+    relay.Send(DataToClient(2, 4000, 1, Bytes{1}));  // the relay only sends data to a validated member
+    Bytes b;
+    ASSERT_TRUE(RecvOne(s, &b));
+    clk.now += 2000;
+    vnet_poll(v);
+    EXPECT_FALSE(relay.TryRecv(&b)) << "still repeating after the relay delivered data";
+}
+
+TEST_F(RelayClient, AnswersAPathChallengeFromTheSameSocketWithTokenAndCookie) {
+    // The relay saw a frame of ours from a new address (a NAT rebinding) and
+    // wants proof that we receive there.
+    Start();
+    Enter(1);
+    Bytes challenge{RELAY_T_PATH_CHALLENGE, 1, 2, 3, 4, 5, 6, 7, 8};
+    relay.Send(challenge);
+    vnet_poll(v);
+    Bytes r;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_PATH_RESPONSE, &r));
+    ASSERT_EQ(r.size(), (size_t)RELAY_RESPONSE_LEN);
+    for (int i = 0; i < RELAY_TOKEN_LEN; i++) EXPECT_EQ(r[1 + i], 0xA0 + i) << "token byte " << i;
+    EXPECT_EQ(Bytes(r.begin() + 1 + RELAY_TOKEN_LEN, r.end()), Bytes({1, 2, 3, 4, 5, 6, 7, 8}));
+    // It leaves from the socket the challenge arrived on (so, from the new address).
+    sockaddr_in a = relay.client();
+    EXPECT_NE(a.sin_port, 0);
+}
+
+TEST_F(RelayClient, DoesNotAnswerChallengesItShouldNotSee) {
+    Start();
+    // In the handshake phase nobody has a session to prove.
+    relay.Send(Bytes{RELAY_T_PATH_CHALLENGE, 9, 9, 9, 9, 9, 9, 9, 9});
+    vnet_poll(v);
+    Bytes b;
+    EXPECT_FALSE(relay.TryRecv(&b));
+    Enter(1);
+    // Not from the relay's address, malformed, or an unknown size: no answer.
+    relay.SpoofFrom(Bytes{RELAY_T_PATH_CHALLENGE, 1, 1, 1, 1, 1, 1, 1, 1});
+    relay.Send(Bytes{RELAY_T_PATH_CHALLENGE, 2, 2, 2, 2, 2, 2, 2});
+    relay.Send(Bytes{RELAY_T_PATH_CHALLENGE, 3, 3, 3, 3, 3, 3, 3, 3, 3});
+    relay.Send(Bytes{RELAY_T_PATH_CHALLENGE});
+    // A real one afterwards: the first answer we see must be to this one.
+    relay.Send(Bytes{RELAY_T_PATH_CHALLENGE, 7, 7, 7, 7, 7, 7, 7, 7});
+    vnet_poll(v);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_PATH_RESPONSE, &b));
+    EXPECT_EQ(Bytes(b.begin() + 1 + RELAY_TOKEN_LEN, b.end()), Bytes(8, 7));
+    EXPECT_FALSE(relay.TryRecv(&b));
+}
+
+TEST_F(RelayClient, KeepaliveIntervalIsValidated) {
+    for (int bad : {-1, 1, 99, 5001, 60000}) {
+        int err = 0;
+        vnet *c = Create(nullptr, bad, 0, &err);
+        EXPECT_EQ(c, nullptr) << bad;
+        EXPECT_EQ(err, VNET_EINVAL) << bad;
+    }
+    for (int ok : {100, 700, 5000}) {
+        vnet *c = Create(nullptr, ok);
+        EXPECT_NE(c, nullptr) << ok;
+        vnet_destroy(c);
+    }
+}
+
+TEST_F(RelayClient, ARelaySuggestionLongerThanItsOwnTimeoutIsClamped) {
+    Start();
+    Enter(1, "ABCDEF", 8, /*keepalive_s=*/60);
+    Bytes b;
+    clk.now += 4999;
+    vnet_poll(v);
+    EXPECT_FALSE(relay.TryRecv(&b));
+    clk.now += 1;
+    vnet_poll(v);
+    EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+}
+
+// The handshake nonce is a credential, so it must come from a secure source
+// and a missing source must be an error, not a weaker nonce.
+struct RandomHookGuard {
+    explicit RandomHookGuard(int (*f)(void *, size_t)) { vnet__random_hook = f; }
+    ~RandomHookGuard() { vnet__random_hook = nullptr; }
+};
+
+TEST_F(RelayClient, NoSecureRandomSourceMeansNoSession) {
+    RandomHookGuard g([](void *, size_t) { return -1; });
+    int err = 0;
+    vnet *c = Create(nullptr, 0, 0, &err);
+    EXPECT_EQ(c, nullptr);
+    EXPECT_EQ(err, VNET_EIO);
+    Bytes b;
+    EXPECT_FALSE(relay.TryRecv(&b)) << "a handshake was sent without a nonce";
+}
+
+#if defined(VNET_TEST_FAKE_ENTROPY)
+extern "C" int g_getentropy_errno;
+
+// The real OS source failing (not the test hook): no weaker nonce is invented.
+TEST_F(RelayClient, WhenTheOsRandomSourceFailsCreateFailsInsteadOfUsingAWeakNonce) {
+    g_getentropy_errno = EIO;
+    int err = 0;
+    vnet *c = Create(nullptr, 0, 0, &err);
+    g_getentropy_errno = 0;
+    EXPECT_EQ(c, nullptr);
+    EXPECT_EQ(err, VNET_EIO);
+    Bytes b;
+    EXPECT_FALSE(relay.TryRecv(&b));
+    uint8_t a[8] = {}, d[8] = {};
+    g_getentropy_errno = EIO;
+    EXPECT_EQ(vnet__random(a, sizeof a), -1);
+    g_getentropy_errno = 0;
+    // A kernel without getentropy() falls back to the CSPRNG device file, still strong.
+    g_getentropy_errno = ENOSYS;
+    EXPECT_EQ(vnet__random(a, sizeof a), 0);
+    EXPECT_EQ(vnet__random(d, sizeof d), 0);
+    g_getentropy_errno = 0;
+    EXPECT_NE(memcmp(a, d, sizeof a), 0);
+}
+#endif
+
+TEST_F(RelayClient, TheNonceComesFromTheRandomSource) {
+    RandomHookGuard g([](void *p, size_t n) {
+        for (size_t i = 0; i < n; i++) static_cast<uint8_t *>(p)[i] = (uint8_t)(0xC0 + i);
+        return 0;
+    });
+    Start();
+    EXPECT_EQ(Bytes(req.begin() + 2, req.begin() + 10), Bytes({0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7}));
+}
+
+TEST_F(RelayClient, NoncesDoNotRepeat) {
+    std::set<Bytes> seen;
+    for (int i = 0; i < 200; i++) {
+        vnet *c = Create();
+        ASSERT_NE(c, nullptr);
+        Bytes r;
+        ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &r));
+        EXPECT_TRUE(seen.insert(Bytes(r.begin() + 2, r.begin() + 10)).second) << "nonce repeated after " << i;
+        vnet_destroy(c);
+    }
 }
 
 TEST_F(RelayClient, SilentRelayEndsTheSessionAfterThreeIntervals) {

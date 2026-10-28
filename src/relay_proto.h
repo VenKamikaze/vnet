@@ -20,6 +20,8 @@
 #define RELAY_T_JOIN 0x02
 #define RELAY_T_LEAVE 0x03
 #define RELAY_T_KEEPALIVE 0x04
+#define RELAY_T_PATH_CHALLENGE 0x05  /* relay to client: prove you receive at this address */
+#define RELAY_T_PATH_RESPONSE 0x06   /* client to relay (UDP): type token cookie[8] */
 #define RELAY_T_DATA 0x10
 #define RELAY_T_ROOM 0x81
 #define RELAY_T_ERROR 0x82
@@ -35,6 +37,10 @@
 #define RELAY_E_NONCE_REUSED 9
 #define RELAY_E_TIMEOUT 10
 #define RELAY_E_ALREADY_IN_ROOM 11
+
+#define RELAY_COOKIE_LEN 8
+#define RELAY_CHALLENGE_LEN (1 + RELAY_COOKIE_LEN)
+#define RELAY_RESPONSE_LEN (1 + RELAY_TOKEN_LEN + RELAY_COOKIE_LEN)
 
 // ROOM: type ver nonce[8] vaddr[4] token[16] code[6] max_members keepalive_s
 #define RELAY_ROOM_LEN (1 + 1 + RELAY_NONCE_LEN + 4 + RELAY_TOKEN_LEN + RELAY_CODE_LEN + 1 + 1)

@@ -16,6 +16,9 @@
 #define HANDSHAKE_RETRY_FIRST_MS 250u
 #define HANDSHAKE_RETRY_MAX_MS 1000u
 #define MAX_FRAMES_PER_POLL 2048
+#define KEEPALIVE_UNCONFIRMED_MS 500u
+#define KEEPALIVE_MIN_MS 100
+#define KEEPALIVE_MAX_MS 5000  /* a third of the relay's default 15 s session timeout */
 
 typedef struct rc_pkt {
     size_t len;
@@ -57,6 +60,7 @@ typedef struct rc_state {
     unsigned hs_timeout_ms;
     unsigned keepalive_ms;
     uint64_t ka_next;
+    int ka_confirmed;      // the relay has answered since we entered the room
     uint64_t last_rx;
 
     rc_sock *socks;
@@ -180,6 +184,14 @@ static void queue_data(vnet *v, rc_state *st, const uint8_t *p, size_t n) {
     q->from.port = sport;
 }
 
+// The relay has answered since we entered the room: it knows we receive here.
+// Stop the fast repeats and go to the regular keepalive interval.
+static void confirm_path(rc_state *st, uint64_t now) {
+    if (st->ka_confirmed) return;
+    st->ka_confirmed = 1;
+    st->ka_next = now + st->keepalive_ms;
+}
+
 static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint64_t now) {
     if (n == 0) return;
     switch (p[0]) {
@@ -200,9 +212,14 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
             if (st->keepalive_ms == 0) {
                 unsigned s = p[14 + RELAY_TOKEN_LEN + RELAY_CODE_LEN + 1];
                 st->keepalive_ms = s ? s * 1000u : DEFAULT_KEEPALIVE_MS;
+                if (st->keepalive_ms > KEEPALIVE_MAX_MS) st->keepalive_ms = KEEPALIVE_MAX_MS;  // never let a relay's suggestion outlast its own timeout
             }
             st->phase = RC_READY;
-            st->ka_next = now + st->keepalive_ms;
+            // The relay sends nothing to a UDP member until a frame bearing
+            // its token has arrived from the address it joined from: say so
+            // at once, and repeat until the relay answers.
+            st->ka_next = now;
+            st->ka_confirmed = 0;
             vnet__logf(v, VNET_LOG_INFO, "entered room %s as 10.0.0.%u", st->code, st->octet);
             break;
         case RELAY_T_ERROR: {
@@ -219,11 +236,30 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
             break;
         }
         case RELAY_T_KEEPALIVE:
-            if (n == 1 && st->phase == RC_READY) st->last_rx = now;
+            if (n == 1 && st->phase == RC_READY) {
+                st->last_rx = now;
+                confirm_path(st, now);
+            }
+            break;
+        case RELAY_T_PATH_CHALLENGE:
+            // The relay saw a frame of ours from an address it does not know
+            // (a NAT rebinding) and asks us to prove we receive here. Only
+            // answer from the relay's address (the transport checks), and only
+            // in a room; the answer goes out from the same socket, hence from
+            // the new address.
+            if (n == RELAY_CHALLENGE_LEN && st->phase == RC_READY && st->udp_style) {
+                st->last_rx = now;
+                uint8_t r[RELAY_RESPONSE_LEN];
+                r[0] = RELAY_T_PATH_RESPONSE;
+                memcpy(r + 1, st->token, RELAY_TOKEN_LEN);
+                memcpy(r + 1 + RELAY_TOKEN_LEN, p + 1, RELAY_COOKIE_LEN);
+                st->ops->send(st->tp, r, sizeof r);
+            }
             break;
         case RELAY_T_DATA:
             if (st->phase != RC_READY) return;
             st->last_rx = now;
+            confirm_path(st, now);  // the relay only sends data to a validated member
             queue_data(v, st, p, n);
             break;
         default:
@@ -393,7 +429,8 @@ static void rc_poll(vnet *v) {
             fail(v, st, VNET_ETIMEDOUT);
         } else if (now >= st->ka_next) {
             send_simple(v, st, RELAY_T_KEEPALIVE);
-            st->ka_next = now + st->keepalive_ms;
+            st->ka_next = now + (st->ka_confirmed || st->keepalive_ms < KEEPALIVE_UNCONFIRMED_MS
+                                     ? st->keepalive_ms : KEEPALIVE_UNCONFIRMED_MS);
         }
     }
 }
@@ -475,13 +512,20 @@ int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops 
         }
         st->is_join = 1;
     }
-    if (cfg->relay_timeout_ms < 0 || cfg->keepalive_ms < 0) {
+    if (cfg->relay_timeout_ms < 0 ||
+        (cfg->keepalive_ms != 0 && (cfg->keepalive_ms < KEEPALIVE_MIN_MS || cfg->keepalive_ms > KEEPALIVE_MAX_MS))) {
+        vnet__logf(v, VNET_LOG_ERROR, "keepalive_ms must be %d..%d", KEEPALIVE_MIN_MS, KEEPALIVE_MAX_MS);
         rc = VNET_EINVAL;
         goto fail;
     }
     st->hs_timeout_ms = cfg->relay_timeout_ms ? (unsigned)cfg->relay_timeout_ms : DEFAULT_HANDSHAKE_TIMEOUT_MS;
     st->keepalive_ms = (unsigned)cfg->keepalive_ms;  // 0: take the relay's suggestion
-    vnet__random(st->nonce, sizeof st->nonce);
+    if (vnet__random(st->nonce, sizeof st->nonce) != 0) {
+        // No unpredictable nonce, no session: the nonce is a credential.
+        vnet__logf(v, VNET_LOG_ERROR, "no secure random source for the handshake nonce");
+        rc = VNET_EIO;
+        goto fail;
+    }
     st->nsocks = v->max_sockets;
     st->rx_cap = cfg->rx_queue_len > 0 ? cfg->rx_queue_len : DEFAULT_RX_QUEUE;
     st->next_eph = EPHEMERAL_FIRST;

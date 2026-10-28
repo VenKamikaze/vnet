@@ -8,6 +8,7 @@
 #include <atomic>
 #include <csignal>
 #include <fcntl.h>
+#include <mutex>
 #include <sys/wait.h>
 #include <thread>
 
@@ -32,7 +33,8 @@ public:
             dup2(pipefd[1], 1);
             close(pipefd[0]);
             close(pipefd[1]);
-            std::vector<std::string> args = {VNET_RELAY_BIN, "-udp", "127.0.0.1:0", "-http", "127.0.0.1:0"};
+            std::vector<std::string> args = {VNET_RELAY_BIN, "-udp", "127.0.0.1:0", "-http", "127.0.0.1:0",
+                                              "-stats", "127.0.0.1:0"};
             for (auto &e : extra) args.push_back(e);
             std::vector<char *> argv;
             for (auto &a : args) argv.push_back(const_cast<char *>(a.c_str()));
@@ -62,7 +64,7 @@ public:
             return line.substr(i, line.find(' ', i) - i);
         };
         udp_ = field("udp");
-        http_ = field("http");
+        http_ = field("stats");  // /stats is served on its own listener
         EXPECT_FALSE(udp_.empty()) << "relay did not start; output: " << line;
     }
     ~RelayProc() {
@@ -534,84 +536,121 @@ TEST_F(RelayIntegration, LostRepliesCauseRetriesButNeverASecondRoomOrMember) {
     vnet_destroy(host);
 }
 
-TEST_F(RelayIntegration, SessionSurvivesNatRebindingBecauseTheTokenIsTheIdentity) {
-    // Two relay clients behind a forwarder that changes its source port in
-    // the middle of the session (what a NAT mapping change looks like).
-    RelayProc relay;
-    vnet *host = RelayClientFor(relay.udp(), nullptr);
-    ASSERT_EQ(Settle(host), VNET_STATUS_READY);
-    // The guest's traffic goes through a forwarder whose upstream socket we replace.
-    struct Fwd {
-        int client_side, up;
-        sockaddr_in relay{}, client{};
-        bool have = false;
-    } f;
-    f.client_side = socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ASSERT_EQ(bind(f.client_side, (sockaddr *)&a, sizeof a), 0);
-    socklen_t l = sizeof a;
-    getsockname(f.client_side, (sockaddr *)&a, &l);
-    uint16_t fport = ntohs(a.sin_port);
-    f.up = socket(AF_INET, SOCK_DGRAM, 0);
-    f.relay.sin_family = AF_INET;
-    f.relay.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    f.relay.sin_port = htons(relay.udp_port());
+// A UDP forwarder standing in for a NAT: it relays between one client socket
+// and the relay through an upstream socket that the test can replace, which
+// changes the source address (and port) the relay sees.
+class Nat {
+public:
+    explicit Nat(uint16_t relay_port) {
+        client_side_ = socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        EXPECT_EQ(bind(client_side_, (sockaddr *)&a, sizeof a), 0);
+        socklen_t l = sizeof a;
+        getsockname(client_side_, (sockaddr *)&a, &l);
+        port_ = ntohs(a.sin_port);
+        relay_.sin_family = AF_INET;
+        relay_.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        relay_.sin_port = htons(relay_port);
+        up_ = socket(AF_INET, SOCK_DGRAM, 0);
+        th_ = std::thread([this] { Run(); });
+    }
+    ~Nat() {  // also runs when an ASSERT leaves the test early
+        stop_ = true;
+        th_.join();
+        close(client_side_);
+        close(up_);
+    }
+    uint16_t port() const { return port_; }
+    void Rebind() {  // a new mapping: the relay now sees another source port
+        std::lock_guard<std::mutex> lk(mu_);
+        close(up_);
+        up_ = socket(AF_INET, SOCK_DGRAM, 0);
+    }
 
-    std::atomic<bool> stop{false};
-    std::mutex mu;
-    std::thread th([&] {
-        while (!stop) {
-            std::lock_guard<std::mutex> lk(mu);
-            pollfd p[2] = {{f.client_side, POLLIN, 0}, {f.up, POLLIN, 0}};
+private:
+    void Run() {
+        sockaddr_in client{};
+        bool have = false;
+        while (!stop_) {
+            std::lock_guard<std::mutex> lk(mu_);
+            pollfd p[2] = {{client_side_, POLLIN, 0}, {up_, POLLIN, 0}};
             if (poll(p, 2, 0) <= 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
                 continue;
             }
             uint8_t buf[2048];
             if (p[0].revents & POLLIN) {
-                socklen_t cl = sizeof f.client;
-                ssize_t n = recvfrom(f.client_side, buf, sizeof buf, 0, (sockaddr *)&f.client, &cl);
+                socklen_t cl = sizeof client;
+                ssize_t n = recvfrom(client_side_, buf, sizeof buf, 0, (sockaddr *)&client, &cl);
                 if (n > 0) {
-                    f.have = true;
-                    sendto(f.up, buf, (size_t)n, 0, (sockaddr *)&f.relay, sizeof f.relay);
+                    have = true;
+                    sendto(up_, buf, (size_t)n, 0, (sockaddr *)&relay_, sizeof relay_);
                 }
             }
             if (p[1].revents & POLLIN) {
-                ssize_t n = recv(f.up, buf, sizeof buf, 0);
-                if (n > 0 && f.have) sendto(f.client_side, buf, (size_t)n, 0, (sockaddr *)&f.client, sizeof f.client);
+                ssize_t n = recv(up_, buf, sizeof buf, 0);
+                if (n > 0 && have) sendto(client_side_, buf, (size_t)n, 0, (sockaddr *)&client, sizeof client);
             }
         }
-    });
-    std::string via = "127.0.0.1:" + std::to_string(fport);
+    }
+    int client_side_, up_;
+    uint16_t port_;
+    sockaddr_in relay_{};
+    std::mutex mu_;
+    std::atomic<bool> stop_{false};
+    std::thread th_;
+};
+
+// Send `text` from (a, sa) to `to` every few ms until it arrives at (b, sb):
+// the datagram is unreliable and a path change takes a round trip to settle.
+bool SendUntilReceived(vnet *a, int sa, const std::string &text, const vnet_addr &to, vnet *b, int sb,
+                       Rx *rx, int timeout_ms = 8000) {
+    auto deadline = In(timeout_ms);
+    size_t before = rx->data.size();
+    while (Clock::now() < deadline) {
+        Send(a, sa, text, to);
+        for (int i = 0; i < 20; i++) {
+            vnet_poll(a);
+            vnet_poll(b);
+            std::string d;
+            vnet_addr f{};
+            if (Recv(b, sb, &d, &f) >= 0) {
+                rx->data.push_back(d);
+                rx->from.push_back(Str(f));
+            }
+            if (rx->data.size() > before) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    return false;
+}
+
+TEST_F(RelayIntegration, SessionSurvivesNatRebindingBecauseTheTokenIsTheIdentity) {
+    RelayProc relay;
+    vnet *host = RelayClientFor(relay.udp(), nullptr);
+    ASSERT_EQ(Settle(host), VNET_STATUS_READY);
+    Nat nat(relay.udp_port());
+    std::string via = "127.0.0.1:" + std::to_string(nat.port());
     vnet *guest = RelayClientFor(via, RoomOf(host).c_str());
     ASSERT_EQ(Settle(guest), VNET_STATUS_READY);
     int hs = vnet_open(host, 1), gs = vnet_open(guest, 2);
-    ASSERT_EQ(Send(host, hs, "before", A("10.0.0.2:2")), 6);
-    Rx rx;
-    ASSERT_TRUE(Collect({host, guest}, guest, gs, 1, &rx));
-    EXPECT_EQ(rx.data[0], "before");
+    Rx at_guest, at_host;
+    ASSERT_TRUE(SendUntilReceived(host, hs, "before", A("10.0.0.2:2"), guest, gs, &at_guest));
 
-    {  // The mapping changes: a new upstream socket, hence a new source port at the relay.
-        std::lock_guard<std::mutex> lk(mu);
-        close(f.up);
-        f.up = socket(AF_INET, SOCK_DGRAM, 0);
-    }
-    // Traffic from the guest re-registers it (any authenticated frame does).
-    ASSERT_EQ(Send(guest, gs, "hello-from-new-port", A("10.0.0.1:1")), 19);
-    Rx at_host;
-    ASSERT_TRUE(Collect({host, guest}, host, hs, 1, &at_host));
-    ASSERT_EQ(Send(host, hs, "after", A("10.0.0.2:2")), 5);
-    ASSERT_TRUE(Collect({host, guest}, guest, gs, 2, &rx));
-    EXPECT_EQ(rx.data[1], "after");  // the relay now sends to the guest's new address
+    nat.Rebind();
+    // The guest's next datagram arrives from a new source port. The relay does
+    // not trust the new source yet: it challenges it, the client answers from
+    // the same socket, and only then does the session move.
+    ASSERT_TRUE(SendUntilReceived(guest, gs, "from-the-new-port", A("10.0.0.1:1"), host, hs, &at_host));
+    ASSERT_TRUE(SendUntilReceived(host, hs, "after", A("10.0.0.2:2"), guest, gs, &at_guest));
+    EXPECT_EQ(at_guest.data.back(), "after");  // the relay now sends to the guest's new address
     EXPECT_EQ(vnet_status(guest, nullptr), VNET_STATUS_READY);
-    stop = true;
-    th.join();
+    EXPECT_GE(relay.Stat("path_migrations"), 1);
+    EXPECT_GE(relay.Stat("path_challenges"), 1);
     vnet_destroy(guest);
     vnet_destroy(host);
-    close(f.client_side);
-    close(f.up);
 }
 
 }  // namespace

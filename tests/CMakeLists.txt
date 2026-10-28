@@ -53,6 +53,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # IPv6 policy test seam (see ipv6_shim.cpp).
     target_sources(vnet_tests PRIVATE ipv6_shim.cpp)
     target_compile_definitions(vnet_tests PRIVATE VNET_TEST_FAKE_IPV6)
+    # Random source failure test seam (see entropy_shim.cpp).
+    target_sources(vnet_tests PRIVATE entropy_shim.cpp)
+    target_compile_definitions(vnet_tests PRIVATE VNET_TEST_FAKE_ENTROPY)
+    target_link_options(vnet_tests PRIVATE -Wl,--wrap=getentropy)
     target_link_options(vnet_tests PRIVATE -Wl,--wrap=socket -Wl,--wrap=setsockopt
                         -Wl,--wrap=bind -Wl,--wrap=close -Wl,--wrap=sendto)
 endif()

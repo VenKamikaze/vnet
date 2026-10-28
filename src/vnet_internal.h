@@ -79,9 +79,14 @@ void vnet__imp_release(vnet *v);
 void vnet__imp_purge_socket(vnet *v, int s);
 
 // random.c
-// Fill buf with n bytes from the OS random source (falls back to a time-based
-// mix if there is none). Not for key material: used for handshake nonces.
-void vnet__random(void *buf, size_t n);
+// Fill buf (n <= 256) with bytes from the OS cryptographic random source.
+// Returns 0, or -1 if there is none: callers must fail, never fall back to
+// something guessable. The relay's handshake nonce is effectively a
+// credential (whoever repeats it gets the session's ROOM and token), so it
+// must be unpredictable.
+int vnet__random(void *buf, size_t n);
+// Test seam: when non-NULL it replaces the OS source.
+extern int (*vnet__random_hook)(void *buf, size_t n);
 
 // Relay client (relay_client.c). A relay backend is a framing/state-machine
 // core plus a transport that moves whole frames: UDP datagrams (relay_udp.c)

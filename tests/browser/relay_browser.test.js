@@ -40,13 +40,13 @@ const withTimeout = (p, ms, what) => Promise.race([
 // ---- child processes
 
 function startRelay(extraArgs = []) {
-  const child = spawn(RELAY_BIN, ['-udp', '127.0.0.1:0', '-http', '127.0.0.1:0', ...extraArgs],
+  const child = spawn(RELAY_BIN, ['-udp', '127.0.0.1:0', '-http', '127.0.0.1:0', '-stats', '127.0.0.1:0', ...extraArgs],
     { stdio: ['ignore', 'pipe', 'inherit'], env: { PATH: process.env.PATH } });
   const rl = readline.createInterface({ input: child.stdout });
   const ready = new Promise((resolve, reject) => {
     rl.on('line', (line) => {
-      const m = /^LISTEN udp=(\S+) http=(\S+)/.exec(line);
-      if (m) resolve({ child, udp: m[1], http: m[2] });
+      const m = /^LISTEN udp=(\S+) http=(\S+) stats=(\S+)/.exec(line);
+      if (m) resolve({ child, udp: m[1], http: m[2], stats: m[3] });
     });
     child.on('exit', (c) => reject(new Error('relay exited early: ' + c)));
   });
@@ -187,10 +187,10 @@ async function main() {
     }
 
     // Closing a page closes its WebSocket; the relay notices asynchronously.
-    let st = await getJSON(relay.http, '/stats');
+    let st = await getJSON(relay.stats, '/stats');
     for (let i = 0; i < 500 && st.sessions !== 0; i++) {
       await new Promise((r) => setTimeout(r, 10));
-      st = await getJSON(relay.http, '/stats');
+      st = await getJSON(relay.stats, '/stats');
     }
     check(st.rooms_created === 3, `3 rooms were created (${st.rooms_created})`);
     check(st.malformed === 0 && st.rate_limited === 0, `relay saw no malformed frames and no rate limiting (${st.malformed}, ${st.rate_limited})`);

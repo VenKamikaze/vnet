@@ -28,7 +28,9 @@
  *    context; create/destroy can be repeated freely.
  *  - After setup, steady-state send/receive/poll performs no heap
  *    allocation (queues are sized and allocated in vnet_create() and
- *    vnet_open()).
+ *    vnet_open()). That is vnet's own code: in a browser build, Emscripten's
+ *    WebSocket glue (and the browser) allocate for every message that
+ *    arrives or is sent.
  *  - Threading: a vnet context, and every loopback network and context
  *    attached to it, must be used from one thread at a time. Separate
  *    UDP contexts may be used from separate threads.
@@ -290,10 +292,13 @@ typedef struct vnet_config {
     int relay_timeout_ms;         /* give up (VNET_ETIMEDOUT) if no room has
                                      been entered after this long; 0 = 10000 */
     int keepalive_ms;             /* keepalive interval once in a room; 0 = the
-                                     relay's suggestion (5000). The session is
-                                     declared lost (VNET_ETIMEDOUT) after three
-                                     intervals without any frame from the
-                                     relay. */
+                                     relay's suggestion (5000). Otherwise
+                                     100..5000, else VNET_EINVAL: the relay drops
+                                     a silent member after 15 s by default, so
+                                     keep it at or below a third of that. The
+                                     session is declared lost (VNET_ETIMEDOUT)
+                                     after three intervals without any frame
+                                     from the relay. */
 
     /* Optional hooks */
     vnet_clock_fn clock;          /* NULL = backend default (see top) */
@@ -313,7 +318,9 @@ void vnet_config_init(vnet_config *cfg);
  *   VNET_ENOTSUP   unknown/unavailable `backend`
  *   VNET_EADDRINUSE  `loopback_host` already used on that network
  *   VNET_ENOMEM    out of memory
- *   VNET_EIO       OS networking could not be initialised (Winsock)
+ *   VNET_EIO       OS networking could not be initialised (Winsock), or a
+ *                  relay backend found no secure random source for its
+ *                  handshake nonce
  * cfg may be NULL (= UDP defaults). A context made on a loopback network
  * must be destroyed before the network is.
  */
@@ -416,6 +423,7 @@ typedef struct vnet_status_info {
     vnet_addr self;          /* relay: this context's virtual address
                                 (10.0.0.N, port 0) once READY; family
                                 VNET_AF_NONE otherwise */
+    /* New fields are only ever added at the end of this struct. */
 } vnet_status_info;
 
 /*
