@@ -34,7 +34,8 @@ inline Bytes Str2Bytes(const std::string &s) { return Bytes(s.begin(), s.end());
 
 // A relay stand-in: one UDP socket on 127.0.0.1 that the test reads and
 // writes by hand. Presence is checked with a bounded wait; absence with a
-// non-blocking read (loopback delivery is complete when sendto() returns).
+// non-blocking read. Both need everything sent so far to have been delivered:
+// see Flush().
 class FakeRelay {
 public:
     FakeRelay() {
@@ -48,8 +49,31 @@ public:
         socklen_t l = sizeof a;
         getsockname(fd_, (sockaddr *)&a, &l);
         port_ = ntohs(a.sin_port);
+        barrier_ = socket(AF_INET, SOCK_DGRAM, 0);
+        a.sin_port = 0;
+        EXPECT_EQ(bind(barrier_, (sockaddr *)&a, sizeof a), 0);
+        l = sizeof barrier_addr_;
+        getsockname(barrier_, (sockaddr *)&barrier_addr_, &l);
     }
-    ~FakeRelay() { close(fd_); }
+    ~FakeRelay() {
+        close(fd_);
+        close(barrier_);
+    }
+
+    // Wait until every loopback datagram sent so far is in its receiver's
+    // queue. On Linux it is when sendto() returns. On macOS loopback packets
+    // are queued for the network input thread and delivered a moment later,
+    // so a vnet_poll() straight after Send() could find nothing, and a check
+    // that the client sent nothing could pass because its datagram had not
+    // arrived yet. That thread takes loopback packets in order, so once a
+    // datagram sent to ourselves after them has arrived, they have too.
+    void Flush() {
+        sendto(barrier_, "", 0, 0, (sockaddr *)&barrier_addr_, sizeof barrier_addr_);
+        pollfd p{barrier_, POLLIN, 0};
+        ASSERT_EQ(poll(&p, 1, 3000), 1) << "loopback barrier lost";
+        char c;
+        recv(barrier_, &c, sizeof c, 0);
+    }
     uint16_t port() const { return port_; }
     std::string addr() const { return "127.0.0.1:" + std::to_string(port_); }
 
@@ -65,7 +89,10 @@ public:
         have_client_ = true;
         return true;
     }
-    bool TryRecv(Bytes *out) { return Recv(out, 0); }
+    bool TryRecv(Bytes *out) {
+        Flush();
+        return Recv(out, 0);
+    }
     int Drain() {
         Bytes b;
         int n = 0;
@@ -84,6 +111,7 @@ public:
     void Send(const Bytes &b) {
         ASSERT_TRUE(have_client_);
         sendto(fd_, b.data(), b.size(), 0, (sockaddr *)&from_, sizeof from_);
+        Flush();
     }
     sockaddr_in client() const { return from_; }
     // A third party sends to the client's socket.
@@ -91,10 +119,12 @@ public:
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         sendto(s, b.data(), b.size(), 0, (sockaddr *)&from_, sizeof from_);
         close(s);
+        Flush();
     }
 
 private:
-    int fd_;
+    int fd_, barrier_;
+    sockaddr_in barrier_addr_{};
     uint16_t port_;
     sockaddr_in from_{};
     bool have_client_ = false;
