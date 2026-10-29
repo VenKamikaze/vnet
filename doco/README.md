@@ -18,7 +18,7 @@ Each brief (`NN-*.md`) is one implement → review → merge cycle. Brief number
 | 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | done |
 | 14 | [API polish and browser lifecycle](14-vnet-api-polish.md) (from the [design review](design-review.md)) | 11 | done |
 
-**State (29 Oct 2026):** 06, 10, 11 and 14 are done. 06, 10 and 11 are merged into `claude` (26f4b0f), and 14 (API polish and browser lifecycle, CMake version 0.4.0) is on `vnet/14-api-polish`, awaiting the coordinator's merge. Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11); `v0.4.0` is tagged by the user after the merge (the command is in brief 14's Outcome). Consumers pin a tag. CI runs on pushes to `vnet/**`.
+**State (29 Oct 2026):** 06, 10, 11 and 14 are done and merged into `claude` (14: merge eb1feeb, CMake version 0.4.0). Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11), `v0.4.0` (14). Consumers pin a tag. No brief is open. CI (GitHub Actions) runs on pushes to `main`, `claude`, `vnet/**` and `fix/**`, and is green on all seven jobs; it never ran before 29 Oct because the workflow file was invalid YAML.
 
 **Bit Riot briefs that consume vnet:** 07 (native lockstep, needs 06) and 12 (browser netplay, needs 10). Both start after 14, which added what they need (impairment changes on a live context and integration docs for 07; the hidden-tab fix, wake callback and portable relay backend for 12). A session doing those needs both repos attached.
 
