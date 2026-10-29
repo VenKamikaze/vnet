@@ -140,7 +140,7 @@ Landed on `vnet/14-api-polish`, version **0.4.0**. Every in-scope item is implem
 - **`relay_rtt_ms` is KEEPALIVE only**, as the brief says, so the first sample comes one keepalive interval after READY (or at once after a gap). A sample from the handshake round trip would give the lobby a number earlier.
 - **Corrections to the review** (also marked in it): `relay_peer.c` had no `#ifdef` for the backend (it chose by URL scheme); "natively the same logic covers sleep/debugger pauses for free" holds only for pauses shorter than the relay's 15 s UDP session timeout, after which the client now learns `VNET_ECLOSED` within a round trip; the WebTransport wake needs no exported function.
 - `10.0.0.254` is reserved in the protocol document, but the relay still accepts `-max-members 254` (the brief says protocol notes only, no code). The document says so.
-- Not run: macOS (no macOS here; a `POLL_IN` macro clash CI found on macOS was fixed, and the late-loopback-delivery pitfall was avoided in the new tests), MinGW i686.
+- **CI** (run 40836134763 on `ca6fa23`): all 7 jobs green: gcc, clang, gcc+ASan/UBSan, macOS clang, the Go relay (vet, race, fuzz, Docker), the browser job (Emscripten + Chromium, including the wake test) and MinGW under Wine. Two macOS problems CI found in this branch's first pushes were fixed: a `POLL_IN` macro clash in `udp.c`, and the Linux-only `SO_RCVBUF` seam tests linked on macOS. Not run: MinGW i686.
 
 **Follow-ups**
 
