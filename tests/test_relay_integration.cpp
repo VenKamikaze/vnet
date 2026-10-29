@@ -191,6 +191,74 @@ bool Collect(const std::vector<vnet *> &pumps, vnet *v, int s, size_t n, Rx *rx,
 
 class RelayIntegration : public VnetTest {};
 
+// VNET_BACKEND_RELAY_AUTO with relay_udp (the same constant a browser build uses),
+// and waiting with vnet_wait() instead of sleeping: the context is woken by
+// frames and by its own keepalive deadline, never by a fixed nap.
+TEST_F(RelayIntegration, AutoBackendWithWaitMeasuresTheRelayRoundTripAndReportsTheRoomLimit) {
+    RelayProc relay({"-max-members", "5"});
+    auto make = [&](const char *room) {
+        vnet_config cfg;
+        vnet_config_init(&cfg);
+        cfg.backend = VNET_BACKEND_RELAY_AUTO;
+        cfg.relay = "wss://relay.example.org/vnet";  // a browser build would use this
+        cfg.relay_udp = relay.udp().c_str();
+        cfg.room = room;
+        cfg.ignore_env = 1;
+        cfg.keepalive_ms = 100;
+        int err = 0;
+        vnet *v = vnet_create(&cfg, &err);
+        EXPECT_NE(v, nullptr) << vnet_strerror(err);
+        return v;
+    };
+    vnet *host = make(nullptr);
+    ASSERT_NE(host, nullptr);
+    // Wake on frames: no sleeping, no spinning.
+    auto deadline = In(8000);
+    vnet_status_info st;
+    while (vnet_status(host, &st) == VNET_STATUS_CONNECTING && Clock::now() < deadline) {
+        vnet_wait(host, 500);
+        vnet_poll(host);
+    }
+    ASSERT_EQ(vnet_status(host, &st), VNET_STATUS_READY);
+    EXPECT_STREQ(st.transport, "relay-udp");
+    EXPECT_EQ(st.max_members, 5) << "the room's limit, from ROOM";
+    EXPECT_EQ(st.relay_rtt_ms, -1) << "no KEEPALIVE answered yet";
+    // The 100 ms keepalive deadline wakes vnet_wait; its answer is a sample.
+    deadline = In(5000);
+    auto t0 = Clock::now();
+    while (st.relay_rtt_ms < 0 && Clock::now() < deadline) {
+        vnet_wait(host, 2000);
+        vnet_poll(host);
+        vnet_status(host, &st);
+    }
+    EXPECT_GE(st.relay_rtt_ms, 0);
+    EXPECT_LT(st.relay_rtt_ms, 1000) << "loopback to the relay";
+    double took_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    EXPECT_LT(took_ms, 3000);
+
+    vnet *guest = make(st.room);
+    ASSERT_NE(guest, nullptr);
+    ASSERT_EQ(Settle(guest), VNET_STATUS_READY);
+    int hs = vnet_open(host, 5000), gs = vnet_open(guest, 5001);
+    vnet_addr to_host;
+    ASSERT_EQ(vnet_resolve(guest, "room-host:5000", &to_host), 0);
+    ASSERT_EQ(Send(guest, gs, "ping", to_host), 4);
+    std::string d;
+    vnet_addr from{};
+    deadline = In(5000);
+    int n = VNET_EAGAIN;
+    while (n == VNET_EAGAIN && Clock::now() < deadline) {
+        vnet_wait(host, 1000);
+        vnet_poll(host);
+        n = Recv(host, hs, &d, &from);
+    }
+    EXPECT_EQ(n, 4);
+    EXPECT_EQ(d, "ping");
+    EXPECT_EQ(Str(from), "10.0.0.2:5001");
+    vnet_destroy(guest);
+    vnet_destroy(host);
+}
+
 TEST_F(RelayIntegration, TwoNativeClientsExchangeDatagramsInOrder) {
     RelayProc relay;
     vnet *host = RelayClientFor(relay.udp(), nullptr);

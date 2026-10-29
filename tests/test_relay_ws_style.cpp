@@ -194,6 +194,14 @@ TEST_F(RelayWsStyle, ASuspendedPageInARoomStaysInItAndAsksTheRelayAtOnce) {
     EXPECT_EQ(tp.out.size(), 2u);
 }
 
+TEST_F(RelayWsStyle, AWebSocketStyleTransportCannotWait) {
+    v = Make();
+    Open();
+    Enter(1);
+    EXPECT_EQ(vnet_wait(v, 0), VNET_ENOTSUP);
+    EXPECT_EQ(vnet_wait(v, 10), VNET_ENOTSUP);
+}
+
 TEST_F(RelayWsStyle, ConnectFailureMeansTheRelayCannotBeReached) {
     v = Make();
     tp.state = RELAY_TP_FAILED;

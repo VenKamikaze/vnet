@@ -820,6 +820,106 @@ TEST_F(RelayClient, AGapShorterThanAKeepaliveIsNotASuspension) {
     EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_FAILED);
 }
 
+// ---- vnet_wait() on relay-UDP
+
+static double MsSince(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
+TEST_F(RelayClient, WaitReturnsAtOnceForAFrameFromTheRelay) {
+    Start();
+    Enter(1);
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(vnet_wait(v, 5000), 1);
+    EXPECT_LT(MsSince(t0), 1500);
+    vnet_poll(v);
+}
+
+TEST_F(RelayClient, WaitReturnsAtOnceWhileADatagramIsStillQueued) {
+    Start();
+    Enter(1);
+    int s = vnet_open(v, 4000);
+    relay.Send(DataToClient(2, 4000, 1, Bytes{1}));
+    relay.Send(DataToClient(2, 4000, 1, Bytes{2}));
+    EXPECT_EQ(vnet_wait(v, 5000), 1);
+    vnet_poll(v);  // both are now in the socket's queue; the game reads one
+    char buf[8];
+    ASSERT_EQ(vnet_recvfrom(v, s, buf, sizeof buf, nullptr), 1);
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(vnet_wait(v, 5000), 1) << "the second is receivable without any socket activity";
+    EXPECT_LT(MsSince(t0), 500);
+}
+
+TEST_F(RelayClient, WaitDoesNotSleepPastTheNextKeepalive) {
+    Start(nullptr, 100);  // keepalive every 100 ms (the injected clock does not move)
+    Enter(1);
+    relay.Drain();
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(vnet_wait(v, 10000), 0);
+    double ms = MsSince(t0);
+    EXPECT_GE(ms, 60);
+    EXPECT_LT(ms, 3000) << "woken for the keepalive due in 100 ms, not after 10 s";
+}
+
+TEST_F(RelayClient, WaitDoesNotSleepPastTheNextHandshakeRetransmission) {
+    Start();  // CREATE sent; the first retransmission is due after 250 ms
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(vnet_wait(v, 10000), 0);
+    double ms = MsSince(t0);
+    EXPECT_GE(ms, 150);
+    EXPECT_LT(ms, 3000);
+}
+
+TEST_F(RelayClient, WaitWithADeadlineAlreadyPastDoesNotSleep) {
+    Start(nullptr, 100);
+    Enter(1);
+    clk.now += 500;  // the keepalive is overdue
+    auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(vnet_wait(v, 10000), 0);
+    EXPECT_LT(MsSince(t0), 500);
+}
+
+// ---- impairment and the wake callback on a relay context
+
+TEST_F(RelayClient, ImpairmentCanBeChangedOnALiveRelayContext) {
+    Start();
+    Enter(1);
+    int s = vnet_open(v, 4000);
+    vnet_addr to = A("10.0.0.2:5");
+    relay.Drain();
+    vnet_impair out = {};
+    out.loss_pct = 100;
+    ASSERT_EQ(vnet_set_impair(v, &out), 0);
+    for (int i = 0; i < 5; i++) EXPECT_EQ(Send(v, s, "x", to), 1);
+    Bytes b;
+    EXPECT_FALSE(relay.TryRecv(&b)) << "an outage: nothing reaches the relay";
+    ASSERT_EQ(vnet_set_impair(v, nullptr), 0);
+    EXPECT_EQ(Send(v, s, "y", to), 1);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_DATA, &b));
+    EXPECT_EQ(b.back(), 'y');
+}
+
+TEST_F(RelayClient, TheWakeCallbackIsNeverCalledByTheNativeRelayClient) {
+    int wakes = 0;
+    addr = relay.addr();
+    vnet_config cfg = RelayUdpConfig(relay, &clk);
+    cfg.relay = addr.c_str();
+    cfg.wake = [](void *u) { ++*static_cast<int *>(u); };
+    cfg.wake_user = &wakes;
+    v = vnet_create(&cfg, nullptr);
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &req));
+    Enter(1);
+    int s = vnet_open(v, 4000);
+    relay.Send(DataToClient(2, 4000, 1, Bytes{1}));
+    Bytes b;
+    ASSERT_TRUE(RecvOne(s, &b));
+    clk.now += 60000;
+    vnet_poll(v);
+    EXPECT_EQ(wakes, 0);
+}
+
 // ---- status: relay_rtt_ms and max_members
 
 TEST_F(RelayClient, StatusCarriesTheRoomsMemberLimit) {
