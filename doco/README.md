@@ -17,7 +17,7 @@ Each brief (`NN-*.md`) is one implement → review → merge cycle. Brief number
 | 10 | [Relay and WebSocket transport](10-vnet-relay-websocket.md) | 06 | done |
 | 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | done |
 
-**State (29 Oct 2026):** 06, 10 and 11 are all done and merged into `claude` (26f4b0f, CMake version 0.3.0). There is no published release tag yet, so consumers pin a commit hash. GitHub Actions runs have not been observed from the cloud sessions.
+**State (29 Oct 2026):** 06, 10 and 11 are all done and merged into `claude` (26f4b0f, CMake version 0.3.0). Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11). Consumers pin a tag. GitHub Actions runs have not been observed from the cloud sessions.
 
 **Bit Riot briefs that consume vnet:** 07 (native lockstep, needs 06) and 12 (browser netplay, needs 10). A session doing those needs both repos attached.
 

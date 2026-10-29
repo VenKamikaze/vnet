@@ -26,13 +26,13 @@ As a subdirectory or with `FetchContent` (use `GIT_REPOSITORY`; archive download
 include(FetchContent)
 FetchContent_Declare(vnet
     GIT_REPOSITORY https://github.com/VenKamikaze/vnet.git
-    GIT_TAG        26f4b0f)         # pin a commit (or a release tag once one is published)
+    GIT_TAG        v0.3.0)          # pin a release tag or commit
 FetchContent_MakeAvailable(vnet)
 
 target_link_libraries(mygame PRIVATE vnet::vnet)
 ```
 
-No release tag is published yet (the next one is planned as `v0.3.0`, matching the CMake project version), so pin a commit hash from the `claude` branch. (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
+Releases are tagged `vMAJOR.MINOR.PATCH`, matching the CMake project version: `v0.1.0` (core, brief 06), `v0.2.0` (relay and WebSocket, brief 10), `v0.3.0` (WebTransport, brief 11). (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
 
 Or install it and use `find_package`:
 
