@@ -36,8 +36,8 @@ int TpRecv(void *p, uint8_t *buf, size_t cap) {
 void TpDestroy(void *p) { static_cast<ScriptTp *>(p)->destroyed = true; }
 size_t TpMaxFrame(void *p) { return static_cast<ScriptTp *>(p)->max_frame; }
 
-const relay_transport_ops kWtOps = {"relay-wt", 0, TpState, TpSend, TpRecv, TpDestroy, TpMaxFrame};
-const relay_transport_ops kWsOps = {"relay-ws", 0, TpState, TpSend, TpRecv, TpDestroy, nullptr};
+const relay_transport_ops kWtOps = {"relay-wt", 0, TpState, TpSend, TpRecv, TpDestroy, TpMaxFrame, nullptr};
+const relay_transport_ops kWsOps = {"relay-ws", 0, TpState, TpSend, TpRecv, TpDestroy, nullptr, nullptr};
 
 // What the core is told to fall back to: a way to open the second transport.
 struct Fallback {
@@ -132,6 +132,17 @@ TEST_F(RelayFallback, TheFirstTransportIsUsedWhenItWorks) {
     EXPECT_EQ(wt.out.back(), B({RELAY_T_LEAVE}));
 }
 
+TEST_F(RelayFallback, AGapBeforeTheRoomIsNotTimeTheFirstTransportRanOut) {
+    Make();
+    Poll(60000);  // suspended while WebTransport was connecting
+    EXPECT_EQ(fb.calls, 0) << "the primary's time is spent polling, not sleeping";
+    wt.state = RELAY_TP_OPEN;
+    Poll();
+    Enter(wt);
+    EXPECT_EQ(Status().state, VNET_STATUS_READY);
+    EXPECT_STREQ(Status().transport, "relay-wt");
+}
+
 TEST_F(RelayFallback, AFailedTransportIsReplacedAndTheHandshakeStartsOverWithANewNonce) {
     Make();
     wt.state = RELAY_TP_OPEN;
@@ -196,7 +207,11 @@ TEST_F(RelayFallback, TheFallbackGetsTheWholeHandshakeTimeoutNotWhatIsLeft) {
     ws.state = RELAY_TP_OPEN;
     // 10.5 s after creation but 7.5 s after the switch: the default timeout
     // of 10 s counts from the start of the WebSocket attempt.
-    Poll(7500);
+    // (Polled every 2.5 s: one long gap between polls would count as the
+    // application sleeping and extend the deadline; see RelayClientSuspend.)
+    Poll(2500);
+    Poll(2500);
+    Poll(2500);
     EXPECT_EQ(Status().state, VNET_STATUS_CONNECTING);
     Poll(2500);  // 10 s after the switch
     vnet_status_info st = Status();
@@ -382,6 +397,15 @@ TEST_F(RelayProbe, TheProbeIsRepeatedUntilItIsAnsweredOrTheTimeIsUp) {
     EXPECT_EQ(Status().state, VNET_STATUS_READY) << "a repeat's echo is as good as the first's";
 }
 
+TEST_F(RelayProbe, AGapDuringTheProbeDoesNotCountAgainstIt) {
+    EnterSmall(false);
+    Poll(60000);  // the page was suspended for a minute mid-probe
+    EXPECT_EQ(Status().state, VNET_STATUS_CONNECTING);
+    wt.in.push_back(Echo(Probe(), 2));
+    Poll();
+    EXPECT_EQ(Status().state, VNET_STATUS_READY);
+}
+
 TEST_F(RelayProbe, NoAnswerMeansFallBackWhenThereIsAFallback) {
     EnterSmall();
     Bytes first = Nonce(wt);
@@ -533,11 +557,12 @@ TEST(RelayAutoArguments, BadArgumentsAreRejectedAndBrowserOnlyBackendsSayTheyAre
         int want;
     } cases[] = {
         {VNET_BACKEND_RELAY_AUTO, nullptr, nullptr, VNET_EINVAL},
-        {VNET_BACKEND_RELAY_AUTO, "127.0.0.1:7777", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_AUTO, "https://x/vnet", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_AUTO, "wss://x/vnet", "nothex", VNET_EINVAL},
-        {VNET_BACKEND_RELAY_AUTO, "wss://x/vnet", nullptr, VNET_ENOTSUP},
-        {VNET_BACKEND_RELAY_AUTO, "ws://x/vnet", nullptr, VNET_ENOTSUP},
+        // Natively AUTO means RELAY_UDP (0.4.0): a URL is not a UDP address,
+        // and there is no relay_udp. (Before 0.4.0 these were VNET_ENOTSUP.)
+        {VNET_BACKEND_RELAY_AUTO, "wss://x/vnet", nullptr, VNET_EINVAL},
+        {VNET_BACKEND_RELAY_AUTO, "ws://x/vnet", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_WT, "ws://x/vnet", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_WT, "https://x:1/vnet", "00", VNET_EINVAL},
         {VNET_BACKEND_RELAY_WT, "https://x:1/vnet", nullptr, VNET_ENOTSUP},

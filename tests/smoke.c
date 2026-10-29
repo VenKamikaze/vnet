@@ -32,13 +32,13 @@ static int failures;
         }                                                                    \
     } while (0)
 
-/* Poll with a bounded number of 1 ms sleeps (5 s). */
+/* Wait for a datagram with vnet_wait(): up to 1000 rounds of at most 5 ms (5 s). */
 static int recv_wait(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
-    for (int i = 0; i < 5000; i++) {
+    for (int i = 0; i < 1000; i++) {
         vnet_poll(v);
         int n = vnet_recvfrom(v, s, buf, cap, from);
         if (n != VNET_EAGAIN) return n;
-        sleep_ms();
+        if (vnet_wait(v, 5) == VNET_ENOTSUP) sleep_ms();
     }
     return VNET_EAGAIN;
 }
@@ -77,6 +77,27 @@ static void test_udp(void) {
     CHECK(n == VNET_MAX_DATAGRAM);
 
     CHECK(vnet_open(b, lb.port) == VNET_EADDRINUSE);
+
+    /* vnet_wait: a timeout is 0, a waiting datagram is 1 */
+    CHECK(vnet_wait(b, 0) == 0);
+    CHECK(vnet_wait(b, 10) == 0);
+    CHECK(vnet_wait(b, -1) == VNET_EINVAL);
+    CHECK(vnet_sendto(a, sa, "w", 1, &to) == 1);
+    CHECK(vnet_wait(b, 5000) == 1);
+    CHECK(recv_wait(b, sb, buf, sizeof buf, &from) == 1);
+
+    /* vnet_set_impair on a live UDP context: total loss, then recovery */
+    {
+        vnet_impair out;
+        memset(&out, 0, sizeof out);
+        out.loss_pct = 100;
+        CHECK(vnet_set_impair(a, &out) == 0);
+        CHECK(vnet_sendto(a, sa, "lost", 4, &to) == 4);
+        CHECK(vnet_wait(b, 50) == 0);
+        CHECK(vnet_set_impair(a, NULL) == 0);
+        CHECK(vnet_sendto(a, sa, "back", 4, &to) == 4);
+        CHECK(recv_wait(b, sb, buf, sizeof buf, &from) == 4 && memcmp(buf, "back", 4) == 0);
+    }
     vnet_destroy(a);
     vnet_destroy(b);
 }
@@ -106,6 +127,16 @@ static void test_loopback_impair(void) {
     vnet_loopback_network_destroy(net);
 }
 
+static void test_version_and_resolve(void) {
+    char want[32];
+    vnet_addr a;
+    snprintf(want, sizeof want, "%d.%d.%d", VNET_VERSION_MAJOR, VNET_VERSION_MINOR, VNET_VERSION_PATCH);
+    CHECK(strcmp(vnet_version(), want) == 0);
+    CHECK(vnet_resolve_host("127.0.0.1:99", VNET_FAMILY_ANY, &a) == 0 && a.port == 99);
+    CHECK(vnet_resolve_host("localhost:99", VNET_FAMILY_IPV4, &a) == 0 && a.bytes[0] == 127);
+    CHECK(vnet_resolve_host("nonsense", VNET_FAMILY_ANY, &a) == VNET_EINVAL);
+}
+
 static void test_addresses(void) {
     vnet_addr a, b;
     char s[64];
@@ -118,6 +149,7 @@ static void test_addresses(void) {
 
 int main(void) {
     test_addresses();
+    test_version_and_resolve();
     test_loopback_impair();
     test_udp();
     if (failures) {

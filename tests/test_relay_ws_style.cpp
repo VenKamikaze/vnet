@@ -36,7 +36,7 @@ int TpRecv(void *p, uint8_t *buf, size_t cap) {
 }
 void TpDestroy(void *p) { static_cast<ScriptTp *>(p)->destroyed = true; }
 
-const relay_transport_ops kOps = {"relay-ws", 0, TpState, TpSend, TpRecv, TpDestroy, nullptr};
+const relay_transport_ops kOps = {"relay-ws", 0, TpState, TpSend, TpRecv, TpDestroy, nullptr, nullptr};
 
 class RelayWsStyle : public VnetTest {
 protected:
@@ -162,6 +162,44 @@ TEST_F(RelayWsStyle, ConnectTimeout) {
     EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_FAILED);
     EXPECT_EQ(st.error, VNET_ETIMEDOUT);
     EXPECT_TRUE(tp.out.empty());
+}
+
+TEST_F(RelayWsStyle, ASuspendedPageWhileConnectingStillConnects) {
+    // A tab hidden for 60 s while the WebSocket was still opening.
+    v = Make(nullptr, 10000);
+    clk.now += 60000;
+    vnet_poll(v);
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_CONNECTING);
+    Open();
+    Enter(1);
+}
+
+TEST_F(RelayWsStyle, ASuspendedPageInARoomStaysInItAndAsksTheRelayAtOnce) {
+    v = Make();
+    Open();
+    Enter(1);
+    ASSERT_EQ(tp.out.size(), 1u);
+    clk.now += 60000;  // no polls for a minute; the relay's pings were answered by the browser
+    vnet_poll(v);
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
+    ASSERT_EQ(tp.out.size(), 2u);
+    EXPECT_EQ(tp.out[1], B({RELAY_T_KEEPALIVE}));
+    // The answer is a sample of the round trip.
+    clk.now += 44;
+    tp.in.push_back(B({RELAY_T_KEEPALIVE}));
+    vnet_poll(v);
+    vnet_status_info st;
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, 44);
+    EXPECT_EQ(tp.out.size(), 2u);
+}
+
+TEST_F(RelayWsStyle, AWebSocketStyleTransportCannotWait) {
+    v = Make();
+    Open();
+    Enter(1);
+    EXPECT_EQ(vnet_wait(v, 0), VNET_ENOTSUP);
+    EXPECT_EQ(vnet_wait(v, 10), VNET_ENOTSUP);
 }
 
 TEST_F(RelayWsStyle, ConnectFailureMeansTheRelayCannotBeReached) {

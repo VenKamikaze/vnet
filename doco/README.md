@@ -16,11 +16,11 @@ Each brief (`NN-*.md`) is one implement → review → merge cycle. Brief number
 | 06 | [vnet core: API, loopback and native UDP](06-vnet-core.md) | — | done |
 | 10 | [Relay and WebSocket transport](10-vnet-relay-websocket.md) | 06 | done |
 | 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | done |
-| 14 | [API polish and browser lifecycle](14-vnet-api-polish.md) (from the [design review](design-review.md)) | 11 | in progress |
+| 14 | [API polish and browser lifecycle](14-vnet-api-polish.md) (from the [design review](design-review.md)) | 11 | done |
 
-**State (29 Oct 2026):** 06, 10 and 11 are all done and merged into `claude` (26f4b0f, CMake version 0.3.0). Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11). Consumers pin a tag. GitHub Actions runs have not been observed from the cloud sessions.
+**State (29 Oct 2026):** 06, 10, 11 and 14 are done. 06, 10 and 11 are merged into `claude` (26f4b0f), and 14 (API polish and browser lifecycle, CMake version 0.4.0) is on `vnet/14-api-polish`, awaiting the coordinator's merge. Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11); `v0.4.0` is tagged by the user after the merge (the command is in brief 14's Outcome). Consumers pin a tag. CI runs on pushes to `vnet/**`.
 
-**Bit Riot briefs that consume vnet:** 07 (native lockstep, needs 06) and 12 (browser netplay, needs 10). Both should start after 14, which adds what they need (impairment changes on a live context and integration docs for 07; the hidden-tab fix, wake callback and portable relay backend for 12). A session doing those needs both repos attached.
+**Bit Riot briefs that consume vnet:** 07 (native lockstep, needs 06) and 12 (browser netplay, needs 10). Both start after 14, which added what they need (impairment changes on a live context and integration docs for 07; the hidden-tab fix, wake callback and portable relay backend for 12). A session doing those needs both repos attached.
 
 Wire format of the relay: [`relay-protocol.md`](relay-protocol.md). Operating it: [`../relay/README.md`](../relay/README.md).
 

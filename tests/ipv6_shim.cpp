@@ -22,6 +22,8 @@ ssize_t __real_sendto(int, const void *, size_t, int, const struct sockaddr *, s
 int g_fake_ipv6 = 0;
 int g_fail_sendto = 0;
 int g_fake_v6only_last = -1;
+int g_last_rcvbuf = 0;      // the last SO_RCVBUF value a socket was asked to have
+int g_fail_rcvbuf = 0;      // make setsockopt(SO_RCVBUF) fail
 static bool g_fake_fd[4096];
 
 int __wrap_socket(int domain, int type, int proto) {
@@ -34,6 +36,13 @@ int __wrap_socket(int domain, int type, int proto) {
 }
 
 int __wrap_setsockopt(int fd, int level, int name, const void *val, socklen_t len) {
+    if (level == SOL_SOCKET && name == SO_RCVBUF) {
+        std::memcpy(&g_last_rcvbuf, val, sizeof(int));
+        if (g_fail_rcvbuf) {
+            errno = ENOBUFS;
+            return -1;
+        }
+    }
     if (fd >= 0 && fd < 4096 && g_fake_fd[fd] && level == IPPROTO_IPV6 && name == IPV6_V6ONLY) {
         std::memcpy(&g_fake_v6only_last, val, sizeof(int));
         return 0;

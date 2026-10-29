@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(vnet
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "Virtual UDP for games: a small non-blocking datagram API with pluggable backends"
     LANGUAGES C)
 
@@ -39,9 +39,11 @@ add_library(vnet STATIC
     src/random.c
     src/relay_auto.c
     src/relay_client.c
+    src/relay_inbox.c
     src/relay_udp.c
     src/relay_ws.c
     src/relay_wt.c
+    src/resolve.c
     src/udp.c
     src/vnet.c)
 add_library(vnet::vnet ALIAS vnet)
@@ -110,6 +112,17 @@ if(VNET_BUILD_EXAMPLES)
     if(EMSCRIPTEN)
         set_target_properties(relay_peer PROPERTIES SUFFIX ".html")
         target_link_options(relay_peer PRIVATE
+            "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/examples/shell.html")
+    endif()
+
+    # wake_probe: the test program for the wake callback (vnet_config.wake).
+    # Browser: an echo host that is driven by wake-ups, or whose loop is frozen.
+    # Native: the guest that sends it pings (and uses vnet_wait()).
+    add_executable(wake_probe examples/wake_probe.c)
+    target_link_libraries(wake_probe PRIVATE vnet)
+    if(EMSCRIPTEN)
+        set_target_properties(wake_probe PROPERTIES SUFFIX ".html")
+        target_link_options(wake_probe PRIVATE
             "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/examples/shell.html")
     endif()
 endif()

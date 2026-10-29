@@ -27,6 +27,10 @@ typedef struct vnet_backend {
     // negative VNET_E* code (it was this backend's form but invalid), or 1
     // (not one of this backend's forms: use the built-in parser).
     int (*resolve)(vnet *v, const char *host_port, vnet_addr *out);
+    // Optional (NULL = vnet_wait() returns VNET_ENOTSUP). Sleep until something
+    // may be receivable or timeout_ms passes (already capped by the caller to
+    // the next impairment release). 1 ready, 0 timeout, or a VNET_E* code.
+    int (*wait)(vnet *v, int timeout_ms);
 } vnet_backend;
 
 typedef struct vnet_imp vnet_imp;
@@ -42,7 +46,10 @@ struct vnet {
     void *clock_user;
     vnet_log_fn log;
     void *log_user;
-    vnet_imp *imp;  // NULL when impairment is off
+    vnet_imp *imp;  // NULL until impairment has been on; see vnet__imp_active()
+    int imp_queue_len;  // as configured, for a later vnet_set_impair()
+    vnet_wake_fn wake;
+    void *wake_user;
     vnet_stats stats;
 };
 
@@ -53,6 +60,8 @@ void vnet__logf(vnet *v, int level, const char *fmt, ...)
 #endif
     ;
 uint64_t vnet__now(vnet *v);
+// Tell the application that a poll is worth making (browser transports).
+void vnet__wake(vnet *v);
 uint64_t vnet__system_clock(void *user);
 // Impaired datagrams due now go to the backend (also done by vnet_poll()).
 void vnet__release(vnet *v);
@@ -69,6 +78,10 @@ void vnet__addr_set_ipv4(vnet_addr *a, const uint8_t ip[4], uint16_t port);
 // impair.c
 vnet_imp *vnet__imp_create(vnet *v, const vnet_impair *cfg, int queue_len);
 void vnet__imp_destroy(vnet_imp *imp);
+void vnet__imp_configure(vnet_imp *imp, const vnet_impair *cfg);
+int vnet__imp_active(const vnet *v);
+int vnet__imp_set(vnet *v, const vnet_impair *cfg, int queue_len);
+int vnet__imp_next_due(const vnet *v, uint64_t *due);
 // Like vnet_impair_parse() but updates `inout` in place (keys not mentioned keep their value).
 int vnet__impair_parse_into(const char *spec, vnet_impair *inout);
 int vnet__imp_enabled(const vnet_impair *cfg);
@@ -77,6 +90,12 @@ int vnet__imp_validate(const vnet_impair *cfg);
 void vnet__imp_submit(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to);
 void vnet__imp_release(vnet *v);
 void vnet__imp_purge_socket(vnet *v, int s);
+
+// resolve.c
+// vnet_resolve_host() without the public family filter. Failure to look a name
+// up is VNET_ECONNREFUSED (how the relay backends report it), a malformed
+// address VNET_EINVAL. `inner` is only used for its numeric parser.
+int vnet__resolve_host(vnet *inner, const char *host_port, int family, vnet_addr *out);
 
 // random.c
 // Fill buf (n <= 256) with bytes from the OS cryptographic random source.
@@ -106,6 +125,9 @@ typedef struct relay_transport_ops {
     // RELAY_WT_DATA_MAX the core checks what really fits before it reports
     // READY (a datagram-size probe). NULL: no such limit.
     size_t (*max_data_frame)(void *tp);
+    // Optional: sleep until a frame may be waiting or timeout_ms has passed
+    // (1 / 0 / VNET_E*). NULL: vnet_wait() is VNET_ENOTSUP.
+    int (*wait)(void *tp, int timeout_ms);
 } relay_transport_ops;
 
 // A way to open the transport to fall back to. `arg` is the copy of the bytes

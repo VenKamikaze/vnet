@@ -21,6 +21,7 @@ if (q.get('cert')) args.push('--cert-hash', q.get('cert'));
 if (q.get('wttimeout')) args.push('--wt-timeout', q.get('wttimeout'));
 if (q.get('maxlen')) args.push('--maxlen', q.get('maxlen'));
 if (q.get('verbose')) args.push('--verbose');
+if (q.get('mode')) args.push('--mode', q.get('mode'));
 window.vnetLog = [];
 var Module = {
   arguments: args,

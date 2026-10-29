@@ -10,8 +10,11 @@
 //
 // The browser API is promise based. The EM_JS functions below keep a small
 // state object per session in JavaScript and queue incoming frames there; C
-// polls (vnet_poll() -> tp_state / tp_recv), so no callback ever enters C and
-// nothing blocks.
+// polls (vnet_poll() -> tp_state / tp_recv), so nothing blocks. The one way
+// back into C is the optional wake callback (vnet_config.wake): when a frame is
+// queued or the session opens or fails, JavaScript calls wt_wake() through the
+// function table, and that calls the game's hook, which may only schedule a
+// poll.
 #include "relay_proto.h"
 #include "vnet_internal.h"
 
@@ -90,7 +93,11 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 // object is missing, as in an old browser or an insecure page) or the browser
 // refused the arguments. hash (32 bytes, or hashlen == 0) is a SHA-256
 // certificate hash for serverCertificateHashes.
-EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int inbox_frames, int max_frame, int ctl_max, int ctl_frames), {
+// wake_fn is a C function pointer (void (*)(void *)), or 0; it is called with
+// wake_arg whenever a frame is queued or the state changes, never after the
+// session was closed with vnet_wt_close.
+EM_JS_DEPS(vnet_wt_deps, "$getWasmTableEntry")
+EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int inbox_frames, int max_frame, int ctl_max, int ctl_frames, int wake_fn, int wake_arg), {
   var T = Module.vnetWT || (Module.vnetWT = { next: 1, s: {} });
   // Queue a frame for C. Datagrams: dropped when the queue is full or the
   // frame is not acceptable. Control frames: never dropped; too many waiting
@@ -99,12 +106,13 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
     T.enqueue = function (s, control, u8) {
       if (u8.length === 0 || u8.length > s.maxFrame) { s.drops++; return; }
       if (control) {
-        if (s.qc.length >= s.ctlFrames) { if (s.state !== 3) { s.state = 2; s.reason = "control queue overflow"; } return; }
+        if (s.qc.length >= s.ctlFrames) { if (s.state !== 3) { s.state = 2; s.reason = "control queue overflow"; s.wake(); } return; }
         s.qc.push(u8);
       } else {
         if (s.q.length >= s.inbox) { s.drops++; return; }
         s.q.push(u8);
       }
+      s.wake();
     };
   }
   if (typeof WebTransport === "undefined") return 0;
@@ -114,9 +122,18 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
   }
   var s = { id: T.next++, state: 0, q: [], qc: [], inbox: inbox_frames, maxFrame: max_frame, ctlFrames: ctl_frames,
             maxdg: 0, dgInFlight: 0, ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
+  // Tell C there is something to poll for. Not once the session is closed or
+  // gone (T.s no longer has it): C may have freed what the hook points at.
+  s.wake = function () { if (wake_fn && T.s[s.id] === s && s.state !== 3) getWasmTableEntry(wake_fn)(wake_arg); };
   try { s.wt = new WebTransport(UTF8ToString(url), opts); } catch (e) { return 0; }
   T.s[s.id] = s;
-  var fail = function (why) { if (s.state !== 3) { s.state = 2; if (!s.reason) s.reason = String(why); } };
+  var fail = function (why) {
+    if (s.state === 3) return;
+    var was = s.state;
+    s.state = 2;
+    if (!s.reason) s.reason = String(why);
+    if (was !== 2) s.wake();
+  };
   // After the session is up, any end of it is a failure; before, too.
   s.wt.closed.then(function () { fail("closed"); }, function (e) { fail(e); });
   s.wt.ready.then(function () {
@@ -157,7 +174,7 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
         pumpD();
       }, function (e) { fail(e); });
     })();
-    if (s.state === 0) s.state = 1;
+    if (s.state === 0) { s.state = 1; s.wake(); }
   }).catch(function (e) { fail(e); });
   return s.id;
 })
@@ -190,13 +207,14 @@ EM_JS(int, vnet_wt_recv, (int id, uint8_t *buf, int cap), {
 EM_JS(int, vnet_wt_send_control, (int id, const uint8_t *p, int n, int in_flight_max), {
   var s = Module.vnetWT && Module.vnetWT.s[id];
   if (!s || s.state !== 1 || !s.cw) return -1;
+  // (No wake here: this runs inside a vnet call, and the hook is for browser events.)
   if (s.ctlInFlight >= in_flight_max) { s.state = 2; s.reason = "control stream stuck"; return -1; }
   var m = new Uint8Array(2 + n);
   m[0] = n >> 8;
   m[1] = n & 255;
   m.set(HEAPU8.subarray(p, p + n), 2);
   s.ctlInFlight++;
-  s.cw.write(m).then(function () { s.ctlInFlight--; }, function (e) { s.ctlInFlight--; if (s.state !== 3) { s.state = 2; s.reason = String(e); } });
+  s.cw.write(m).then(function () { s.ctlInFlight--; }, function (e) { s.ctlInFlight--; if (s.state !== 3 && s.state !== 2) { s.state = 2; s.reason = String(e); s.wake(); } });
   return 0;
 })
 
@@ -234,6 +252,12 @@ typedef struct wt_tp {
   int failed_logged;
   size_t max_dgram;  // browser-reported maxDatagramSize, once open
 } wt_tp;
+
+// Called by JavaScript (see vnet_wt_open) from a promise handler.
+static void wt_wake(void *arg) {
+    wt_tp *t = arg;
+    vnet__wake(t->v);
+}
 
 static int tp_state(void *p) {
     wt_tp *t = p;
@@ -292,7 +316,7 @@ static void tp_destroy(void *p) {
     free(t);
 }
 
-static const relay_transport_ops wt_ops = {"relay-wt", 0, tp_state, tp_send, tp_recv, tp_destroy, tp_max_data_frame};
+static const relay_transport_ops wt_ops = {"relay-wt", 0, tp_state, tp_send, tp_recv, tp_destroy, tp_max_data_frame, NULL};
 
 int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const relay_transport_ops **ops,
                         void **tp) {
@@ -303,7 +327,8 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
     wt_tp *t = calloc(1, sizeof *t);
     if (!t) return VNET_ENOMEM;
     t->v = v;
-    t->id = vnet_wt_open(url, hash, hashlen, JS_INBOX_FRAMES, RELAY_MAX_FRAME, RELAY_WT_CTL_MAX, JS_CONTROL_FRAMES);
+    t->id = vnet_wt_open(url, hash, hashlen, JS_INBOX_FRAMES, RELAY_MAX_FRAME, RELAY_WT_CTL_MAX, JS_CONTROL_FRAMES,
+                         v->wake ? (int)(uintptr_t)&wt_wake : 0, (int)(uintptr_t)t);
     if (t->id <= 0) {
         free(t);
         return VNET_ENOTSUP;  // no WebTransport in this browser or page

@@ -1,21 +1,31 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * relay_peer: a small two-player program that talks through the vnet relay.
- * The same source is built natively (VNET_BACKEND_RELAY_UDP) and for the
- * browser with Emscripten (VNET_BACKEND_RELAY_WS), so a browser page and a
- * native process can share a room.
+ * The same source, with the same backend constant (VNET_BACKEND_RELAY_AUTO),
+ * is built natively (where it means the relay over UDP) and for the browser with
+ * Emscripten (WebTransport or WebSocket), so a browser page and a native process
+ * can share a room.
  *
  *   relay_peer --relay 127.0.0.1:7777                 create a room (host)
  *   relay_peer --relay 127.0.0.1:7777 --room K7M2QX   join it (guest)
  *   relay_peer --relay ws://localhost:8080/vnet ...   browser builds: a WebSocket URL
+ *   relay_peer --relay ws://h/vnet --relay-udp h:7777 ...   one command line for both
  *
- * Options: --count N (datagrams each way, default 100), --port P (default
- * 5000), --timeout MS (default 30000), --maxlen N (largest payload sent,
- * default 899, at most 1093), --verbose (print the library's log as "LOG ..."
- * lines), and for browser builds:
- *   --backend ws|wt|auto   ws (default for ws:// and wss:// URLs), wt (WebTransport
- *                          only; --relay is an https:// URL), auto (WebTransport,
- *                          then WebSocket; --relay is the WebSocket URL)
+ * The relay address goes to vnet_config.relay (a URL: used by browser builds) and,
+ * when it has no "scheme://" or --relay-udp is given, to vnet_config.relay_udp
+ * (used by native builds), so no #ifdef is needed to choose between them.
+ *
+ * Options: --relay-udp HOST:PORT (the relay's UDP address, for native builds),
+ * --count N (datagrams each way, default 100), --port P (default 5000),
+ * --timeout MS (default 30000), --maxlen N (largest payload sent, default 899,
+ * at most 1093), --verbose (print the library's log as "LOG ..." lines),
+ *   --backend auto|ws|wt|udp   auto (default): the same constant everywhere.
+ *                          In a browser, WebTransport then WebSocket (--relay is
+ *                          the WebSocket URL; a plain ws:// URL means WebSocket
+ *                          only); natively, the relay over UDP. ws and wt force
+ *                          one browser transport (wt: --relay is an https:// URL);
+ *                          udp forces the native one.
+ * and for browser builds:
  *   --relay-wt URL         auto: the WebTransport URL (default: derived from a wss:// --relay)
  *   --cert-hash HEX        SHA-256 of the relay's -dev-cert certificate
  *   --wt-timeout MS        auto: how long WebTransport gets before the fallback (default 3000)
@@ -277,7 +287,7 @@ static void sleep_ms(void) {
 
 int main(int argc, char **argv) {
     static peer p; /* zero-initialised */
-    const char *relay = NULL, *room = NULL, *backend = NULL, *relay_wt = NULL, *cert_hash = NULL;
+    const char *relay = NULL, *relay_udp = NULL, *room = NULL, *backend = NULL, *relay_wt = NULL, *cert_hash = NULL;
     int wt_timeout = 0, verbose = 0;
     p.count = 100;
     p.port = 5000;
@@ -286,6 +296,7 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         const char *val = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--relay") && val) relay = argv[++i];
+        else if (!strcmp(a, "--relay-udp") && val) relay_udp = argv[++i];
         else if (!strcmp(a, "--room") && val) room = argv[++i];
         else if (!strcmp(a, "--count") && val) p.count = atoi(argv[++i]);
         else if (!strcmp(a, "--port") && val) p.port = (unsigned)atoi(argv[++i]);
@@ -298,7 +309,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--verbose")) verbose = 1;
         else {
             fprintf(stderr,
-                    "usage: %s --relay HOST:PORT|ws://HOST:PORT/vnet [--room CODE] [--count N] [--port P] [--timeout MS]\n"
+                    "usage: %s --relay HOST:PORT|ws://HOST:PORT/vnet [--relay-udp HOST:PORT] [--room CODE] [--count N] [--port P] [--timeout MS]\n"
                     "          [--maxlen N] [--verbose] [--backend ws|wt|auto] [--relay-wt URL] [--cert-hash HEX] [--wt-timeout MS]\n",
                     argv[0]);
             return 2;
@@ -317,18 +328,19 @@ int main(int argc, char **argv) {
 
     vnet_config cfg;
     vnet_config_init(&cfg);
-    cfg.backend = (!strncmp(relay, "ws://", 5) || !strncmp(relay, "wss://", 6)) ? VNET_BACKEND_RELAY_WS
-                                                                                   : VNET_BACKEND_RELAY_UDP;
+    cfg.backend = VNET_BACKEND_RELAY_AUTO;  /* the same constant in every build */
     if (backend) {
         if (!strcmp(backend, "ws")) cfg.backend = VNET_BACKEND_RELAY_WS;
         else if (!strcmp(backend, "wt")) cfg.backend = VNET_BACKEND_RELAY_WT;
         else if (!strcmp(backend, "auto")) cfg.backend = VNET_BACKEND_RELAY_AUTO;
+        else if (!strcmp(backend, "udp")) cfg.backend = VNET_BACKEND_RELAY_UDP;
         else {
             fprintf(stderr, "unknown --backend\n");
             return 2;
         }
     }
     cfg.relay = relay;
+    cfg.relay_udp = relay_udp ? relay_udp : strstr(relay, "://") ? NULL : relay;
     cfg.relay_wt = relay_wt;
     cfg.relay_cert_sha256 = cert_hash;
     cfg.wt_timeout_ms = wt_timeout;
@@ -355,7 +367,8 @@ int main(int argc, char **argv) {
 #else
     while (!p.done) {
         step(&p);
-        if (!p.done) sleep_ms();
+        /* Sleep until a frame arrives (or 2 ms: the program has timers of its own). */
+        if (!p.done && vnet_wait(p.v, 2) == VNET_ENOTSUP) sleep_ms();
     }
 #endif
     vnet_destroy(p.v);

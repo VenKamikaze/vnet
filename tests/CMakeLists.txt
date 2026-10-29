@@ -38,11 +38,14 @@ add_executable(vnet_tests
     test_relay_client.cpp
     test_relay_ws_style.cpp
     test_relay_fallback.cpp
+    test_api_polish.cpp
+    test_inbox.cpp
     test_util.h
     relay_test_util.h)
 target_link_libraries(vnet_tests PRIVATE vnet GTest::gtest GTest::gtest_main)
 # The relay tests look at the protocol constants and the internal test seam.
 target_include_directories(vnet_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_definitions(vnet_tests PRIVATE VNET_PROJECT_VERSION="${PROJECT_VERSION}")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(vnet_tests PRIVATE -Wall -Wextra)
 endif()

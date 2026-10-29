@@ -9,14 +9,14 @@ Virtual UDP for games: a small, dependency-free C11 library with a non-blocking 
 | relay over UDP (`VNET_BACKEND_RELAY_UDP`) | native clients in shared rooms with virtual addresses `10.0.0.N` |
 | relay over WebSocket (`VNET_BACKEND_RELAY_WS`) | browser (Emscripten) clients, in the same rooms as native ones |
 | relay over WebTransport (`VNET_BACKEND_RELAY_WT`) | browser clients with real unreliable datagrams (no head-of-line blocking) |
-| browser auto (`VNET_BACKEND_RELAY_AUTO`) | WebTransport where it works, WebSocket where it does not; same game code |
+| auto (`VNET_BACKEND_RELAY_AUTO`) | one constant for every build: WebTransport then WebSocket in a browser, the relay over UDP natively; same game code |
 | impairment layer | latency, jitter, loss, duplication, reordering on top of any backend |
 
 The relay itself is a small Go server in [`relay/`](relay/README.md); its wire protocol is in [`doco/relay-protocol.md`](doco/relay-protocol.md). Work briefs and decisions are in [`doco/`](doco/README.md).
 
 vnet carries **unreliable, unordered datagrams only** (at most `VNET_MAX_DATAGRAM` = 1100 bytes). Reliability and ordering are the game protocol's job. Nothing blocks, there are no threads and no global state, and steady-state send/receive does not allocate.
 
-The API is documented in [`include/vnet.h`](include/vnet.h).
+The API is documented in [`include/vnet.h`](include/vnet.h). How to wire it into a game's loop (the per-frame sequence, the status states, what to do on `FAILED`, hidden browser tabs, vendoring without CMake, the API-stability policy) is in [`doco/integration.md`](doco/integration.md).
 
 ## Using it from CMake
 
@@ -26,13 +26,13 @@ As a subdirectory or with `FetchContent` (use `GIT_REPOSITORY`; archive download
 include(FetchContent)
 FetchContent_Declare(vnet
     GIT_REPOSITORY https://github.com/VenKamikaze/vnet.git
-    GIT_TAG        v0.3.0)          # pin a release tag or commit
+    GIT_TAG        v0.4.0)          # pin a release tag or commit
 FetchContent_MakeAvailable(vnet)
 
 target_link_libraries(mygame PRIVATE vnet::vnet)
 ```
 
-Releases are tagged `vMAJOR.MINOR.PATCH`, matching the CMake project version: `v0.1.0` (core, brief 06), `v0.2.0` (relay and WebSocket, brief 10), `v0.3.0` (WebTransport, brief 11). (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
+Releases are tagged `vMAJOR.MINOR.PATCH`, matching the CMake project version: `v0.1.0` (core, brief 06), `v0.2.0` (relay and WebSocket, brief 10), `v0.3.0` (WebTransport, brief 11), `v0.4.0` (API polish and browser lifecycle, brief 14). Pin an exact tag: from 0.3.0 on 0.x releases only add to the API, but CMake's `find_package(vnet 0.x)` treats every 0.x as compatible, which is more generous than that (policy in [`doco/integration.md`](doco/integration.md#api-stability)). (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
 
 Or install it and use `find_package`:
 
@@ -141,7 +141,7 @@ vnet_status_info st; vnet_status(v, &st);
 printf("connected over %s\n", st.transport);              /* "relay-wt" or "relay-ws" */
 ```
 
-`relay_wt` names the WebTransport URL when it differs from the one derived from `relay` (another port, or a `ws://` development relay); `relay_cert_sha256` pins a development certificate (leave it NULL in production); `wt_timeout_ms` is how long WebTransport gets before the WebSocket is tried (default 3 s). The fallback happens only before the room is entered: after `READY` the transport never changes (a lost session is `VNET_ECLOSED`, as before). Native builds return `VNET_ENOTSUP` for `RELAY_WT` and `RELAY_AUTO`; use `RELAY_UDP` there. Operating the WebTransport endpoint (certificates, firewall, Docker) is in [`relay/README.md`](relay/README.md#webtransport-http3-datagrams).
+`relay_wt` names the WebTransport URL when it differs from the one derived from `relay` (another port, or a `ws://` development relay); `relay_cert_sha256` pins a development certificate (leave it NULL in production); `wt_timeout_ms` is how long WebTransport gets before the WebSocket is tried (default 3 s). The fallback happens only before the room is entered: after `READY` the transport never changes (a lost session is `VNET_ECLOSED`, as before). Native builds return `VNET_ENOTSUP` for `RELAY_WT`, and `RELAY_AUTO` there means `RELAY_UDP`: give the relay's UDP address in `relay_udp` (or in `relay`, if it has no `scheme://`), so one `vnet_config` with both `relay` (the URL) and `relay_udp` (`host:port`) serves every build. `vnet_config.wake` is called from the browser event that queued a frame, so a hidden tab can poll from events (see [`doco/integration.md`](doco/integration.md#hidden-browser-tabs)). Operating the WebTransport endpoint (certificates, firewall, Docker) is in [`relay/README.md`](relay/README.md#webtransport-http3-datagrams).
 
 ## Testing under bad network conditions
 
@@ -151,7 +151,9 @@ Any context can be impaired from code (`vnet_config.impair`) or, with no code ch
 VNET_IMPAIR="lat=80,jit=20,loss=5,dup=1,reorder=3,seed=7" ./mygame
 ```
 
-Keys: `lat`, `jit` (ms), `loss`, `dup`, `reorder` (percent, decimals allowed), `rdelay` (extra ms for reordered packets, default 50), `seed`. The same seed, settings and sends give exactly the same outcome. **Without `seed=` every process gets seed 0 and therefore the same loss pattern**; give each peer its own (`seed=1`, `seed=2`, ...). Impairment is applied to what a context *sends*; delayed datagrams are released by `vnet_poll()`, so keep polling once per frame. A malformed `VNET_IMPAIR` makes `vnet_create()` fail rather than silently testing nothing; set `vnet_config.ignore_env` to opt out of the variable.
+Keys: `lat`, `jit` (ms), `loss`, `dup`, `reorder` (percent, decimals allowed), `rdelay` (extra ms for reordered packets, default 50), `burst` and `blen` (burst loss: a packet starts a burst of drops with probability `burst` percent, bursts last `blen` packets on average), `seed`. The same seed, settings and sends give exactly the same outcome. **Without `seed=` every process gets seed 0 and therefore the same loss pattern**; give each peer its own (`seed=1`, `seed=2`, ...). Impairment is applied to what a context *sends*; delayed datagrams are released by `vnet_poll()`, so keep polling once per frame. A malformed `VNET_IMPAIR` makes `vnet_create()` fail rather than silently testing nothing; set `vnet_config.ignore_env` to opt out of the variable.
+
+`vnet_set_impair(v, &imp)` changes the impairment of a live context (NULL turns it off): 500 ms of total loss and then recovery, a latency spike, an in-game debug menu. Datagrams already held back for delay are released on schedule.
 
 On the loopback backend time is virtual (`vnet_loopback_network_step(net, ms)`), so latency tests never sleep.
 
@@ -161,7 +163,7 @@ On the loopback backend time is virtual (`vnet_loopback_network_step(net, ms)`),
 cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
-`vnet_time(v)` gives the context's clock in milliseconds (virtual time on loopback), so timeout and RTT code can run on loopback in tests.
+`vnet_version()` returns the library's version string for logs. `vnet_wait(v, ms)` sleeps until a datagram may be waiting (UDP and relay-UDP; loopback and the browser say `VNET_ENOTSUP`), for headless peers and servers. `vnet_resolve_host()` is the blocking DNS lookup, for a worker thread or settings load. `vnet_time(v)` gives the context's clock in milliseconds (virtual time on loopback), so timeout and RTT code can run on loopback in tests.
 
 With Go installed, the same `ctest` run also builds the relay, runs its Go tests (`relay_go_tests`) and the integration tests that start it (option `VNET_BUILD_RELAY`, default on when `go` is found). `scripts/test-browser.sh` runs the Chromium test, and `scripts/loadtest.sh` the load sanity test (50 rooms x 4 clients x 30 packets/s).
 
