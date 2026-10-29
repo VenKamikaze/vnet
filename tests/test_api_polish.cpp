@@ -591,9 +591,10 @@ TEST(UdpReceiveBuffer, ABacklogBeyondTheKernelDefaultIsKept) {
     vnet_addr to = A("127.0.0.1:1");
     to.port = lb.port;
     for (int i = 0; i < 450; i++) ASSERT_EQ(Send(a, sa, "0123456789", to), 10);
+    // (macOS delivers loopback datagrams a moment late: wait for the stragglers.)
     int got = 0;
     std::string d;
-    while (Recv(b, sb, &d) >= 0) got++;
+    while (RecvWait(b, sb, &d, nullptr, 300) >= 0) got++;
     EXPECT_EQ(got, 450);
     vnet_destroy(a);
     vnet_destroy(b);

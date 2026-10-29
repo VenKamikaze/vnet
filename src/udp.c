@@ -34,8 +34,8 @@ typedef SOCKET sock_t;
 typedef int sa_len_t;
 typedef char *sockopt_t;
 typedef WSAPOLLFD pollfd_t;
-#define POLL_IN POLLRDNORM
-#define POLL_CALL(fds, n, ms) WSAPoll((fds), (ULONG)(n), (ms))
+#define VNET_POLL_IN POLLRDNORM
+#define VNET_POLL_CALL(fds, n, ms) WSAPoll((fds), (ULONG)(n), (ms))
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -45,8 +45,8 @@ typedef WSAPOLLFD pollfd_t;
 #include <sys/types.h>
 #include <unistd.h>
 typedef struct pollfd pollfd_t;
-#define POLL_IN POLLIN
-#define POLL_CALL(fds, n, ms) poll((fds), (nfds_t)(n), (ms))
+#define VNET_POLL_IN POLLIN
+#define VNET_POLL_CALL(fds, n, ms) poll((fds), (nfds_t)(n), (ms))
 typedef int sock_t;
 #define BAD_SOCK (-1)
 #define SOCK_ERRNO() errno
@@ -341,7 +341,7 @@ static int udp_wait(vnet *v, int timeout_ms) {
     for (int i = 0; i < st->n; i++) {
         if (!st->socks[i].used) continue;
         st->pfds[n].fd = st->socks[i].fd;
-        st->pfds[n].events = POLL_IN;
+        st->pfds[n].events = VNET_POLL_IN;
         st->pfds[n].revents = 0;
         n++;
     }
@@ -353,7 +353,7 @@ static int udp_wait(vnet *v, int timeout_ms) {
 #endif
         return 0;
     }
-    int rc = POLL_CALL(st->pfds, n, timeout_ms);
+    int rc = VNET_POLL_CALL(st->pfds, n, timeout_ms);
     if (rc > 0) return 1;
     if (rc == 0) return 0;
 #if defined(_WIN32)
