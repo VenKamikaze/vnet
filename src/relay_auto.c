@@ -22,6 +22,25 @@ int vnet__relay_auto_derive_wt_url(const char *ws, char *out, size_t cap) {
     return 0;
 }
 
+#if !defined(__EMSCRIPTEN__)
+// Natively RELAY_AUTO means RELAY_UDP: there is no browser to choose a transport
+// for, and the game keeps one backend constant for every build. The relay's UDP
+// address is `relay_udp`, or `relay` when that is not set and it is not a URL.
+int vnet__relay_auto_init(vnet *v, const vnet_config *cfg) {
+    const char *addr = NULL;
+    if (cfg->relay_udp && cfg->relay_udp[0]) addr = cfg->relay_udp;
+    else if (cfg->relay && cfg->relay[0] && !strstr(cfg->relay, "://")) addr = cfg->relay;
+    if (!addr) {
+        vnet__logf(v, VNET_LOG_ERROR,
+                   "VNET_BACKEND_RELAY_AUTO needs the relay's UDP address in a native build: set relay_udp "
+                   "(\"host:port\"); `relay` is used only if it has no \"scheme://\"");
+        return VNET_EINVAL;
+    }
+    vnet_config c = *cfg;
+    c.relay = addr;
+    return vnet__relay_udp_init(v, &c);
+}
+#else
 static int ws_fallback(vnet *v, const void *arg, const relay_transport_ops **ops, void **tp) {
     return vnet__relay_ws_make(v, (const char *)arg, ops, tp);
 }
@@ -55,3 +74,4 @@ int vnet__relay_auto_init(vnet *v, const vnet_config *cfg) {
     return vnet__relay_init_fallback(v, cfg, ops, tp, cfg->wt_timeout_ms > 0 ? (unsigned)cfg->wt_timeout_ms : 3000u,
                                      ws_fallback, ws_url, strlen(ws_url) + 1);
 }
+#endif /* __EMSCRIPTEN__ */

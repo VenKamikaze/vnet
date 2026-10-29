@@ -1070,6 +1070,69 @@ TEST_F(RelayClient, WebSocketBackendIsUnavailableOnNativeBuilds) {
     EXPECT_EQ(err, VNET_ENOTSUP);
 }
 
+// ---- VNET_BACKEND_RELAY_AUTO natively means RELAY_UDP (relay_udp, else relay)
+
+TEST_F(RelayClient, AutoUsesRelayUdpWhenSet) {
+    addr = relay.addr();
+    vnet_config cfg = RelayUdpConfig(relay, &clk);
+    cfg.backend = VNET_BACKEND_RELAY_AUTO;
+    cfg.relay = "wss://relay.example.org/vnet";  // the browser's URL, ignored natively
+    cfg.relay_udp = addr.c_str();
+    int err = 0;
+    v = vnet_create(&cfg, &err);
+    ASSERT_NE(v, nullptr) << vnet_strerror(err);
+    EXPECT_TRUE(relay.RecvType(RELAY_T_CREATE, &req));
+    vnet_status_info st;
+    EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_CONNECTING);
+    EXPECT_STREQ(st.transport, "relay-udp");
+    Enter(3);
+    EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_READY);
+    EXPECT_EQ(st.self.bytes[3], 3);
+}
+
+TEST_F(RelayClient, AutoFallsBackToRelayWhenItHasNoScheme) {
+    addr = relay.addr();
+    vnet_config cfg = RelayUdpConfig(relay, &clk, "k7m2qx");
+    cfg.backend = VNET_BACKEND_RELAY_AUTO;
+    cfg.relay = addr.c_str();
+    int err = 0;
+    v = vnet_create(&cfg, &err);
+    ASSERT_NE(v, nullptr) << vnet_strerror(err);
+    EXPECT_TRUE(relay.RecvType(RELAY_T_JOIN, &req));
+}
+
+TEST_F(RelayClient, AutoPrefersRelayUdpOverAnAddressInRelay) {
+    std::string other = "127.0.0.1:" + std::to_string(relay.port() == 65535 ? 1 : relay.port() + 1);
+    addr = relay.addr();
+    vnet_config cfg = RelayUdpConfig(relay, &clk);
+    cfg.backend = VNET_BACKEND_RELAY_AUTO;
+    cfg.relay = other.c_str();
+    cfg.relay_udp = addr.c_str();
+    v = vnet_create(&cfg, nullptr);
+    ASSERT_NE(v, nullptr);
+    EXPECT_TRUE(relay.RecvType(RELAY_T_CREATE, &req)) << "relay_udp wins";
+}
+
+TEST_F(RelayClient, AutoWithoutAUdpAddressIsAnErrorThatSaysSo) {
+    std::vector<std::string> log;
+    auto sink = [](void *u, int, const char *m) { static_cast<std::vector<std::string> *>(u)->push_back(m); };
+    for (const char *relay_arg : {(const char *)nullptr, "", "ws://127.0.0.1:1/vnet", "wss://x/vnet", "https://x:1/vnet"}) {
+        log.clear();
+        vnet_config cfg;
+        vnet_config_init(&cfg);
+        cfg.backend = VNET_BACKEND_RELAY_AUTO;
+        cfg.relay = relay_arg;
+        cfg.ignore_env = 1;
+        cfg.log = sink;
+        cfg.log_user = &log;
+        int err = 0;
+        EXPECT_EQ(vnet_create(&cfg, &err), nullptr) << (relay_arg ? relay_arg : "(null)");
+        EXPECT_EQ(err, VNET_EINVAL);
+        ASSERT_FALSE(log.empty());
+        EXPECT_NE(log[0].find("relay_udp"), std::string::npos) << log[0];
+    }
+}
+
 TEST_F(RelayClient, StatusIsGenericForEveryBackend) {
     vnet_loopback_network *net = vnet_loopback_network_create();
     vnet *lb = LoopbackHost(net);

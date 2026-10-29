@@ -4,6 +4,7 @@
 // arrive between frames, run the callbacks below, and queue frames in a
 // ring; vnet_poll() moves them on into the sockets' receive queues, so no
 // vnet call ever blocks.
+#include "relay_inbox.h"
 #include "relay_proto.h"
 #include "vnet_internal.h"
 
@@ -27,15 +28,17 @@ int vnet__relay_ws_make(vnet *v, const char *url, const relay_transport_ops **op
 #include <stdlib.h>
 #include <string.h>
 
+// DATA frames waiting for vnet_poll(); more are dropped (a lossy network).
+// Control frames (ROOM, ERROR, KEEPALIVE ...) wait in a ring of their own and
+// are never pushed out by a burst of datagrams: an unpolled page that fills the
+// DATA ring still hears its KEEPALIVE answer or an ERROR(CLOSED). So many
+// control frames waiting means vnet_poll() has not run for a very long time:
+// the transport is declared failed, as relay_wt.c does.
 #define INBOX_FRAMES 256
+#define INBOX_CONTROL_FRAMES 64
 // A WebSocket whose send buffer is this full is not keeping up: new datagrams
 // are dropped rather than queued behind stale ones (vnet is unreliable).
 #define MAX_BUFFERED_BYTES 65536
-
-typedef struct inbox_frame {
-    size_t len;
-    uint8_t data[RELAY_MAX_FRAME];
-} inbox_frame;
 
 // A browser cannot tell why a WebSocket failed to open: a relay that is down
 // and a relay that answered HTTP 503 (this address has too many sockets
@@ -47,10 +50,10 @@ typedef struct inbox_frame {
 #define CONNECT_BACKOFF_MAX_MS 1000.0
 
 typedef struct ws_tp {
+    vnet *v;  // for the wake callback
     EMSCRIPTEN_WEBSOCKET_T ws;
     int state;  // RELAY_TP_*
-    int head, count;
-    inbox_frame *inbox;
+    relay_inbox *inbox;
     char url[512];
     int attempts;        // failed attempts to open so far
     int retry_pending;   // a reconnect is scheduled
@@ -90,13 +93,17 @@ static void failed(ws_tp *t) {
         return;
     }
     t->state = RELAY_TP_FAILED;
+    vnet__wake(t->v);
 }
 
 static EM_BOOL on_open(int type, const EmscriptenWebSocketOpenEvent *e, void *user) {
     (void)type;
     (void)e;
     ws_tp *t = user;
-    if (t->state == RELAY_TP_CONNECTING) t->state = RELAY_TP_OPEN;
+    if (t->state == RELAY_TP_CONNECTING) {
+        t->state = RELAY_TP_OPEN;
+        vnet__wake(t->v);
+    }
     return EM_TRUE;
 }
 
@@ -118,11 +125,13 @@ static EM_BOOL on_message(int type, const EmscriptenWebSocketMessageEvent *e, vo
     (void)type;
     ws_tp *t = user;
     if (e->isText || e->numBytes == 0 || e->numBytes > RELAY_MAX_FRAME) return EM_TRUE;  // not a vnet frame
-    if (t->count == INBOX_FRAMES) return EM_TRUE;  // overflow: dropped, like a lossy network
-    inbox_frame *f = &t->inbox[(t->head + t->count) % INBOX_FRAMES];
-    t->count++;
-    f->len = e->numBytes;
-    memcpy(f->data, e->data, e->numBytes);
+    int rc = relay_inbox_push(t->inbox, e->data, e->numBytes);
+    if (rc == RELAY_INBOX_OVERFLOW) {
+        if (t->state != RELAY_TP_FAILED) t->state = RELAY_TP_FAILED;
+        vnet__wake(t->v);
+    } else if (rc != RELAY_INBOX_DROPPED) {
+        vnet__wake(t->v);  // a frame is waiting for vnet_poll()
+    }
     return EM_TRUE;
 }
 
@@ -153,13 +162,7 @@ static int tp_send(void *p, const uint8_t *frame, size_t len) {
 
 static int tp_recv(void *p, uint8_t *buf, size_t cap) {
     ws_tp *t = p;
-    if (t->count == 0) return VNET_EAGAIN;
-    inbox_frame *f = &t->inbox[t->head];
-    t->head = (t->head + 1) % INBOX_FRAMES;
-    t->count--;
-    if (f->len > cap) return VNET_EMSGSIZE;
-    memcpy(buf, f->data, f->len);
-    return (int)f->len;
+    return relay_inbox_pop(t->inbox, buf, cap);
 }
 
 static void tp_destroy(void *p) {
@@ -170,7 +173,7 @@ static void tp_destroy(void *p) {
         emscripten_websocket_close(t->ws, 1000, "bye");
         emscripten_websocket_delete(t->ws);
     }
-    free(t->inbox);
+    relay_inbox_destroy(t->inbox);
     free(t);
 }
 
@@ -183,7 +186,8 @@ int vnet__relay_ws_make(vnet *v, const char *url, const relay_transport_ops **op
     if (!emscripten_websocket_is_supported()) return VNET_ENOTSUP;
     ws_tp *t = calloc(1, sizeof *t);
     if (!t) return VNET_ENOMEM;
-    t->inbox = calloc(INBOX_FRAMES, sizeof *t->inbox);
+    t->v = v;
+    t->inbox = relay_inbox_create(INBOX_FRAMES, INBOX_CONTROL_FRAMES);
     if (!t->inbox) {
         free(t);
         return VNET_ENOMEM;

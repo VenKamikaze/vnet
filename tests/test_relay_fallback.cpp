@@ -557,11 +557,12 @@ TEST(RelayAutoArguments, BadArgumentsAreRejectedAndBrowserOnlyBackendsSayTheyAre
         int want;
     } cases[] = {
         {VNET_BACKEND_RELAY_AUTO, nullptr, nullptr, VNET_EINVAL},
-        {VNET_BACKEND_RELAY_AUTO, "127.0.0.1:7777", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_AUTO, "https://x/vnet", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_AUTO, "wss://x/vnet", "nothex", VNET_EINVAL},
-        {VNET_BACKEND_RELAY_AUTO, "wss://x/vnet", nullptr, VNET_ENOTSUP},
-        {VNET_BACKEND_RELAY_AUTO, "ws://x/vnet", nullptr, VNET_ENOTSUP},
+        // Natively AUTO means RELAY_UDP (0.4.0): a URL is not a UDP address,
+        // and there is no relay_udp. (Before 0.4.0 these were VNET_ENOTSUP.)
+        {VNET_BACKEND_RELAY_AUTO, "wss://x/vnet", nullptr, VNET_EINVAL},
+        {VNET_BACKEND_RELAY_AUTO, "ws://x/vnet", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_WT, "ws://x/vnet", nullptr, VNET_EINVAL},
         {VNET_BACKEND_RELAY_WT, "https://x:1/vnet", "00", VNET_EINVAL},
         {VNET_BACKEND_RELAY_WT, "https://x:1/vnet", nullptr, VNET_ENOTSUP},
