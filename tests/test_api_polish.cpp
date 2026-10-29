@@ -517,6 +517,20 @@ TEST(ResolveHost, TheResultIsUsableAsAnAddressForCreate) {
     EXPECT_TRUE(vnet_addr_equal(&a, &b));
 }
 
+TEST(ResolveHost, LocalhostIsLoopbackInTheFamilyAskedFor) {
+    vnet_addr a;
+    // No network and no ::1 interface needed: both are answered without a lookup.
+    ASSERT_EQ(vnet_resolve_host("localhost:77", VNET_FAMILY_IPV6, &a), 0);
+    EXPECT_EQ(Str(a), "[::1]:77");
+    ASSERT_EQ(vnet_resolve_host("localhost:77", VNET_FAMILY_IPV4, &a), 0);
+    EXPECT_EQ(Str(a), "127.0.0.1:77");
+    ASSERT_EQ(vnet_resolve_host("localhost:77", VNET_FAMILY_ANY, &a), 0);
+    EXPECT_EQ(Str(a), "127.0.0.1:77");
+    EXPECT_EQ(vnet_resolve_host("localhost:", VNET_FAMILY_IPV6, &a), VNET_EINVAL);
+    EXPECT_EQ(vnet_resolve_host("localhost:99999", VNET_FAMILY_IPV6, &a), VNET_EINVAL);
+    EXPECT_EQ(vnet_resolve_host("localhost:12345678901234567890", VNET_FAMILY_IPV6, &a), VNET_EINVAL);
+}
+
 TEST(ResolveHost, FamilyFilter) {
     vnet_addr a;
     EXPECT_EQ(vnet_resolve_host("[::1]:80", VNET_FAMILY_IPV4, &a), VNET_EAFNOSUPPORT);

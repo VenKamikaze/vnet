@@ -12,7 +12,9 @@
 //   driven:  the page has no main loop at all (requestAnimationFrame is stubbed
 //            out too). Each wake schedules one poll; the whole exchange (the
 //            transport opening, the handshake, the room, the datagrams and their
-//            echoes) runs on wake-ups alone.
+//            echoes) runs on wake-ups. A 1 Hz timer polls too, as a real page
+//            must: vnet's own timers (connect retries, the fallback, handshake
+//            timeout, keepalives) are not events and run only inside vnet_poll().
 //
 //   node wake_browser.test.js --relay-bin PATH --probe-bin PATH --web-dir DIR
 'use strict';
@@ -90,7 +92,7 @@ async function main() {
         check(c.ready === 1, 'the page opened its transport, handshook and entered a room with nothing but wake-ups');
         check(r.ok === true && r.sent === N && r.echoed === N, `the native guest got all ${N} echoes: ${JSON.stringify(r)}`);
         check(c.received === N && c.echoed === N, `the page received and echoed ${N} (${JSON.stringify(c)})`);
-        check(c.wakes > N && c.polls > 0 && c.polls <= c.wakes, `it polled only after wake-ups (${c.polls} polls for ${c.wakes} wakes)`);
+        check(c.wakes > N && c.polls > 0 && c.polls <= c.wakes + c.timers, `it polled only after wake-ups and its 1 Hz timer (${c.polls} polls for ${c.wakes} wakes and ${c.timers} timer ticks)`);
         check(p.errors.length === 0, 'no page errors ' + p.errors.join('; '));
         await p.ctx.close();
       }

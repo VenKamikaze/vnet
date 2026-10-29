@@ -52,9 +52,13 @@
  *
  * API stability (see doco/integration.md): from 0.3.0 on, 0.x releases only
  * add. New fields go at the END of vnet_config, vnet_impair and
- * vnet_status_info (so a zeroed or vnet_config_init()ed struct keeps its
- * meaning), and new functions, error codes and backends may appear; nothing is
- * removed, renamed or reinterpreted. 1.0 follows once Bit Riot's native and
+ * vnet_status_info (so source written for an older version, with its structs
+ * zeroed or vnet_config_init()ed, keeps its meaning when rebuilt), and new
+ * functions, error codes and backends may appear; nothing is removed, renamed
+ * or reinterpreted. This is source compatibility, not binary: vnet is a static
+ * library whose structs grow, so rebuild your code against the header of the
+ * vnet you link (never mix a new library with objects compiled against an old
+ * header). 1.0 follows once Bit Riot's native and
  * browser netplay have used it. CMake's SameMajorVersion treats every 0.x as
  * compatible, which is more generous than that promise: pin an exact release
  * tag.
@@ -315,8 +319,13 @@ typedef uint64_t (*vnet_clock_fn)(void *user);
  * and when the transport opens, fails or closes. It must do nothing but
  * arrange for vnet_poll() to run soon (set a flag, post a message, call
  * emscripten_async_call()): it must NOT call any vnet function, and it must
- * not block. It may be called at any time between the start of vnet_create()
- * and vnet_destroy(), and never after vnet_destroy() returns.
+ * not block. It is called from browser events only (never from inside a vnet
+ * call), at any time between the start of vnet_create() and vnet_destroy(), and
+ * never after vnet_destroy() returns. It does not replace polling on a timer:
+ * vnet's own timers (a WebSocket connect retry, the WebTransport-to-WebSocket
+ * fallback, the handshake timeout, keepalives) run only inside vnet_poll(), so
+ * keep a timer-driven poll going as well (once a second is plenty) and use the
+ * wake to poll sooner.
  */
 typedef void (*vnet_wake_fn)(void *user);
 

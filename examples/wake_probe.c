@@ -11,9 +11,13 @@
  *                     receives the datagrams that arrive afterwards.
  *     --mode drive    has no main loop at all. Every wake schedules one poll
  *                     with emscripten_async_call(); the poll drains the sockets
- *                     and echoes. The whole exchange runs on wake-ups.
+ *                     and echoes. The connection and the whole exchange run on
+ *                     wake-ups. A 1 Hz timer polls as well: vnet's own timers (a
+ *                     WebSocket connect retry, the WebTransport fallback, the
+ *                     handshake timeout, keepalives) are not events and run only
+ *                     inside vnet_poll(), so a real page needs it too.
  *   Counters are published as window.vnetWake = {wakes, polls, received,
- *   echoed, ready} and a "ROOM <code> <addr> <transport>" line is printed.
+ *   echoed, timers, ready} and a "ROOM <code> <addr> <transport>" line is printed.
  *
  *   Native build, the "guest": joins the room with --room and sends --count
  *   datagrams to room-host:5000 (10 ms apart), waiting with vnet_wait() instead
@@ -45,7 +49,7 @@ typedef struct probe {
     int sock;
     int drive;     /* browser: wake-driven, no main loop */
     int ready;
-    unsigned wakes, polls, received, echoed;
+    unsigned wakes, polls, received, echoed, timers;
     int scheduled; /* a poll is already queued by a wake */
     int done;
 } probe;
@@ -54,9 +58,10 @@ static probe g;
 
 #if defined(__EMSCRIPTEN__)
 static void publish(void) {
-    char script[200];
-    snprintf(script, sizeof script, "window.vnetWake={wakes:%u,polls:%u,received:%u,echoed:%u,ready:%d};", g.wakes,
-             g.polls, g.received, g.echoed, g.ready);
+    char script[240];
+    snprintf(script, sizeof script,
+             "window.vnetWake={wakes:%u,polls:%u,received:%u,echoed:%u,timers:%u,ready:%d};", g.wakes, g.polls,
+             g.received, g.echoed, g.timers, g.ready);
     emscripten_run_script(script);
 }
 
@@ -89,6 +94,14 @@ static void poll_scheduled(void *arg) {
     (void)arg;
     g.scheduled = 0;
     service();
+}
+
+/* The safety timer of the driven page: once a second, whatever the wakes did. */
+static void timer_tick(void *arg) {
+    (void)arg;
+    g.timers++;
+    service();
+    emscripten_async_call(timer_tick, NULL, 1000);
 }
 
 /* The wake callback: it may only arrange for a poll. (Counting is fine too.) */
@@ -183,6 +196,7 @@ int main(int argc, char **argv) {
     publish();
     if (g.drive) {
         /* No main loop: the first wake (the transport opening) starts it all. */
+        emscripten_async_call(timer_tick, NULL, 1000);
         emscripten_exit_with_live_runtime();
     }
     emscripten_set_main_loop(frozen_loop, 50, 0); /* a timer loop: 50 Hz */

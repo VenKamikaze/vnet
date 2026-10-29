@@ -3,6 +3,7 @@
 // backend does for its relay address. The only place vnet calls getaddrinfo().
 #include "vnet_internal.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -93,6 +94,14 @@ int vnet__resolve_host(vnet *inner, const char *hp, int family, vnet_addr *out) 
 int vnet_resolve_host(const char *host_port, int family, vnet_addr *out) {
     if (!host_port || !out) return VNET_EINVAL;
     if (family != VNET_FAMILY_ANY && family != VNET_FAMILY_IPV4 && family != VNET_FAMILY_IPV6) return VNET_EINVAL;
+    // vnet_resolve() maps the literal "localhost" to 127.0.0.1; asked for IPv6
+    // the same name is ::1 (no lookup needed either).
+    char local6[40];
+    if (family == VNET_FAMILY_IPV6 && strncmp(host_port, "localhost:", 10) == 0) {
+        if (strlen(host_port + 10) > 16) return VNET_EINVAL;
+        snprintf(local6, sizeof local6, "[::1]:%s", host_port + 10);
+        host_port = local6;
+    }
     vnet_addr a;
     memset(&a, 0, sizeof a);
 #if defined(_WIN32)

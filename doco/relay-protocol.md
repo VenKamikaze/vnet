@@ -113,8 +113,8 @@ WebTransport gives a browser what WebSocket cannot: **unreliable datagrams** tha
 - `10.0.0.1` is **never reissued** while the room exists, even after the creator has left (the room stays open for the others, with one slot fewer). There is no host migration; rejoining as the host is not possible.
 - A late datagram meant for a member that has left can reach whoever later gets that address. Games that care should put their own session id in their packets.
 - A member may send to its own address; the relay delivers it back. A destination that is not a current member of the sender's room (an address that is free, outside `10.0.0.0/24`, or a member of another room) is dropped and counted (`unroutable`).
-- Member cap: 8 by default, `2`-`254` configurable (`-max-members`). One cap for the whole relay.
-- **Reserved addresses: `10.0.0.254` and `10.0.0.255` are never a player.** They are set aside for a future relay-side pseudo-member (`.254`: for example the gateway to a native server, see [Future extensions](#future-extensions)) and for broadcast (`.255`). A client must not treat a datagram from either as a player's, and must not use either as a player address. **Known gap:** the relay still accepts `-max-members 254`, which would hand `.254` to a joiner in such a room; it will refuse values above 253 in the brief that first uses the reservation (nothing in the default configuration, or anything below 254, is affected).
+- Member cap: 8 by default, `2`-`253` configurable (`-max-members`). One cap for the whole relay.
+- **Reserved addresses: `10.0.0.254` and `10.0.0.255` are never a player.** They are set aside for a future relay-side pseudo-member (`.254`: for example the gateway to a native server, see [Future extensions](#future-extensions)) and for broadcast (`.255`). A client must not treat a datagram from either as a player's, and must not use either as a player address. The relay enforces it: `-max-members` is at most 253, so `.254` is never handed to a joiner (before vnet 0.4.0 it accepted 254).
 
 ## Sessions, keepalive and timeouts
 

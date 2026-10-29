@@ -5,6 +5,11 @@
 // push out other datagrams (like a lossy network) but never a KEEPALIVE answer
 // or an ERROR. relay_wt.c keeps the same split in JavaScript. This file is
 // plain C and is built everywhere so that the native tests can drive it.
+//
+// Order: control frames come out before DATA frames, so an ERROR(CLOSED) that
+// arrived after some datagrams is seen before them, and the datagrams still
+// queued behind it are then of no use: the session has ended. A KEEPALIVE
+// answer likewise overtakes datagrams. Unreliable datagrams, so nothing is owed.
 #ifndef VNET_RELAY_INBOX_H
 #define VNET_RELAY_INBOX_H
 

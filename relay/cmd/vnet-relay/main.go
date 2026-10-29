@@ -34,7 +34,7 @@ func main() {
 	var (
 		udpAddr    = fs.String("udp", ":7777", "UDP listen address for native clients (empty disables)")
 		httpAddr   = fs.String("http", ":8080", "HTTP listen address; WebSocket clients connect to /vnet (empty disables)")
-		maxMembers = fs.Int("max-members", 8, "members per room, including the creator (2..254)")
+		maxMembers = fs.Int("max-members", 8, "members per room, including the creator (2..253; 10.0.0.254 and .255 are reserved)")
 		maxRooms   = fs.Int("max-rooms", 1000, "rooms at once")
 		maxSess    = fs.Int("max-sessions", 20000, "members at once (also caps open WebSockets)")
 		perIPSess  = fs.Int("max-sessions-per-ip", 128, "members at once per source address (IPv6: per /64); many players behind one NAT share it")

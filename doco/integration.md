@@ -17,10 +17,12 @@ int state = vnet_status(v, &st);                   /* 2. where are we? (see the 
 if (state == VNET_STATUS_READY) {
     uint8_t buf[VNET_MAX_DATAGRAM];
     vnet_addr from;
-    int n;
-    while ((n = vnet_recvfrom(v, sock, buf, sizeof buf, &from)) >= 0)   /* 3. drain until EAGAIN */
-        handle_packet(&from, buf, (size_t)n);
-    /* n is now VNET_EAGAIN (nothing more), or VNET_EMSGSIZE / VNET_EIO: keep draining */
+    for (;;) {                                     /* 3. drain until EAGAIN */
+        int n = vnet_recvfrom(v, sock, buf, sizeof buf, &from);
+        if (n >= 0) handle_packet(&from, buf, (size_t)n);
+        else if (n == VNET_EAGAIN || n == VNET_EIO) break;   /* nothing more / transient: next frame */
+        /* VNET_EMSGSIZE: that datagram was consumed (a bug in your buffer size); carry on */
+    }
 }
 
 game_logic();                                      /* 4. */
@@ -109,7 +111,7 @@ Nothing blocks in a browser: the connection is made by events between frames, an
 A tab in the background stops `requestAnimationFrame` altogether and runs timers at about 1 Hz. Two facts make that survivable:
 
 1. **The session survives.** The relay keeps a WebSocket or WebTransport session alive for as long as the connection answers its pings, and browsers answer those by themselves. vnet does not read a pause as a dead relay: if more than one keepalive interval passes between two `vnet_poll()` calls it restarts its silence and handshake clocks and sends a `KEEPALIVE` at once. A page that comes back after a minute is still in its room. (Natively the same logic covers a debugger or a sleeping laptop, but over UDP the relay itself drops a member that was silent for 15 s, so a longer pause ends in `VNET_ECLOSED` as soon as the first `KEEPALIVE` is answered.)
-2. **Network events are not throttled, so poll from them.** Set `vnet_config.wake`; the WebSocket and WebTransport transports call it from the browser event that queues a frame or changes the transport's state:
+2. **Network events are not throttled, so poll from them, as well as from a timer.** Set `vnet_config.wake`; the WebSocket and WebTransport transports call it from the browser event that queues a frame or changes the transport's state:
 
 ```c
 static void on_wake(void *user) {
@@ -120,7 +122,13 @@ static void on_wake(void *user) {
 cfg.wake = on_wake;
 ```
 
-The callback may be called at any time between `vnet_create()` and `vnet_destroy()` (never after), it must not call any vnet function and must not block, and it may be called many times for one poll (coalesce with a flag). Native backends never call it. `examples/wake_probe.c` and `tests/browser/wake_browser.test.js` are a working page with no main loop at all that runs a whole exchange on wake-ups, and a page whose loop is frozen.
+The callback is called from browser events only (never from inside a vnet call), at any time between `vnet_create()` and `vnet_destroy()` (never after); it must not call any vnet function and must not block, and it may be called many times for one poll (coalesce with a flag). Native backends never call it.
+
+**The wake does not replace a timer.** Frames and state changes call it; vnet's own timers do not, because they are not events: a failed WebSocket connect is retried (with backoff) only inside `vnet_poll()`, the WebTransport-to-WebSocket fallback deadline, the handshake timeout and the keepalives likewise, and a connection that never delivers a frame never wakes you. A page that polls from wake-ups alone stays `CONNECTING` forever behind a relay that is slow to refuse. So keep a **timer-driven poll** (`emscripten_async_call` re-arming itself, `setTimeout`, about once a second is plenty) running alongside the wake, and let the wake poll *sooner*. Mind the throttling: a hidden tab's timers run at about 1 Hz, and after about five minutes hidden Chrome's intensive throttling can run them as rarely as once a minute (Bit Riot brief 12 has the details). That is enough for vnet (a gap of more than a keepalive interval is treated as sleep and the session survives, point 1), and it is why the wake matters: the game itself keeps stepping from the network events, which are not throttled.
+
+In a WebSocket page, control frames overtake queued datagrams (they have a queue of their own so that a burst of datagrams cannot push them out): an `ERROR(CLOSED)` can be seen before datagrams that arrived earlier, which are then of no use because the session has ended. Under D7 nothing is owed to a lost datagram.
+
+`examples/wake_probe.c` and `tests/browser/wake_browser.test.js` are a working page with no main loop at all, a 1 Hz safety timer and a wake that schedules each poll (the exchange itself is driven by the wake-ups; the timer is there for vnet's own timers), and a page whose loop is frozen.
 
 Keeping a lockstep game stepping in a hidden tab (what to simulate when) is Bit Riot brief 12's business; this is the hook it needs.
 
@@ -153,7 +161,7 @@ A `pkg-config` file and a single-file amalgamation are not provided.
 
 ## API stability
 
-- From **0.3.0** on, 0.x releases are **additive only**: new functions, error codes, backends and config/status/impairment fields. New fields go at the **end** of `vnet_config`, `vnet_impair` and `vnet_status_info`, so a zeroed (or `vnet_config_init`ed) struct keeps its meaning and code compiled against an older header still works. Nothing is removed, renamed or reinterpreted. Relay protocol version 1 is frozen (see [Versioning](relay-protocol.md#versioning)).
+- From **0.3.0** on, 0.x releases are **additive only**: new functions, error codes, backends and config/status/impairment fields. New fields go at the **end** of `vnet_config`, `vnet_impair` and `vnet_status_info`, so code written for an older version, with its structs zeroed or `vnet_config_init`ed, keeps its meaning **when rebuilt**. Nothing is removed, renamed or reinterpreted. This is *source* compatibility, not binary: vnet is a static library whose structs grow (an old object file would hand a new `vnet_create()` a config that is too short, and a `vnet_status()` a struct that is too small), so rebuild your code against the header of the vnet you link, and never mix a new library with objects built against an old header. Relay protocol version 1 is frozen (see [Versioning](relay-protocol.md#versioning)).
 - **1.0** comes after Bit Riot's native and browser netplay (briefs 07 and 12) have consumed the API.
 - **`SameMajorVersion` caveat.** The installed CMake package declares compatibility `SameMajorVersion`, which makes `find_package(vnet 0.4)` accept any 0.x. That is more generous than semver's 0.x rule (any minor may break) and than this policy (additive), and it cannot tell you a release is *older* in a way that matters to you. **Pin an exact release tag** (`GIT_TAG v0.4.0`) and bump it on purpose.
 - A shared-library build, if one is ever offered, would add a `size` field to `vnet_status_info` first; as a static library it needs none.

@@ -28,7 +28,7 @@ Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper ca
 |---|---|---|
 | `-udp` | `:7777` | UDP listen address; empty disables native clients |
 | `-http` | `:8080` | HTTP listen address; empty disables WebSocket. Serves `/vnet`, `/healthz`, `/stats` |
-| `-max-members` | 8 | members per room, creator included (2..254) |
+| `-max-members` | 8 | members per room, creator included (2..253; `10.0.0.254` and `.255` are reserved) |
 | `-max-rooms` | 1000 | rooms at once |
 | `-max-sessions` | 20000 | members at once (also caps open WebSockets and WebTransport connections, together) |
 | `-max-wt` | 4000 | WebTransport (QUIC) connections at once, with or without a session, from anywhere. Each costs roughly 150 to 250 KB of memory, far more than a WebSocket, so this cap is separate from (and below) `-max-sessions`; see [sizing](#sizing-webtransport) |

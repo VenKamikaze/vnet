@@ -207,7 +207,8 @@ EM_JS(int, vnet_wt_recv, (int id, uint8_t *buf, int cap), {
 EM_JS(int, vnet_wt_send_control, (int id, const uint8_t *p, int n, int in_flight_max), {
   var s = Module.vnetWT && Module.vnetWT.s[id];
   if (!s || s.state !== 1 || !s.cw) return -1;
-  if (s.ctlInFlight >= in_flight_max) { s.state = 2; s.reason = "control stream stuck"; s.wake(); return -1; }
+  // (No wake here: this runs inside a vnet call, and the hook is for browser events.)
+  if (s.ctlInFlight >= in_flight_max) { s.state = 2; s.reason = "control stream stuck"; return -1; }
   var m = new Uint8Array(2 + n);
   m[0] = n >> 8;
   m[1] = n & 255;

@@ -1602,6 +1602,19 @@ func TestConfigRejectsKeepaliveThatWouldTimeOutHealthyClients(t *testing.T) {
 	}
 }
 
+// 10.0.0.254 and 10.0.0.255 are reserved (doco/relay-protocol.md): a room can
+// never be big enough to hand either to a player.
+func TestMaxMembersStopsBeforeTheReservedAddresses(t *testing.T) {
+	if _, err := New(Config{MaxMembers: 253}); err != nil {
+		t.Fatalf("253 members (.1 to .253) must be accepted: %v", err)
+	}
+	for _, n := range []int{254, 255, 1000} {
+		if _, err := New(Config{MaxMembers: n}); err == nil {
+			t.Fatalf("MaxMembers %d would allow 10.0.0.254 as a player", n)
+		}
+	}
+}
+
 func TestForwardedForUsesTheEntryOurProxyAdded(t *testing.T) {
 	srv, err := New(Config{TrustForwardedFor: true})
 	if err != nil {

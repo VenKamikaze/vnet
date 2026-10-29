@@ -11,7 +11,7 @@ import (
 // "use the default" (see withDefaults); nothing is unlimited.
 type Config struct {
 	// Rooms.
-	MaxMembers  int // members per room incl. the creator (2..254); default 8
+	MaxMembers  int // members per room incl. the creator (2..253: .254 and .255 are reserved); default 8
 	MaxRooms    int // rooms at once; default 1000
 	MaxSessions int // members (UDP, WebSocket, WebTransport) at once, also caps open connections; default 20000
 	// Per source address (IPv6 sources are grouped by /64):
@@ -136,8 +136,8 @@ func (c Config) withDefaults() (Config, error) {
 	if c.Logf == nil {
 		c.Logf = func(string, ...any) {}
 	}
-	if c.MaxMembers < 2 || c.MaxMembers > 254 {
-		return c, fmt.Errorf("MaxMembers must be 2..254, got %d", c.MaxMembers)
+	if c.MaxMembers < 2 || c.MaxMembers > 253 {
+		return c, fmt.Errorf("MaxMembers must be 2..253 (10.0.0.254 and 10.0.0.255 are reserved), got %d", c.MaxMembers)
 	}
 	if c.MaxRooms < 0 || c.MaxSessions < 0 || c.WSSendQueue < 0 || c.WTSendQueue < 0 || c.MaxWT < 0 || c.MaxWTPerIP < 0 || c.MaxPendingWTPerIP < 0 {
 		return c, fmt.Errorf("negative limit")
