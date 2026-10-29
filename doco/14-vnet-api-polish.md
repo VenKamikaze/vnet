@@ -3,7 +3,7 @@
 - **Repo:** `VenKamikaze/vnet`
 - **Branch:** `vnet/14-api-polish`, from `claude`
 - **Depends on:** 11
-- **Status:** todo
+- **Status:** done
 
 ## Goal
 
@@ -106,4 +106,55 @@ From the review's summary table. The user agreed to all highs and mediums, plus 
 
 ## Outcome
 
-*(fill in when done)*
+Landed on `vnet/14-api-polish`, version **0.4.0**. Every in-scope item is implemented and tested; nothing was cut. Protocol version 1 and every existing struct, field order and caller are unchanged: the only existing tests touched are listed under Deviations.
+
+**What landed**
+
+1. **R1.** `rc_poll` measures the gap since the previous poll. A gap of more than one keepalive interval (floor 1 s, see below) is taken for the application sleeping: the silence clock restarts, the handshake, primary-transport (AUTO) and datagram-size-probe deadlines move forward by the gap, and the `KEEPALIVE` that is then due goes out in the same poll. Tests (scripted UDP relay, WebSocket-style and WebTransport-style scripted transports, injected clock): a 60 s jump leaves a READY client READY and sends one keepalive; the same while connecting, during the handshake, during the probe and before the AUTO fallback; real silence is still found within three polled intervals after a resume; slow polling below the floor is not a suspension.
+2. **R2.** `vnet_set_impair()`. Queued delayed datagrams stay queued and are released on schedule (also after impairment is turned off or replaced); a new setting reseeds the PRNG from `seed`; NULL, all-zero and seed-only turn it off; invalid values change nothing; the call wins over `VNET_IMPAIR`, which only `vnet_create()` reads; the delay queue is allocated on first use with the `impair_queue_len` given to create. Every current backend has an impairment layer, so `VNET_ENOTSUP` is documented but unused.
+3. **R3.** `vnet_config.wake` / `wake_user` and `vnet_wake_fn`. The WebSocket transport calls it from `on_open`, `on_message` (when a frame was queued), failure and close; the WebTransport transport from `T.enqueue` and every state change in its JavaScript, through the C function pointer and `getWasmTableEntry` (no exported function, no link flag). Never after the transport is closed. New `examples/wake_probe.c` (browser: an echo host, either with a loop frozen after READY or with no loop at all, driven by wake-ups; native: the guest that pings it, using `RELAY_AUTO` and `vnet_wait`) and `tests/browser/wake_browser.test.js` (WS, WT and AUTO, both modes, `requestAnimationFrame` stubbed out). Native backends never call it (tested).
+4. **R4.** `relay_udp` config field; natively `RELAY_AUTO` is `RELAY_UDP` to `relay_udp`, else `relay` if it has no `scheme://`, else `VNET_EINVAL` with a log line that names `relay_udp`. Browser behaviour unchanged. `examples/relay_peer.c` now always uses `RELAY_AUTO` (`--backend` overrides; new `--relay-udp`).
+5. **R5.** `vnet_status_info.relay_rtt_ms` (latest `KEEPALIVE` round trip; -1 unknown; 0 on UDP and loopback) and `max_members`. A round trip that spans a gap is not measured. No smoothed RTT.
+6. **R6.** `doco/integration.md` (all the review's contents, plus the vendoring recipe of R10 and the API-stability policy); linked from the README.
+7. **R7.** `VNET_EAGAIN`/`VNET_EIO` documented as a drop on every backend; protocol v1 declared frozen since v0.2.0 with what may still be added; API-stability policy and the `SameMajorVersion` caveat (header, integration page, README); `vnet_version()` (a test checks it against the macros and the CMake project version).
+8. **R8.** `vnet_wait(v, timeout_ms)`: `poll`/`WSAPoll`, UDP and relay-UDP; relay-UDP also returns at its next keepalive, silence or handshake-retransmission deadline and at once if a datagram is already queued; any backend returns early for the next delayed-datagram release. Loopback, WebSocket and WebTransport: `VNET_ENOTSUP`. Negative timeout: `VNET_EINVAL`. `tests/smoke.c` and `examples/relay_peer.c` use it.
+9. **R9.** `vnet_resolve_host(host_port, family, out)` in the new `src/resolve.c` (the relay-UDP lookup moved there). Malformed: `VNET_EINVAL`; wrong family: `VNET_EAFNOSUPPORT`; lookup failure: `VNET_EIO`; browsers: `VNET_ENOTSUP`. On Windows it starts and stops Winsock itself.
+10. **R12.** Burst loss: `vnet_impair.burst_pct` and `burst_len`, keys `burst=` and `blen=`. See Deviations. No bandwidth cap.
+11. **R13.** `SO_RCVBUF` 256 KiB at socket creation, best effort, logged at debug level when refused, no config field. The WebSocket transport's queue moved to `src/relay_inbox.c`: a 256-frame DATA ring and a separate 64-frame control ring; control frames come out first and are never pushed out by data; control overflow fails the transport, as in `relay_wt.c`. No `size` field.
+12. **R11/R14, protocol notes only** in `relay-protocol.md`: extension by new `*_EXT` frame types with the padding kept zero and ignored forever; `10.0.0.254` and `.255` reserved; the Odamex packet-size gap, the per-member rate-limit note and the gateway groundwork under "Future extensions"; "Versioning" rewritten (frozen since v0.2.0, what may be added).
+13. **0.4.0.** CMake project version, `VNET_VERSION_*`, README pin section (`GIT_TAG v0.4.0`).
+
+**Tests**
+
+- C/C++: `ctest` 270 entries (204 before), 269 pass and 1 skips (the IPv6 test, no `::1` here); also clean under gcc `-Werror`, clang `-Werror` (270, 1 skip) and ASan+UBSan (270, 1 skip). The Go relay is unchanged: `relay_go_tests` passes (it is one of the 270).
+- Browser: `scripts/test-browser.sh` with the pinned emsdk 6.0.13 and Chromium: the existing WebSocket and WebTransport suites pass unchanged on `relay_peer` (now `RELAY_AUTO`), and the new wake suite passes (3 transports x frozen/driven).
+- MinGW: x86_64 cross build of the library, smoke test, `relay_peer` and `wake_probe` with `-Werror`; `vnet_smoke.exe` (which now exercises `vnet_wait` on `WSAPoll`, `vnet_set_impair` and `vnet_resolve_host`) passes under Wine 9, and `scripts/test-mingw-relay.sh` passes in both directions. i686 not built.
+- Emscripten 6.0.13 build of the library, `relay_peer` and `wake_probe` with `-Werror`: clean.
+- **Proof that the tests fail without the change** (each mutation applied to a scratch edit, built, the suite run, restored; every mutation below made at least one named test fail): R1 (gap handling off: 9 tests; the t_start, stage_start and probe-deadline extensions one by one; the 1 s floor), R5 (RTT always 0, `ka_pending` never set, `max_members` not stored), R2 (no reseed, off keeps active, off drops the queue, queue length ignored), R12 (wrong mean length, burst on the main PRNG stream, bursts not sticky, no validation, parser key), R8 (poll result ignored, timeout ignored, one socket skipped, impairment due time ignored, relay deadline ignored, queued datagrams ignored, handshake deadline ignored), R13 (`SO_RCVBUF` removed or the wrong size; control and data in one ring; data before control), R9 (no family filter, wrong error code), R4 (relay preferred over `relay_udp`, URLs accepted), R7 (version string, CMake version skew), R3 in the browser (the C hook made a no-op: the frozen and driven tests fail for all transports; the WebTransport JavaScript wake removed from `T.enqueue`: the WebTransport tests fail). One mutation (the "resumed" flag that sent the post-gap keepalive) survived and was removed as redundant: the keepalive falls due anyway in any poll that follows a gap longer than an interval.
+
+**Deviations from the brief and corrections**
+
+- **Existing tests changed** (the old behaviour they encoded is what the brief changes): `RelayClient.SilentRelayEndsTheSessionAfterThreeIntervals`, `RelayClient.DefaultHandshakeTimeoutIsTenSeconds` and `RelayFallback.TheFallbackGetsTheWholeHandshakeTimeoutNotWhatIsLeft` jumped the clock by more than a keepalive in one step, which R1 now (rightly) treats as sleep; they poll in steps instead, asserting the same thresholds. The native `RELAY_AUTO` rows of `RelayAutoArguments` (`"wss://..."` and `"ws://..."` were `VNET_ENOTSUP`, now `VNET_EINVAL`; `"127.0.0.1:7777"` now succeeds and moved to new tests). The `relay_transport_ops` initialisers in three test files gained a trailing `nullptr` for the new optional `wait`.
+- **Burst loss is counted in packets, not milliseconds** (`burst_len`, not the review's `burst_len_ms`): a millisecond model needs an exponential draw (libm) or depends on the send rate; the packet model is exactly reproducible. Tolerances are stated in `BurstLoss.BurstLengthsAndLossRateMatchTheConfiguration`.
+- **A floor of 1 s on the suspension threshold.** The brief says "longer than one keepalive interval"; `keepalive_ms` may be as low as 100 ms, and a game polling every 200 ms would then switch silence detection off. The threshold is `max(keepalive, 1 s)`; identical to the brief at the default 5 s.
+- **`relay_rtt_ms` is KEEPALIVE only**, as the brief says, so the first sample comes one keepalive interval after READY (or at once after a gap). A sample from the handshake round trip would give the lobby a number earlier.
+- **Corrections to the review** (also marked in it): `relay_peer.c` had no `#ifdef` for the backend (it chose by URL scheme); "natively the same logic covers sleep/debugger pauses for free" holds only for pauses shorter than the relay's 15 s UDP session timeout, after which the client now learns `VNET_ECLOSED` within a round trip; the WebTransport wake needs no exported function.
+- `10.0.0.254` is reserved in the protocol document, but the relay still accepts `-max-members 254` (the brief says protocol notes only, no code). The document says so.
+- Not run: macOS (no macOS here; a `POLL_IN` macro clash CI found on macOS was fixed, and the late-loopback-delivery pitfall was avoided in the new tests), MinGW i686.
+
+**Follow-ups**
+
+- For Bit Riot 07: pin `v0.4.0`; read `doco/integration.md`; use `vnet_set_impair()` in the stall/leave/host-loss tests and `burst=`/`blen=` for blackout tests; give each process its own `seed=`; use `vnet_wait()` in `bitriot_headless`; resolve `--join host:port` names with `vnet_resolve_host()` (before the loop or on a worker).
+- For Bit Riot 12: one `vnet_config` for both worlds (`relay` URL plus `relay_udp`, backend `RELAY_AUTO`); `cfg.wake` to step a hidden tab from network events (the frozen-loop and no-loop pages in `wake_probe.c` are the working shape); `st.max_members` and `st.relay_rtt_ms` in the lobby; a browser tab paused for a minute stays in its room (WebSocket and WebTransport), whereas a native UDP peer paused for more than 15 s is dropped by the relay and gets `VNET_ECLOSED`.
+- Reduce `-max-members` to 253 in the brief that first uses `.254`. Not done: a smoothed RTT, a handshake RTT sample, `size` on `vnet_status_info`, a pkg-config file, an amalgamation, R11's room control, R15.
+
+**Releasing 0.4.0.** The cloud session cannot push tags. **After the coordinator has merged this branch into `claude`** (and `claude` is the commit to release), run on a PC, in a clone with that merge commit checked out:
+
+```sh
+git fetch origin
+git checkout claude && git pull --ff-only origin claude   # the merge commit
+git tag -a v0.4.0 -m "vnet 0.4.0: API polish and browser lifecycle (brief 14)"
+git push origin v0.4.0
+```
+
+Run it only after the merge: tagging earlier would pin a commit that is not the released one.
