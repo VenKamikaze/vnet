@@ -670,14 +670,14 @@ func TestStatsAndHealth(t *testing.T) {
 // Many rooms at once, both transports, under the race detector.
 func TestManyRoomsConcurrently(t *testing.T) {
 	e := newEnv(t, func(c *Config) {
-		c.WSSendQueue = 4096 // the test sends in bursts
+		c.WSSendQueue = 4096 // the test sends in batches
 		c.ClientPPS, c.ClientPPSBurst = 1e6, 1e6
 		c.ClientBPS, c.ClientBPSBurst = 1e9, 1e9
 		c.HandshakePerSec, c.HandshakeBurst = 1e6, 1e6
 		c.ReplyPerSec, c.ReplyBurst = 1e6, 1e6
 		c.GlobalReplyPerSec, c.GlobalReplyBurst = 1e6, 1e6
 	})
-	const rooms, perRoom, msgs = 12, 4, 40
+	const rooms, perRoom, msgs, batch = 12, 4, 40, 2
 	var wg sync.WaitGroup
 	errs := make(chan string, rooms*perRoom)
 	for r := 0; r < rooms; r++ {
@@ -694,35 +694,51 @@ func TestManyRoomsConcurrently(t *testing.T) {
 					ms = append(ms, dialUDP(t, e.udp).join(host.room.code))
 				}
 			}
-			// Everybody sends msgs datagrams to everybody (self included).
-			for i, from := range ms {
-				for _, to := range ms {
-					for k := 0; k < msgs; k++ {
-						send(from, to, 1, 2, fmt.Sprintf("r%d-m%d-k%d", r, i, k))
+			// Everybody sends msgs datagrams to everybody (self included),
+			// batch at a time: each member reads a whole batch before the
+			// next one is sent. UDP promises no delivery, and the relay's
+			// socket buffer is whatever net.core.rmem_max allows
+			// (relay/README.md): a full one drops. An unpaced burst queued
+			// all rooms' UDP frames at once (12*3*4*40 = 5760 datagrams,
+			// about 830 bytes of buffer each), which fits in the 8 MiB a
+			// 4 MiB rmem_max gives, but not in the 2 MiB of a CI runner
+			// (rmem_max 1 MiB), where whole runs of a sender's frames were
+			// dropped. Batches keep at most 12*3*4*batch = 288 datagrams
+			// queued, which even the Linux default (rmem_max 208 KiB, so
+			// 416 KiB, about 500 datagrams) holds.
+			next := make([]map[byte]int, len(ms))
+			for i := range next {
+				next[i] = make(map[byte]int)
+			}
+			for k0 := 0; k0 < msgs; k0 += batch {
+				for i, from := range ms {
+					for _, to := range ms {
+						for k := k0; k < k0+batch; k++ {
+							send(from, to, 1, 2, fmt.Sprintf("r%d-m%d-k%d", r, i, k))
+						}
 					}
 				}
-			}
-			// Every member must receive exactly perRoom*msgs frames, all
-			// from its own room, in order per sender.
-			for _, m := range ms {
-				next := make(map[byte]int)
-				for n := 0; n < perRoom*msgs; n++ {
-					b := m.read(waitLimit)
-					if b == nil {
-						errs <- fmt.Sprintf("room %d member %d: only %d of %d frames", r, m.octet(), n, perRoom*msgs)
-						return
+				// Every member must receive exactly perRoom*batch frames,
+				// all from its own room, in order per sender.
+				for j, m := range ms {
+					for n := 0; n < perRoom*batch; n++ {
+						b := m.read(waitLimit)
+						if b == nil {
+							errs <- fmt.Sprintf("room %d member %d: only %d of %d frames", r, m.octet(), k0*perRoom+n, perRoom*msgs)
+							return
+						}
+						f := parseFwd(t, b)
+						var rr, mm, kk int
+						if _, err := fmt.Sscanf(string(f.payload), "r%d-m%d-k%d", &rr, &mm, &kk); err != nil || rr != r || byte(mm+1) != f.srcOctet {
+							errs <- fmt.Sprintf("room %d member %d got foreign or mislabeled frame %q from %d", r, m.octet(), f.payload, f.srcOctet)
+							return
+						}
+						if kk != next[j][f.srcOctet] {
+							errs <- fmt.Sprintf("room %d member %d: out of order from %d: %d != %d", r, m.octet(), f.srcOctet, kk, next[j][f.srcOctet])
+							return
+						}
+						next[j][f.srcOctet]++
 					}
-					f := parseFwd(t, b)
-					var rr, mm, kk int
-					if _, err := fmt.Sscanf(string(f.payload), "r%d-m%d-k%d", &rr, &mm, &kk); err != nil || rr != r || byte(mm+1) != f.srcOctet {
-						errs <- fmt.Sprintf("room %d member %d got foreign or mislabeled frame %q from %d", r, m.octet(), f.payload, f.srcOctet)
-						return
-					}
-					if kk != next[f.srcOctet] {
-						errs <- fmt.Sprintf("room %d member %d: out of order from %d: %d != %d", r, m.octet(), f.srcOctet, kk, next[f.srcOctet])
-						return
-					}
-					next[f.srcOctet]++
 				}
 			}
 		}(r)

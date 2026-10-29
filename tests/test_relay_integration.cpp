@@ -576,9 +576,13 @@ private:
         sockaddr_in client{};
         bool have = false;
         while (!stop_) {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::unique_lock<std::mutex> lk(mu_);
             pollfd p[2] = {{client_side_, POLLIN, 0}, {up_, POLLIN, 0}};
             if (poll(p, 2, 0) <= 0) {
+                // Sleep without the lock. Holding it here left Rebind() only
+                // the instant between unlock and the next lock (std::mutex
+                // is not fair), so it could wait for seconds.
+                lk.unlock();
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
                 continue;
             }
