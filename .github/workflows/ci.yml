@@ -132,7 +132,7 @@ jobs:
           docker rm -f relay
 
   browser:
-    name: browser (Emscripten + Chromium via Playwright): WebSocket, WebTransport, fallback
+    name: "browser (Emscripten + Chromium via Playwright): WebSocket, WebTransport, fallback"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
