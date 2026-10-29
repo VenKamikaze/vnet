@@ -13,8 +13,9 @@
  *                           over a WebSocket
  *   VNET_BACKEND_RELAY_WT   browser client of the relay over WebTransport
  *                           (unreliable datagrams)
- *   VNET_BACKEND_RELAY_AUTO browser client: WebTransport if it works, else
- *                           WebSocket; the game need not care which
+ *   VNET_BACKEND_RELAY_AUTO the one constant for every build: in a browser,
+ *                           WebTransport if it works, else WebSocket; natively,
+ *                           the same as RELAY_UDP (see vnet_config.relay_udp)
  *
  * Any backend can be wrapped by an impairment layer (latency, jitter,
  * loss, duplication, reordering) driven by a seeded PRNG.
@@ -25,9 +26,11 @@
  * ---------------------------------------------------------------------
  * Guarantees
  * ---------------------------------------------------------------------
- *  - Nothing in this API blocks, sleeps or spawns threads. (One exception:
- *    vnet_create() with VNET_BACKEND_RELAY_UDP resolves a relay HOST NAME
- *    with getaddrinfo(), which can block; a numeric address never does.)
+ *  - Nothing in this API blocks, sleeps or spawns threads, except by name:
+ *    vnet_wait() (sleeps until a datagram arrives or a timeout) and
+ *    vnet_resolve_host() (a DNS lookup). vnet_create() with
+ *    VNET_BACKEND_RELAY_UDP (or _AUTO, natively) also resolves a relay HOST
+ *    NAME with getaddrinfo(), which can block; a numeric address never does.
  *  - There is no global state. Every vnet_create() gives an independent
  *    context; create/destroy can be repeated freely.
  *  - After setup, steady-state send/receive/poll performs no heap
@@ -47,6 +50,15 @@
  * and backends may add further negative codes: treat any negative value you
  * do not recognise as an error (and VNET_EAGAIN / VNET_EIO as transient).
  *
+ * API stability (see doco/integration.md): from 0.3.0 on, 0.x releases only
+ * add. New fields go at the END of vnet_config, vnet_impair and
+ * vnet_status_info (so a zeroed or vnet_config_init()ed struct keeps its
+ * meaning), and new functions, error codes and backends may appear; nothing is
+ * removed, renamed or reinterpreted. 1.0 follows once Bit Riot's native and
+ * browser netplay have used it. CMake's SameMajorVersion treats every 0.x as
+ * compatible, which is more generous than that promise: pin an exact release
+ * tag.
+ *
  * Time: all times are milliseconds. A clock is a function returning a
  * monotonic millisecond count. The default clock of the UDP backend is
  * the system monotonic clock; the default clock of the loopback backend
@@ -65,8 +77,14 @@ extern "C" {
 #endif
 
 #define VNET_VERSION_MAJOR 0
-#define VNET_VERSION_MINOR 3
+#define VNET_VERSION_MINOR 4
 #define VNET_VERSION_PATCH 0
+
+/* The version of the library that is linked in, e.g. "0.4.0": for logs and bug
+ * reports. (The macros above are the version of the header you compiled
+ * against; the two differ only if the header and the library do.) Static
+ * storage, never NULL. */
+const char *vnet_version(void);
 
 /*
  * Maximum datagram payload in bytes. It is chosen so that a vnet datagram
@@ -157,6 +175,22 @@ typedef struct vnet vnet;
 int vnet_resolve(vnet *v, const char *host_port, vnet_addr *out);
 
 /*
+ * Resolve "host:port" like vnet_resolve(), but also look up a host NAME with
+ * the system resolver (getaddrinfo). THIS BLOCKS, for as long as DNS takes
+ * (seconds on a bad network), so call it from a worker thread or at settings
+ * load time, never from a frame; then hand the numeric result to vnet_create()
+ * (vnet_addr_to_string() gives a "host:port" string for vnet_config.relay).
+ * `family` is VNET_FAMILY_ANY (IPv4 preferred when the name has both),
+ * VNET_FAMILY_IPV4 or VNET_FAMILY_IPV6; an address of another family is
+ * VNET_EAFNOSUPPORT. Numeric addresses and "localhost" are handled without
+ * a lookup. It needs no context and is thread safe.
+ * Returns 0; VNET_EINVAL (malformed, or port missing); VNET_EAFNOSUPPORT;
+ * VNET_EIO (the lookup failed: unknown name, no network); VNET_ENOTSUP in
+ * browser builds, which have no resolver.
+ */
+int vnet_resolve_host(const char *host_port, int family, vnet_addr *out);
+
+/*
  * Format as "1.2.3.4:5000" / "[::1]:5000" (IPv6 in RFC 5952 compressed
  * form). Returns the length written, excluding the terminating NUL, or
  * VNET_EINVAL (bad address) / VNET_ENOBUFS (cap too small; buf is left
@@ -183,6 +217,15 @@ int vnet_addr_equal(const vnet_addr *a, const vnet_addr *b);
  *   reordering  with probability reorder_pct the packet is held back by an
  *               extra reorder_delay_ms (0 = 50 ms) so later packets
  *               overtake it
+ *   burst loss  a two-state (Gilbert-Elliott) model on top of loss_pct: a
+ *               packet sent in the "good" state starts a burst with
+ *               probability burst_pct; every packet of a burst is dropped, and
+ *               after each dropped packet the burst ends with probability
+ *               1/burst_len. So bursts last burst_len packets on average
+ *               (geometric, at least 1). It counts packets, not milliseconds:
+ *               a burst of N packets is a blackout of N / send-rate.
+ *               burst_pct = 0 is off. It draws from a PRNG stream of its own,
+ *               so switching it on or off never changes the other draws.
  *
  * Randomness comes from a private seeded PRNG: the same seed, the same
  * settings, the same sends and the same clock give exactly the same
@@ -204,12 +247,17 @@ typedef struct vnet_impair {
     float    reorder_pct;
     uint32_t reorder_delay_ms;
     uint64_t seed;
+    /* Added in 0.4.0, at the end like every later addition. */
+    float    burst_pct;      /* 0..100; 0 = no burst loss */
+    float    burst_len;      /* mean burst length in packets, 1..100000; ignored
+                                when burst_pct is 0, required when it is not */
 } vnet_impair;
 
 /*
  * Parse an impairment spec like "lat=80,jit=20,loss=5,dup=1,reorder=3,
- * rdelay=40,seed=7" (keys: lat, jit, loss, dup, reorder, rdelay, seed;
- * numbers may be decimal for the percentages). The empty string means no
+ * rdelay=40,burst=2,blen=5,seed=7" (keys: lat, jit, loss, dup, reorder,
+ * rdelay, burst = burst_pct, blen = burst_len, seed; numbers may be decimal
+ * for the percentages and blen). The empty string means no
  * impairment. Keys not mentioned are zero; `out` is written only on success.
  * Returns 0 or VNET_EINVAL.
  */
@@ -234,11 +282,15 @@ int vnet_impair_parse(const char *spec, vnet_impair *out);
                                      VNET_MAX_DATAGRAM datagram fits is lost to
                                      very heavy packet loss: RELAY_AUTO would just
                                      use the WebSocket then */
-#define VNET_BACKEND_RELAY_AUTO 5 /* browser client: try WebTransport, fall back
-                                     to WebSocket. Same `relay` as RELAY_WS
-                                     ("wss://host/vnet"); see relay_wt below.
-                                     vnet_status() says which one was chosen
-                                     (`transport`). Emscripten builds only */
+#define VNET_BACKEND_RELAY_AUTO 5 /* the same constant in every build.
+                                     Browser: try WebTransport, fall back to
+                                     WebSocket; `relay` is the WebSocket URL
+                                     ("wss://host/vnet"), see relay_wt below.
+                                     Native: RELAY_UDP, to the relay's UDP
+                                     address `relay_udp`, or `relay` if that
+                                     is NULL and has no URL scheme; anything
+                                     else is VNET_EINVAL. vnet_status() says
+                                     which transport was chosen (`transport`) */
 
 #define VNET_FAMILY_ANY 0   /* UDP: dual-stack IPv6 socket if available,
                                else IPv4 */
@@ -256,6 +308,17 @@ typedef void (*vnet_log_fn)(void *user, int level, const char *msg);
 
 /* Monotonic millisecond clock (the epoch is arbitrary). */
 typedef uint64_t (*vnet_clock_fn)(void *user);
+
+/*
+ * Wake callback (browser relay transports only; see vnet_config.wake). It is
+ * called from a browser event: when a frame has been queued for vnet_poll()
+ * and when the transport opens, fails or closes. It must do nothing but
+ * arrange for vnet_poll() to run soon (set a flag, post a message, call
+ * emscripten_async_call()): it must NOT call any vnet function, and it must
+ * not block. It may be called at any time between the start of vnet_create()
+ * and vnet_destroy(), and never after vnet_destroy() returns.
+ */
+typedef void (*vnet_wake_fn)(void *user);
 
 /* A set of loopback hosts that can reach one another. Opaque. */
 typedef struct vnet_loopback_network vnet_loopback_network;
@@ -302,9 +365,13 @@ typedef struct vnet_config {
      * only for the duration of vnet_create(). */
     const char *relay;            /* RELAY_UDP: "host:port" or "[v6]:port" of
                                      the relay's UDP port (a host name is
-                                     resolved once, inside vnet_create()).
-                                     RELAY_WS: "ws://host:port/vnet" or
-                                     "wss://host/vnet". */
+                                     resolved once, inside vnet_create(); see
+                                     vnet_resolve_host() to do it earlier).
+                                     RELAY_WS / RELAY_AUTO in a browser:
+                                     "ws://host:port/vnet" or "wss://host/vnet".
+                                     RELAY_AUTO natively: used as the UDP
+                                     address only if `relay_udp` is NULL and
+                                     this has no "scheme://". */
     const char *room;             /* NULL or "": create a new room (you become
                                      10.0.0.1, "room-host"). Otherwise join the
                                      room with this 6-symbol code (case
@@ -344,10 +411,48 @@ typedef struct vnet_config {
                                      room, datagram-size check) before falling
                                      back to WebSocket; 0 = 3000. The WebSocket
                                      attempt then gets relay_timeout_ms in full */
+
+    /* Added in 0.4.0 (again at the end). */
+    const char *relay_udp;        /* RELAY_AUTO, native builds: the relay's UDP
+                                     address "host:port" or "[v6]:port", as for
+                                     RELAY_UDP. Browser builds ignore it, and
+                                     native builds ignore `relay` when it is
+                                     set, so one config can carry both the UDP
+                                     address and the WebSocket URL of a relay.
+                                     Needs to live only during vnet_create() */
+    vnet_wake_fn wake;            /* NULL = none. Browser relay transports (WS,
+                                     WT, and AUTO's choice of them) call it from
+                                     the browser event that queued a frame or
+                                     changed the transport's state, so a page
+                                     whose main loop is throttled or stopped
+                                     (a hidden tab) can run vnet_poll() from the
+                                     events instead. It may only schedule that
+                                     poll; see vnet_wake_fn. Native backends
+                                     (UDP, loopback, relay-UDP) never call it. */
+    void *wake_user;              /* passed to `wake` */
 } vnet_config;
 
 /* Set `cfg` to defaults (equivalent to zeroing it). */
 void vnet_config_init(vnet_config *cfg);
+
+/*
+ * Replace the impairment of a live context (e.g. 500 ms of total loss and then
+ * recovery in a test, or an in-game network debug menu).
+ *   imp NULL or all-zero (every field 0): impairment off.
+ *   otherwise: the new settings, validated like vnet_config.impair, with the
+ *   PRNG reseeded from imp->seed so that runs stay reproducible.
+ * Datagrams already held back for delay stay held and are released on schedule,
+ * whatever the new settings say (also after impairment was turned off); only
+ * datagrams sent from now on are subject to the new settings. The call is
+ * explicit and wins over the VNET_IMPAIR environment variable, which only
+ * vnet_create() reads. Turning impairment on for the first time allocates the
+ * delay queue (impair_queue_len as given to vnet_create(); 0 = 256).
+ * Returns 0; VNET_EINVAL (a bad value; nothing changes) or VNET_ENOMEM (nothing
+ * changes); VNET_ENOTSUP on a backend with no impairment layer. Every backend
+ * of this version (UDP, loopback, relay-UDP/WS/WT) has one, so ENOTSUP is
+ * reserved for backends added later.
+ */
+int vnet_set_impair(vnet *v, const vnet_impair *imp);
 
 /*
  * Create a context. Returns NULL on failure and, if err != NULL, stores a
@@ -403,9 +508,11 @@ int  vnet_local_addr(vnet *v, int s, vnet_addr *out);
  *   VNET_EINVAL    NULL/invalid destination, port 0, or buf NULL with len>0
  *   VNET_EBADF     bad socket handle
  *   VNET_EAFNOSUPPORT  destination family not usable from this socket
- *   VNET_EAGAIN    UDP only: the OS send buffer is full; treat as a drop
- *   VNET_EIO       UDP only: transient OS error (network unreachable ...);
- *                  treat as a drop
+ *   VNET_EAGAIN    any backend: the OS send buffer is full (UDP), or the
+ *                  browser is not keeping up (WebSocket backpressure, too
+ *                  many datagram writes in flight over WebTransport). Treat
+ *                  it as a drop, never as a reason to end the session
+ *   VNET_EIO       transient OS error (network unreachable ...); a drop too
  *   VNET_ENOTCONN  relay only: not in a room (see vnet_status()); nothing
  *                  is sent. A destination that is not in your room is not an
  *                  error: it is dropped by the relay, like any lost datagram.
@@ -433,6 +540,27 @@ int vnet_recvfrom(vnet *v, int s, void *buf, size_t cap, vnet_addr *from);
  * poll receivable. Async backends (relay, browser) do their I/O here.
  */
 void vnet_poll(vnet *v);
+
+/*
+ * Sleep until a datagram may be waiting, or `timeout_ms` has passed: for a
+ * headless process or a dedicated server that would otherwise spin or nap in
+ * fixed steps. It is the one call that blocks, by name. It does not receive
+ * anything: afterwards call vnet_poll() and drain vnet_recvfrom() as usual.
+ *   Returns 1  something may be ready (it can be spurious: poll anyway),
+ *           0  nothing yet: the timeout passed, or a deadline of the context
+ *              (an impaired datagram due for release, a relay keepalive or
+ *              handshake retransmission) is here: call vnet_poll() either way,
+ *           VNET_EINVAL  NULL context or negative timeout (0 = just look),
+ *           VNET_ENOTSUP the backend cannot wait: loopback (it is driven by
+ *              vnet_loopback_network_step()) and the browser backends, which
+ *              never block,
+ *           VNET_EIO an OS error.
+ * UDP and relay-UDP wait with poll() / WSAPoll() on the context's sockets;
+ * deadlines are judged by the context's clock, which is assumed to run in real
+ * time (do not combine vnet_wait() with a virtual clock). A datagram already
+ * queued in the context makes it return 1 at once.
+ */
+int vnet_wait(vnet *v, int timeout_ms);
 
 /* ------------------------------------------------------------------ */
 /* Status                                                              */
@@ -468,6 +596,17 @@ typedef struct vnet_status_info {
                                 (10.0.0.N, port 0) once READY; family
                                 VNET_AF_NONE otherwise */
     /* New fields are only ever added at the end of this struct. */
+    /* Added in 0.4.0: */
+    int relay_rtt_ms;        /* relay: the latest KEEPALIVE round trip to the
+                                relay, in ms, measured at vnet_poll() time (so
+                                with the resolution of your poll interval);
+                                -1 until the first answer, which comes one
+                                keepalive interval after READY (or at once
+                                after a long gap between polls). UDP and
+                                loopback: 0. This is the client-to-relay leg
+                                only: add the other peer's for a peer RTT */
+    int max_members;         /* relay: the room's member limit (from ROOM),
+                                once READY; 0 otherwise */
 } vnet_status_info;
 
 /*
@@ -478,6 +617,16 @@ typedef struct vnet_status_info {
  *   vnet_sendto() returns VNET_ENOTCONN (nothing is queued),
  *   vnet_recvfrom() returns VNET_EAGAIN.
  * After FAILED the same applies, with the reason in `error`.
+ *
+ * Pauses. A relay context does not take a long gap between two vnet_poll()
+ * calls (a hidden browser tab, a laptop that slept, a debugger) for the relay
+ * going silent: after a gap of more than one keepalive interval it restarts
+ * its silence and handshake clocks and sends a KEEPALIVE at once. Over
+ * WebSocket and WebTransport the relay keeps the session as long as the
+ * connection is alive, so the context stays READY. Over UDP the relay forgets a
+ * member that sent nothing for its session timeout (15 s by default), so a
+ * longer pause ends with FAILED / VNET_ECLOSED within a round trip of the next
+ * poll (instead of after three more keepalive intervals).
  */
 int vnet_status(vnet *v, vnet_status_info *out);
 

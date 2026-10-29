@@ -237,7 +237,12 @@ TEST_F(RelayClient, HandshakeTimesOut) {
 
 TEST_F(RelayClient, DefaultHandshakeTimeoutIsTenSeconds) {
     Start();
-    clk.now += 9999;
+    // Polled every 3 s: a single longer gap would be taken for a suspension.
+    for (int i = 0; i < 3; i++) {
+        clk.now += 3000;
+        vnet_poll(v);
+    }
+    clk.now += 999;
     vnet_poll(v);
     EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_CONNECTING);
     clk.now += 1;
@@ -709,8 +714,12 @@ TEST_F(RelayClient, NoncesDoNotRepeat) {
 TEST_F(RelayClient, SilentRelayEndsTheSessionAfterThreeIntervals) {
     Start();
     Enter(1);  // keepalive 5 s: lost after 15 s of silence
-    clk.now += 15000;
-    vnet_poll(v);
+    // The game polls throughout (a gap between polls would be taken for the
+    // application sleeping, not for the relay being silent).
+    for (int i = 0; i < 3; i++) {
+        clk.now += 5000;
+        vnet_poll(v);
+    }
     EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
     clk.now += 1;
     vnet_poll(v);
@@ -719,6 +728,178 @@ TEST_F(RelayClient, SilentRelayEndsTheSessionAfterThreeIntervals) {
     EXPECT_EQ(st.error, VNET_ETIMEDOUT);
     int s = vnet_open(v, 3);
     EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), VNET_ENOTCONN);
+}
+
+// ---- a gap between polls is the application sleeping, not the relay silent
+
+TEST_F(RelayClient, ALongGapBetweenPollsIsSleepNotRelaySilence) {
+    // A hidden tab, a laptop lid, a debugger: no vnet_poll() for 60 s, nothing
+    // from the relay waiting. The relay did nothing wrong.
+    Start();
+    Enter(1);
+    relay.Drain();
+    clk.now += 60000;
+    vnet_poll(v);
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
+    // ... and the client asks the relay at once whether the session is alive.
+    Bytes ka;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    EXPECT_EQ(ka.size(), (size_t)(1 + RELAY_TOKEN_LEN));
+    EXPECT_EQ(relay.Drain(), 0) << "exactly one";
+}
+
+TEST_F(RelayClient, SilenceIsStillSilenceAfterTheGap) {
+    // The relay really is gone: it is found out within three polled intervals
+    // of the resume, not never and not instantly.
+    Start();
+    Enter(1);
+    clk.now += 60000;
+    vnet_poll(v);
+    ASSERT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
+    for (int i = 0; i < 3; i++) {
+        clk.now += 5000;
+        vnet_poll(v);
+        EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY) << i;
+    }
+    clk.now += 1;
+    vnet_poll(v);
+    vnet_status_info st;
+    EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_FAILED);
+    EXPECT_EQ(st.error, VNET_ETIMEDOUT);
+}
+
+TEST_F(RelayClient, TheRelayForgettingUsDuringTheGapIsLearnedAtOnce) {
+    // Over UDP the relay drops a member that was silent for its session
+    // timeout: the keepalive sent on resume draws the error straight away.
+    Start();
+    Enter(1);
+    clk.now += 60000;
+    vnet_poll(v);
+    Bytes ka;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    relay.Send(ErrorFrame(Bytes(), RELAY_E_NO_SESSION));
+    vnet_poll(v);
+    vnet_status_info st;
+    EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_FAILED);
+    EXPECT_EQ(st.error, VNET_ECLOSED);
+}
+
+TEST_F(RelayClient, AGapDuringTheHandshakeExtendsItsDeadline) {
+    Start(nullptr, 0, 10000);
+    clk.now += 60000;
+    vnet_poll(v);
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_CONNECTING);
+    // The relay answers late: still welcome.
+    Enter(1);
+    // It still times out, 10 s of polling after the resume.
+    vnet_destroy(v);
+    Start(nullptr, 0, 10000);
+    clk.now += 60000;
+    vnet_poll(v);
+    for (int i = 0; i < 3; i++) {
+        clk.now += 3000;
+        vnet_poll(v);
+    }
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_CONNECTING);
+    clk.now += 1001;
+    vnet_poll(v);
+    vnet_status_info st;
+    EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_FAILED);
+    EXPECT_EQ(st.error, VNET_ETIMEDOUT);
+}
+
+TEST_F(RelayClient, AGapShorterThanAKeepaliveIsNotASuspension) {
+    // Ordinary frame-to-frame polling must not reset the silence clock: with a
+    // 5 s keepalive, polls 4 s apart for 16 s of silence still end the session.
+    Start();
+    Enter(1);
+    for (int i = 0; i < 4; i++) {
+        clk.now += 4000;
+        vnet_poll(v);
+    }
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_FAILED);
+}
+
+// ---- status: relay_rtt_ms and max_members
+
+TEST_F(RelayClient, StatusCarriesTheRoomsMemberLimit) {
+    Start();
+    vnet_status_info st;
+    vnet_status(v, &st);
+    EXPECT_EQ(st.max_members, 0) << "unknown before the room";
+    EXPECT_EQ(st.relay_rtt_ms, -1);
+    Enter(1, "ABCDEF", 6);
+    EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_READY);
+    EXPECT_EQ(st.max_members, 6);
+}
+
+TEST_F(RelayClient, RelayRttIsTheLatestKeepaliveRoundTrip) {
+    Start();
+    Enter(1);
+    relay.Drain();
+    vnet_status_info st;
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, -1) << "nothing measured yet";
+    clk.now += 5000;
+    vnet_poll(v);  // KEEPALIVE goes out at t0
+    Bytes ka;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    clk.now += 37;
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    vnet_poll(v);
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, 37);
+    // The next round trip replaces it.
+    clk.now += 5000 - 37;
+    vnet_poll(v);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    clk.now += 81;
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    vnet_poll(v);
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, 81);
+    // An unsolicited KEEPALIVE (no request outstanding) is life, not a sample.
+    clk.now += 1000;
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    vnet_poll(v);
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, 81);
+}
+
+TEST_F(RelayClient, ARoundTripThatSpansAGapIsNotMeasured) {
+    Start();
+    Enter(1);
+    relay.Drain();
+    clk.now += 5000;
+    vnet_poll(v);  // a KEEPALIVE is out
+    clk.now += 60000;
+    vnet_poll(v);  // the gap: a fresh KEEPALIVE, and the old one no longer counts
+    Bytes ka;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    clk.now += 20;
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    vnet_poll(v);
+    vnet_status_info st;
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, 20);
+}
+
+TEST_F(RelayClient, UdpAndLoopbackReportZeroRttAndNoMemberLimit) {
+    vnet_loopback_network *net = vnet_loopback_network_create();
+    vnet *lb = LoopbackHost(net);
+    vnet_status_info st;
+    st.relay_rtt_ms = 99;
+    st.max_members = 99;
+    EXPECT_EQ(vnet_status(lb, &st), VNET_STATUS_READY);
+    EXPECT_EQ(st.relay_rtt_ms, 0);
+    EXPECT_EQ(st.max_members, 0);
+    vnet_destroy(lb);
+    vnet *u = UdpHost();
+    st.relay_rtt_ms = 99;
+    EXPECT_EQ(vnet_status(u, &st), VNET_STATUS_READY);
+    EXPECT_EQ(st.relay_rtt_ms, 0);
+    vnet_destroy(u);
+    vnet_loopback_network_destroy(net);
 }
 
 TEST_F(RelayClient, AnyFrameFromTheRelayCountsAsLife) {

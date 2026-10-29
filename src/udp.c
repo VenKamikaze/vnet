@@ -33,13 +33,20 @@ typedef SOCKET sock_t;
 #define CLOSE_SOCK closesocket
 typedef int sa_len_t;
 typedef char *sockopt_t;
+typedef WSAPOLLFD pollfd_t;
+#define POLL_IN POLLRDNORM
+#define POLL_CALL(fds, n, ms) WSAPoll((fds), (ULONG)(n), (ms))
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+typedef struct pollfd pollfd_t;
+#define POLL_IN POLLIN
+#define POLL_CALL(fds, n, ms) poll((fds), (nfds_t)(n), (ms))
 typedef int sock_t;
 #define BAD_SOCK (-1)
 #define SOCK_ERRNO() errno
@@ -68,8 +75,14 @@ typedef struct udp_sock {
     int v6only;  // AF_INET6 socket that refuses IPv4 (VNET_FAMILY_IPV6)
 } udp_sock;
 
+// Kernel receive buffer asked for at open (best effort). The default holds only
+// ~270 small datagrams, which one frame hitch at a busy server's packet rate
+// overflows.
+#define VNET_UDP_RCVBUF (256 * 1024)
+
 typedef struct udp_state {
     udp_sock *socks;
+    pollfd_t *pfds;  // scratch for vnet_wait(), one slot per socket
     int n;
     int family_mode;  // VNET_FAMILY_*
 #if defined(_WIN32)
@@ -170,6 +183,11 @@ static sock_t make_socket(vnet *v, int family, int v6only, uint16_t port, int *r
         WSAIoctl(fd, _WSAIOW(IOC_VENDOR, 12), &off, sizeof off, NULL, 0, &bytes, NULL, NULL);
     }
 #endif
+    {
+        int rcvbuf = VNET_UDP_RCVBUF;
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (sockopt_t)&rcvbuf, sizeof rcvbuf) != 0)
+            vnet__logf(v, VNET_LOG_DEBUG, "SO_RCVBUF %d refused (%d): keeping the default", rcvbuf, SOCK_ERRNO());
+    }
     struct sockaddr_storage ss;
     sa_len_t len;
     memset(&ss, 0, sizeof ss);
@@ -317,6 +335,35 @@ static int udp_recv(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
 
 static void udp_poll(vnet *v) { (void)v; }
 
+static int udp_wait(vnet *v, int timeout_ms) {
+    udp_state *st = v->bs;
+    int n = 0;
+    for (int i = 0; i < st->n; i++) {
+        if (!st->socks[i].used) continue;
+        st->pfds[n].fd = st->socks[i].fd;
+        st->pfds[n].events = POLL_IN;
+        st->pfds[n].revents = 0;
+        n++;
+    }
+    if (n == 0) {  // nothing can arrive: just sleep (WSAPoll refuses an empty set)
+#if defined(_WIN32)
+        Sleep((DWORD)timeout_ms);
+#else
+        poll(NULL, 0, timeout_ms);
+#endif
+        return 0;
+    }
+    int rc = POLL_CALL(st->pfds, n, timeout_ms);
+    if (rc > 0) return 1;
+    if (rc == 0) return 0;
+#if defined(_WIN32)
+    int e = SOCK_ERRNO();
+    return e == E_INTR ? 0 : VNET_EIO;
+#else
+    return errno == EINTR ? 0 : VNET_EIO;  // a signal: let the caller look around
+#endif
+}
+
 static void udp_destroy(vnet *v) {
     udp_state *st = v->bs;
     for (int i = 0; i < st->n; i++)
@@ -324,12 +371,14 @@ static void udp_destroy(vnet *v) {
 #if defined(_WIN32)
     if (st->wsa_started) WSACleanup();
 #endif
+    free(st->pfds);
     free(st->socks);
     free(st);
 }
 
 static const vnet_backend udp_backend = {
     "udp", udp_open, udp_close, udp_local_addr, udp_check_send, udp_send, udp_recv, udp_poll, udp_destroy, NULL, NULL,
+    udp_wait,
 };
 
 int vnet__udp_init(vnet *v, const vnet_config *cfg) {
@@ -341,7 +390,10 @@ int vnet__udp_init(vnet *v, const vnet_config *cfg) {
     st->n = v->max_sockets;
     st->family_mode = cfg->family;
     st->socks = calloc((size_t)st->n, sizeof *st->socks);
-    if (!st->socks) {
+    st->pfds = calloc((size_t)st->n, sizeof *st->pfds);
+    if (!st->socks || !st->pfds) {
+        free(st->socks);
+        free(st->pfds);
         free(st);
         return VNET_ENOMEM;
     }
@@ -349,6 +401,7 @@ int vnet__udp_init(vnet *v, const vnet_config *cfg) {
     {
         WSADATA wd;
         if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
+            free(st->pfds);
             free(st->socks);
             free(st);
             return VNET_EIO;

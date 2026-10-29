@@ -9,6 +9,10 @@
 #define DEFAULT_REORDER_DELAY_MS 50u
 #define MAX_DELAY_MS 60000u
 #define PPM 1000000u
+#define MAX_BURST_LEN 100000.0f
+// The burst model draws from a stream of its own (the seed, scrambled), so
+// that switching it on or off never moves the draws of the other knobs.
+#define BURST_STREAM 0xb5ad4eceda1ce2a9ULL
 
 typedef struct imp_slot {
     int used;
@@ -25,6 +29,12 @@ struct vnet_imp {
     uint32_t loss_ppm, dup_ppm, reorder_ppm;
     uint32_t reorder_delay_ms;
     uint64_t rng;
+    // Gilbert-Elliott burst loss: leave the good state with burst_start_ppm per
+    // packet, leave the bad state with burst_end_ppm (0 start = off).
+    uint32_t burst_start_ppm, burst_end_ppm;
+    uint64_t brng;
+    int in_burst;
+    int active;  // 0 after vnet_set_impair() turned it off: queued datagrams still drain
     uint64_t seq;
     int cap;
     int count;
@@ -45,7 +55,7 @@ static uint32_t pct_to_ppm(float pct) {
 
 int vnet__imp_enabled(const vnet_impair *c) {
     return c->latency_ms || c->jitter_ms || c->loss_pct > 0.0f || c->duplicate_pct > 0.0f ||
-           c->reorder_pct > 0.0f;
+           c->reorder_pct > 0.0f || c->burst_pct > 0.0f;
 }
 
 int vnet__imp_validate(const vnet_impair *c) {
@@ -53,6 +63,8 @@ int vnet__imp_validate(const vnet_impair *c) {
     if (!(c->loss_pct >= 0.0f && c->loss_pct <= 100.0f)) return VNET_EINVAL;
     if (!(c->duplicate_pct >= 0.0f && c->duplicate_pct <= 100.0f)) return VNET_EINVAL;
     if (!(c->reorder_pct >= 0.0f && c->reorder_pct <= 100.0f)) return VNET_EINVAL;
+    if (!(c->burst_pct >= 0.0f && c->burst_pct <= 100.0f)) return VNET_EINVAL;
+    if (c->burst_pct > 0.0f && !(c->burst_len >= 1.0f && c->burst_len <= MAX_BURST_LEN)) return VNET_EINVAL;
     if (c->latency_ms > MAX_DELAY_MS || c->jitter_ms > MAX_DELAY_MS ||
         c->reorder_delay_ms > MAX_DELAY_MS)
         return VNET_EINVAL;
@@ -69,13 +81,63 @@ vnet_imp *vnet__imp_create(vnet *v, const vnet_impair *cfg, int queue_len) {
         free(imp);
         return NULL;
     }
+    vnet__imp_configure(imp, cfg);
+    return imp;
+}
+
+// (Re)apply settings: everything but the delay queue. The PRNGs restart from
+// the seed, so a run is reproducible from the call that set it.
+void vnet__imp_configure(vnet_imp *imp, const vnet_impair *cfg) {
     imp->cfg = *cfg;
     imp->loss_ppm = pct_to_ppm(cfg->loss_pct);
     imp->dup_ppm = pct_to_ppm(cfg->duplicate_pct);
     imp->reorder_ppm = pct_to_ppm(cfg->reorder_pct);
     imp->reorder_delay_ms = cfg->reorder_delay_ms ? cfg->reorder_delay_ms : DEFAULT_REORDER_DELAY_MS;
     imp->rng = cfg->seed;
-    return imp;
+    imp->brng = cfg->seed ^ BURST_STREAM;
+    imp->in_burst = 0;
+    imp->burst_start_ppm = cfg->burst_pct > 0.0f ? pct_to_ppm(cfg->burst_pct) : 0;
+    imp->burst_end_ppm = 0;
+    if (imp->burst_start_ppm) {
+        double e = 1000000.0 / (double)cfg->burst_len + 0.5;
+        imp->burst_end_ppm = e >= (double)PPM ? PPM : e < 1.0 ? 1u : (uint32_t)e;
+    }
+    imp->active = 1;
+}
+
+int vnet__imp_active(const vnet *v) { return v->imp && v->imp->active; }
+
+// vnet_set_impair(): new settings, or off (queued datagrams are kept either way).
+int vnet__imp_set(vnet *v, const vnet_impair *cfg, int queue_len) {
+    vnet_impair zero;
+    memset(&zero, 0, sizeof zero);
+    if (!cfg) cfg = &zero;
+    int rc = vnet__imp_validate(cfg);
+    if (rc != VNET_OK) return rc;
+    if (!vnet__imp_enabled(cfg)) {
+        if (v->imp) v->imp->active = 0;
+        return VNET_OK;
+    }
+    if (!v->imp) {
+        v->imp = vnet__imp_create(v, cfg, queue_len);
+        return v->imp ? VNET_OK : VNET_ENOMEM;
+    }
+    vnet__imp_configure(v->imp, cfg);
+    return VNET_OK;
+}
+
+// When the earliest delayed datagram is due (for vnet_wait()). 0 if none.
+int vnet__imp_next_due(const vnet *v, uint64_t *due) {
+    const vnet_imp *imp = v->imp;
+    if (!imp || imp->count == 0) return 0;
+    int found = 0;
+    for (int i = 0; i < imp->cap; i++) {
+        const imp_slot *sl = &imp->slots[i];
+        if (!sl->used) continue;
+        if (!found || sl->due < *due) *due = sl->due;
+        found = 1;
+    }
+    return found;
 }
 
 void vnet__imp_destroy(vnet_imp *imp) {
@@ -128,6 +190,12 @@ void vnet__imp_submit(vnet *v, int s, const void *buf, size_t len, const vnet_ad
 
     // Fixed draw order: loss, dup, reorder, jitter(original), jitter(copy).
     int lost = roll(&imp->rng, imp->loss_ppm);
+    if (imp->burst_start_ppm) {
+        uint32_t r = (uint32_t)(rng_next(&imp->brng) >> 32) % PPM;
+        if (imp->in_burst) imp->in_burst = !(r < imp->burst_end_ppm);
+        else imp->in_burst = r < imp->burst_start_ppm;
+        if (imp->in_burst) lost = 1;
+    }
     int dup = roll(&imp->rng, imp->dup_ppm);
     int reorder = roll(&imp->rng, imp->reorder_ppm);
     uint64_t j1 = jitter_draw(&imp->rng, imp->cfg.jitter_ms);
@@ -203,8 +271,8 @@ static int parse_u64(const char *s, size_t n, uint64_t *out) {
     return 0;
 }
 
-// Locale-independent "12" / "12.5" / ".5" parser (no sign, no exponent).
-static int parse_pct(const char *s, size_t n, float *out) {
+// Locale-independent "12" / "12.5" / ".5" parser (no sign, no exponent), 0..max.
+static int parse_num(const char *s, size_t n, double max, float *out) {
     if (n == 0) return -1;
     double v = 0.0, scale = 0.1;
     size_t i = 0;
@@ -216,10 +284,12 @@ static int parse_pct(const char *s, size_t n, float *out) {
             scale *= 0.1;
         }
     }
-    if (i != n || digits == 0 || v > 100.0) return -1;
+    if (i != n || digits == 0 || v > max) return -1;
     *out = (float)v;
     return 0;
 }
+
+static int parse_pct(const char *s, size_t n, float *out) { return parse_num(s, n, 100.0, out); }
 
 int vnet_impair_parse(const char *spec, vnet_impair *out) {
     if (!spec || !out) return VNET_EINVAL;
@@ -259,6 +329,10 @@ int vnet__impair_parse_into(const char *spec, vnet_impair *out) {
         } else if (kn == 6 && !memcmp(p, "rdelay", 6)) {
             if (parse_u64(val, vn, &u) || u > MAX_DELAY_MS) return VNET_EINVAL;
             r.reorder_delay_ms = (uint32_t)u;
+        } else if (kn == 5 && !memcmp(p, "burst", 5)) {
+            if (parse_pct(val, vn, &r.burst_pct)) return VNET_EINVAL;
+        } else if (kn == 4 && !memcmp(p, "blen", 4)) {
+            if (parse_num(val, vn, MAX_BURST_LEN, &r.burst_len)) return VNET_EINVAL;
         } else if (kn == 4 && !memcmp(p, "seed", 4)) {
             if (parse_u64(val, vn, &r.seed)) return VNET_EINVAL;
         } else {

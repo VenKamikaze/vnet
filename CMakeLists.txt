@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(vnet
-    VERSION 0.3.0
+    VERSION 0.4.0
     DESCRIPTION "Virtual UDP for games: a small non-blocking datagram API with pluggable backends"
     LANGUAGES C)
 
@@ -42,6 +42,7 @@ add_library(vnet STATIC
     src/relay_udp.c
     src/relay_ws.c
     src/relay_wt.c
+    src/resolve.c
     src/udp.c
     src/vnet.c)
 add_library(vnet::vnet ALIAS vnet)

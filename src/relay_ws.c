@@ -174,7 +174,7 @@ static void tp_destroy(void *p) {
     free(t);
 }
 
-static const relay_transport_ops ws_ops = {"relay-ws", 0, tp_state, tp_send, tp_recv, tp_destroy, NULL};
+static const relay_transport_ops ws_ops = {"relay-ws", 0, tp_state, tp_send, tp_recv, tp_destroy, NULL, NULL};
 
 // Open a WebSocket to `url` (ws:// or wss://). On success *ops and *tp are
 // set; the caller owns the transport.

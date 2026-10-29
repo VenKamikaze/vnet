@@ -18,6 +18,11 @@
 #define MAX_FRAMES_PER_POLL 2048
 #define KEEPALIVE_MIN_MS 100
 #define KEEPALIVE_MAX_MS 5000  /* a third of the relay's default 15 s session timeout */
+// A gap between two vnet_poll() calls longer than the keepalive interval (but
+// never less than this) is taken to be the application being suspended, not
+// the relay going silent. The floor keeps a game that polls slower than a very
+// short keepalive from switching the silence check off altogether.
+#define SUSPEND_GAP_FLOOR_MS 1000u
 
 typedef struct rc_pkt {
     size_t len;
@@ -72,6 +77,13 @@ typedef struct rc_state {
     uint64_t stage_start;
     uint64_t ka_next;
     uint64_t last_rx;
+    uint64_t last_poll;  // when rc_poll last ran (a gap here is the application sleeping)
+
+    // Status: the latest KEEPALIVE round trip and the room's size limit.
+    uint64_t ka_sent_at;
+    int ka_pending;      // a KEEPALIVE is out and its answer has not come
+    int rtt_ms;          // -1 until an answer has been timed
+    int max_members;     // from ROOM; 0 before the room is entered
 
     rc_sock *socks;
     int nsocks;
@@ -167,6 +179,14 @@ static void send_simple(vnet *v, rc_state *st, uint8_t type) {
     if (rc < 0) vnet__logf(v, VNET_LOG_DEBUG, "frame 0x%02x send failed (%d)", type, rc);
 }
 
+// A KEEPALIVE, timed: the relay answers it with a one-byte KEEPALIVE, and the
+// time between the two is the round trip to the relay.
+static void send_keepalive(vnet *v, rc_state *st, uint64_t now) {
+    send_simple(v, st, RELAY_T_KEEPALIVE);
+    st->ka_sent_at = now;
+    st->ka_pending = 1;
+}
+
 static void queue_data(vnet *v, rc_state *st, const uint8_t *p, size_t n) {
     if (n < RELAY_DATA_HDR_WS) return;  // malformed
     size_t plen = n - RELAY_DATA_HDR_WS;
@@ -210,6 +230,7 @@ static int transport_may_truncate(const rc_state *st) {
 static void enter_ready(rc_state *st, uint64_t now) {
     st->phase = RC_READY;
     st->ka_next = now + st->keepalive_ms;
+    st->ka_pending = 0;
 }
 
 static uint8_t probe_byte(size_t i, uint8_t octet) { return (uint8_t)(i * 7u + octet + 0x5au); }
@@ -284,6 +305,9 @@ static void switch_transport(vnet *v, rc_state *st, const char *why, uint64_t no
     memset(st->token, 0, sizeof st->token);
     st->code[0] = 0;
     st->keepalive_ms = st->cfg_keepalive_ms;
+    st->ka_pending = 0;
+    st->rtt_ms = -1;
+    st->max_members = 0;
     st->t_start = now;  // the fallback gets the whole handshake timeout
     st->last_rx = now;
     if (begin_handshake(st) != 0) fail(v, st, VNET_EIO);
@@ -306,6 +330,7 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
             memcpy(st->token, p + 14, RELAY_TOKEN_LEN);
             memcpy(st->code, p + 14 + RELAY_TOKEN_LEN, RELAY_CODE_LEN);
             st->code[RELAY_CODE_LEN] = 0;
+            st->max_members = p[14 + RELAY_TOKEN_LEN + RELAY_CODE_LEN];
             if (st->keepalive_ms == 0) {
                 unsigned s = p[14 + RELAY_TOKEN_LEN + RELAY_CODE_LEN + 1];
                 st->keepalive_ms = s ? s * 1000u : DEFAULT_KEEPALIVE_MS;
@@ -337,7 +362,13 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
             break;
         }
         case RELAY_T_KEEPALIVE:
-            if (n == 1 && st->phase == RC_READY) st->last_rx = now;
+            if (n == 1 && st->phase == RC_READY) {
+                st->last_rx = now;
+                if (st->ka_pending) {
+                    st->ka_pending = 0;
+                    st->rtt_ms = now >= st->ka_sent_at ? (int)(now - st->ka_sent_at) : 0;
+                }
+            }
             break;
         case RELAY_T_RETRY:
             // Stateless retry: the relay wants proof that we receive at our
@@ -488,10 +519,49 @@ static int rc_recv(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
     return (int)p->len;
 }
 
+// The application did not call vnet_poll() for `gap` ms: a hidden browser tab,
+// a laptop that slept, a debugger. That says nothing about the relay, which
+// keeps the session alive for as long as the connection answers its pings, so
+// the clocks that judge the relay (the handshake deadline, the primary
+// transport's deadline, the probe, three silent keepalive intervals) are moved
+// forward by the gap instead of being found expired. Returns 1 in a room, where
+// the caller sends a KEEPALIVE at once: if the relay really did forget us, the
+// answer (an error) says so now rather than after three more intervals.
+static int resume_after_gap(rc_state *st, uint64_t gap, uint64_t now) {
+    switch (st->phase) {
+        case RC_HANDSHAKE:
+        case RC_PROBE:
+            st->t_start += gap;
+            st->stage_start += gap;
+            st->probe_deadline += gap;
+            st->probe_next += gap;
+            return 0;
+        case RC_READY:
+            st->last_rx = now;
+            st->ka_pending = 0;  // a pre-gap answer, if it ever comes, is no round trip
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static void rc_poll(vnet *v) {
     rc_state *st = v->bs;
     if (st->phase == RC_FAILED) return;
     uint64_t now = vnet__now(v);
+
+    int resumed = 0;
+    {
+        uint64_t gap = now > st->last_poll ? now - st->last_poll : 0;
+        uint64_t limit = st->keepalive_ms ? st->keepalive_ms : DEFAULT_KEEPALIVE_MS;
+        if (limit < SUSPEND_GAP_FLOOR_MS) limit = SUSPEND_GAP_FLOOR_MS;
+        if (gap > limit) {
+            vnet__logf(v, VNET_LOG_INFO, "no vnet_poll() for %u ms: treated as the application being suspended",
+                       (unsigned)(gap > 0xffffffffu ? 0xffffffffu : gap));
+            resumed = resume_after_gap(st, gap, now);
+        }
+        st->last_poll = now;
+    }
 
     // Before the room is entered the first transport of a RELAY_AUTO context
     // has primary_timeout_ms to get there; failing that, the fallback.
@@ -563,19 +633,54 @@ static void rc_poll(vnet *v) {
     } else {  // READY
         if (now - st->last_rx > 3u * st->keepalive_ms) {
             fail(v, st, VNET_ETIMEDOUT);
-        } else if (now >= st->ka_next) {
-            send_simple(v, st, RELAY_T_KEEPALIVE);
+        } else if (resumed || now >= st->ka_next) {
+            send_keepalive(v, st, now);
             st->ka_next = now + st->keepalive_ms;
         }
     }
 }
 
+// vnet_wait(): sleep on the transport until it has something, but not past the
+// next moment this client has something to do by itself.
+static int rc_wait(vnet *v, int timeout_ms) {
+    rc_state *st = v->bs;
+    if (!st->ops->wait) return VNET_ENOTSUP;
+    for (int i = 0; i < st->nsocks; i++)
+        if (st->socks[i].used && st->socks[i].count > 0) return 1;  // already receivable
+    uint64_t now = vnet__now(v);
+    uint64_t next = 0;  // 0: no deadline of ours
+    switch (st->phase) {
+        case RC_HANDSHAKE:
+            next = st->t_start + st->hs_timeout_ms;
+            if (st->udp_style && st->hs_sent && st->hs_next < next) next = st->hs_next;
+            break;
+        case RC_PROBE:
+            next = st->probe_deadline < st->probe_next ? st->probe_deadline : st->probe_next;
+            break;
+        case RC_READY: {
+            uint64_t silent = st->last_rx + 3u * st->keepalive_ms + 1;
+            next = st->ka_next < silent ? st->ka_next : silent;
+            break;
+        }
+        default:
+            break;
+    }
+    if (next) {
+        uint64_t left = next > now ? next - now : 0;
+        if (left < (uint64_t)timeout_ms) timeout_ms = (int)left;
+    }
+    return st->ops->wait(st->tp, timeout_ms);
+}
+
 static int rc_status(vnet *v, vnet_status_info *out) {
     rc_state *st = v->bs;
     out->transport = st->ops->name;
+    out->relay_rtt_ms = -1;  // unknown until a KEEPALIVE has been answered
     switch (st->phase) {
         case RC_READY:
             out->state = VNET_STATUS_READY;
+            out->relay_rtt_ms = st->rtt_ms;
+            out->max_members = st->max_members;
             memcpy(out->room, st->code, RELAY_CODE_LEN + 1);
             out->self.family = VNET_AF_IPV4;
             out->self.bytes[0] = 10;
@@ -626,7 +731,7 @@ static void rc_destroy(vnet *v) {
 
 static const vnet_backend rc_backend = {
     "relay", rc_open,  rc_close, rc_local_addr, rc_check_send, rc_send, rc_recv,
-    rc_poll, rc_destroy, rc_status, rc_resolve,
+    rc_poll, rc_destroy, rc_status, rc_resolve, rc_wait,
 };
 
 int vnet__relay_init_fallback(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp,
@@ -689,6 +794,8 @@ int vnet__relay_init_fallback(vnet *v, const vnet_config *cfg, const relay_trans
     st->t_start = vnet__now(v);
     st->stage_start = st->t_start;
     st->last_rx = st->t_start;
+    st->last_poll = st->t_start;
+    st->rtt_ms = -1;
     // First poll sends the handshake once the transport is open. Do it now
     // too, so that a UDP relay is asked immediately.
     rc_poll(v);

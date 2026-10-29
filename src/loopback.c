@@ -221,7 +221,7 @@ static void lb_destroy(vnet *v) {
 }
 
 static const vnet_backend lb_backend = {
-    "loopback", lb_open, lb_close, lb_local_addr, lb_check_send, lb_send, lb_recv, lb_poll, lb_destroy, NULL, NULL,
+    "loopback", lb_open, lb_close, lb_local_addr, lb_check_send, lb_send, lb_recv, lb_poll, lb_destroy, NULL, NULL, NULL,
 };
 
 static int host_ip_taken(const vnet_loopback_network *net, const uint8_t ip[4]) {

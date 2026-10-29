@@ -67,6 +67,16 @@ uint64_t vnet__now(vnet *v) { return v->clock(v->clock_user); }
 
 uint64_t vnet_time(vnet *v) { return v ? vnet__now(v) : 0; }
 
+#define VNET_STR_(x) #x
+#define VNET_STR(x) VNET_STR_(x)
+const char *vnet_version(void) {
+    return VNET_STR(VNET_VERSION_MAJOR) "." VNET_STR(VNET_VERSION_MINOR) "." VNET_STR(VNET_VERSION_PATCH);
+}
+
+void vnet__wake(vnet *v) {
+    if (v && v->wake) v->wake(v->wake_user);
+}
+
 void vnet_config_init(vnet_config *cfg) {
     if (cfg) memset(cfg, 0, sizeof *cfg);
 }
@@ -96,6 +106,9 @@ static vnet *create(const vnet_config *cfg_in, int *err, const relay_transport_o
     v->log_user = cfg.log_user;
     v->clock = cfg.clock;
     v->clock_user = cfg.clock_user;
+    v->wake = cfg.wake;
+    v->wake_user = cfg.wake_user;
+    v->imp_queue_len = cfg.impair_queue_len;
     v->max_sockets = cfg.max_sockets > 0 ? cfg.max_sockets : 16;
     v->max_dgram = VNET_MAX_DATAGRAM;
 
@@ -215,7 +228,7 @@ int vnet_sendto(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to
     if (!to || to->port == 0 || (to->family != VNET_AF_IPV4 && to->family != VNET_AF_IPV6))
         return VNET_EINVAL;
 
-    if (!v->imp) {
+    if (!vnet__imp_active(v)) {
         int rc = vnet__wire_send(v, s, buf, len, to);
         if (rc < 0) return rc;
         v->stats.tx_datagrams++;
@@ -245,6 +258,26 @@ int vnet_recvfrom(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
 }
 
 void vnet__release(vnet *v) { vnet__imp_release(v); }
+
+int vnet_set_impair(vnet *v, const vnet_impair *imp) {
+    if (!v) return VNET_EINVAL;
+    int rc = vnet__imp_set(v, imp, v->imp_queue_len);
+    if (rc == VNET_EINVAL) vnet__logf(v, VNET_LOG_ERROR, "invalid impairment settings");
+    return rc;
+}
+
+int vnet_wait(vnet *v, int timeout_ms) {
+    if (!v || timeout_ms < 0) return VNET_EINVAL;
+    if (!v->be->wait) return VNET_ENOTSUP;
+    // Never sleep past a delayed datagram's release: the caller must poll then.
+    uint64_t due;
+    if (vnet__imp_next_due(v, &due)) {
+        uint64_t now = vnet__now(v);
+        uint64_t left = due > now ? due - now : 0;
+        if (left < (uint64_t)timeout_ms) timeout_ms = (int)left;
+    }
+    return v->be->wait(v, timeout_ms);
+}
 
 void vnet_poll(vnet *v) {
     if (!v) return;

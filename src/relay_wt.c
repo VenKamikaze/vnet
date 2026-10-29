@@ -292,7 +292,7 @@ static void tp_destroy(void *p) {
     free(t);
 }
 
-static const relay_transport_ops wt_ops = {"relay-wt", 0, tp_state, tp_send, tp_recv, tp_destroy, tp_max_data_frame};
+static const relay_transport_ops wt_ops = {"relay-wt", 0, tp_state, tp_send, tp_recv, tp_destroy, tp_max_data_frame, NULL};
 
 int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const relay_transport_ops **ops,
                         void **tp) {
