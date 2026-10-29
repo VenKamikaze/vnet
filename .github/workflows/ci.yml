@@ -1,11 +1,11 @@
 name: CI
 
-# Work branches (vnet/NN-*) are merged locally, so they need push builds. A
-# pull request from the same repository would run twice (push + PR): the
-# concurrency group below cancels the older run for the same ref.
+# Work branches (vnet/NN-*, fix/*) are merged locally, so they need push
+# builds. A pull request from the same repository would run twice (push + PR):
+# the concurrency group below cancels the older run for the same ref.
 on:
   push:
-    branches: [main, claude, "vnet/**"]
+    branches: [main, claude, "vnet/**", "fix/**"]
   pull_request:
 
 concurrency:
