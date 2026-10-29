@@ -71,7 +71,15 @@ void vnet_config_init(vnet_config *cfg) {
     if (cfg) memset(cfg, 0, sizeof *cfg);
 }
 
-static vnet *create(const vnet_config *cfg_in, int *err, const relay_transport_ops *ops, void *tp) {
+typedef struct fallback_spec {
+    unsigned primary_timeout_ms;
+    relay_fallback_fn fn;
+    const void *arg;
+    size_t arg_len;
+} fallback_spec;
+
+static vnet *create(const vnet_config *cfg_in, int *err, const relay_transport_ops *ops, void *tp,
+                    const fallback_spec *fb) {
     vnet_config cfg;
     int rc;
     int owns_tp = ops != NULL;  // the caller's transport is ours to destroy until the relay backend takes it
@@ -117,17 +125,21 @@ static vnet *create(const vnet_config *cfg_in, int *err, const relay_transport_o
 
     // Relay backends time their handshake from creation: they need the clock
     // during init. (Loopback installs its virtual clock in its own init.)
-    if (!v->clock && (ops || cfg.backend == VNET_BACKEND_RELAY_UDP || cfg.backend == VNET_BACKEND_RELAY_WS))
+    if (!v->clock && (ops || cfg.backend == VNET_BACKEND_RELAY_UDP || cfg.backend == VNET_BACKEND_RELAY_WS ||
+                      cfg.backend == VNET_BACKEND_RELAY_WT || cfg.backend == VNET_BACKEND_RELAY_AUTO))
         v->clock = vnet__system_clock;
     if (ops) {  // test seam: a relay backend over the caller's transport
         owns_tp = 0;  // vnet__relay_init destroys it itself on failure
-        rc = vnet__relay_init(v, &cfg, ops, tp);
+        if (fb) rc = vnet__relay_init_fallback(v, &cfg, ops, tp, fb->primary_timeout_ms, fb->fn, fb->arg, fb->arg_len);
+        else rc = vnet__relay_init(v, &cfg, ops, tp);
     } else {
         switch (cfg.backend) {
             case VNET_BACKEND_UDP: rc = vnet__udp_init(v, &cfg); break;
             case VNET_BACKEND_LOOPBACK: rc = vnet__loopback_init(v, &cfg); break;
             case VNET_BACKEND_RELAY_UDP: rc = vnet__relay_udp_init(v, &cfg); break;
             case VNET_BACKEND_RELAY_WS: rc = vnet__relay_ws_init(v, &cfg); break;
+            case VNET_BACKEND_RELAY_WT: rc = vnet__relay_wt_init(v, &cfg); break;
+            case VNET_BACKEND_RELAY_AUTO: rc = vnet__relay_auto_init(v, &cfg); break;
             default: rc = VNET_ENOTSUP; break;
         }
     }
@@ -153,11 +165,18 @@ fail_noctx:
     return NULL;
 }
 
-vnet *vnet_create(const vnet_config *cfg, int *err) { return create(cfg, err, NULL, NULL); }
+vnet *vnet_create(const vnet_config *cfg, int *err) { return create(cfg, err, NULL, NULL, NULL); }
 
 vnet *vnet__create_with_relay_transport(const vnet_config *cfg, const relay_transport_ops *ops,
                                         void *tp, int *err) {
-    return create(cfg, err, ops, tp);
+    return create(cfg, err, ops, tp, NULL);
+}
+
+vnet *vnet__create_with_relay_fallback(const vnet_config *cfg, const relay_transport_ops *ops, void *tp,
+                                       unsigned primary_timeout_ms, relay_fallback_fn fb, const void *fb_arg,
+                                       size_t fb_arg_len, int *err) {
+    fallback_spec spec = {primary_timeout_ms, fb, fb_arg, fb_arg_len};
+    return create(cfg, err, ops, tp, &spec);
 }
 
 void vnet_destroy(vnet *v) {

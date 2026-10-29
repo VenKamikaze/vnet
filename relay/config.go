@@ -13,12 +13,15 @@ type Config struct {
 	// Rooms.
 	MaxMembers  int // members per room incl. the creator (2..254); default 8
 	MaxRooms    int // rooms at once; default 1000
-	MaxSessions int // members (UDP + WebSocket) at once, also caps open WebSockets; default 20000
+	MaxSessions int // members (UDP, WebSocket, WebTransport) at once, also caps open connections; default 20000
 	// Per source address (IPv6 sources are grouped by /64):
 	MaxSessionsPerIP  int           // members at once; default 128 (everyone behind one NAT shares it)
 	MaxRoomsPerIP     int           // rooms created and still alive; default 16
 	MaxWSPerIP        int           // open WebSockets; default 128
 	MaxPendingWSPerIP int           // WebSockets that have not entered a room yet; default 32
+	MaxWT             int           // WebTransport (QUIC) connections at once, whether or not they have a session (each costs roughly 250 KB; see relay/README.md); default 4000
+	MaxWTPerIP        int           // WebTransport (QUIC) connections per source address, whether or not they have a session; default 128
+	MaxPendingWTPerIP int           // of those, the ones that have not entered a room yet; default 32
 	PrefixFactor      int           // an IPv6 /48 may hold this many times the per-address caps above; default 4
 	RoomIdleTimeout   time.Duration // a room with no DATA for this long is closed; default 30 min
 
@@ -58,8 +61,14 @@ type Config struct {
 	WSSendQueue       int           // frames queued per WebSocket client before drops; default 128
 	WSSendQueueBytes  int           // bytes queued per WebSocket client before drops; default 65536
 	WSWriteTimeout    time.Duration // a WebSocket write that takes longer closes the connection; default 5 s
-	AllowedOrigins    []string      // Origin hosts allowed to open a WebSocket; empty or "*" = any
+	AllowedOrigins    []string      // Origin hosts allowed to open a WebSocket or WebTransport session; empty or "*" = any
 	TrustForwardedFor bool          // take the client IP from X-Forwarded-For (only behind a trusted proxy)
+
+	// WebTransport. The connection is also bounded by SessionTimeout (QUIC's
+	// idle timeout) and PingInterval (QUIC keep-alive).
+	WTSendQueue      int           // datagrams queued per WebTransport client before drops; default 128
+	WTSendQueueBytes int           // bytes queued per WebTransport client before drops; default 65536
+	WTWriteTimeout   time.Duration // a control-stream write that takes longer closes the session; default 5 s
 
 	// Test and logging hooks.
 	Now  func() time.Time
@@ -90,6 +99,12 @@ func (c Config) withDefaults() (Config, error) {
 	def(&c.MaxWSPerIP, 128)
 	def(&c.MaxPendingWSPerIP, 32)
 	def(&c.PrefixFactor, 4)
+	def(&c.MaxWT, 4000)
+	def(&c.MaxWTPerIP, 128)
+	def(&c.MaxPendingWTPerIP, 32)
+	def(&c.WTSendQueue, 128)
+	def(&c.WTSendQueueBytes, 65536)
+	defD(&c.WTWriteTimeout, 5*time.Second)
 	def(&c.WSSendQueueBytes, 65536)
 	defD(&c.WSWriteTimeout, 5*time.Second)
 	defD(&c.RetryCookieBucket, 16*time.Second)
@@ -124,7 +139,7 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MaxMembers < 2 || c.MaxMembers > 254 {
 		return c, fmt.Errorf("MaxMembers must be 2..254, got %d", c.MaxMembers)
 	}
-	if c.MaxRooms < 0 || c.MaxSessions < 0 || c.WSSendQueue < 0 {
+	if c.MaxRooms < 0 || c.MaxSessions < 0 || c.WSSendQueue < 0 || c.WTSendQueue < 0 || c.MaxWT < 0 || c.MaxWTPerIP < 0 || c.MaxPendingWTPerIP < 0 {
 		return c, fmt.Errorf("negative limit")
 	}
 	if c.KeepaliveInterval < time.Second {

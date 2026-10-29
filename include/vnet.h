@@ -11,6 +11,10 @@
  *                           addresses 10.0.0.N); see doco/relay-protocol.md
  *   VNET_BACKEND_RELAY_WS   browser (Emscripten) client of the vnet relay
  *                           over a WebSocket
+ *   VNET_BACKEND_RELAY_WT   browser client of the relay over WebTransport
+ *                           (unreliable datagrams)
+ *   VNET_BACKEND_RELAY_AUTO browser client: WebTransport if it works, else
+ *                           WebSocket; the game need not care which
  *
  * Any backend can be wrapped by an impairment layer (latency, jitter,
  * loss, duplication, reordering) driven by a seeded PRNG.
@@ -29,8 +33,9 @@
  *  - After setup, steady-state send/receive/poll performs no heap
  *    allocation (queues are sized and allocated in vnet_create() and
  *    vnet_open()). That is vnet's own code: in a browser build, Emscripten's
- *    WebSocket glue (and the browser) allocate for every message that
- *    arrives or is sent.
+ *    WebSocket glue, vnet's WebTransport glue (a copy of every frame in each
+ *    direction, in JavaScript) and the browser allocate for every message or
+ *    datagram that arrives or is sent.
  *  - Threading: a vnet context, and every loopback network and context
  *    attached to it, must be used from one thread at a time. Separate
  *    UDP contexts may be used from separate threads.
@@ -60,7 +65,7 @@ extern "C" {
 #endif
 
 #define VNET_VERSION_MAJOR 0
-#define VNET_VERSION_MINOR 2
+#define VNET_VERSION_MINOR 3
 #define VNET_VERSION_PATCH 0
 
 /*
@@ -219,6 +224,21 @@ int vnet_impair_parse(const char *spec, vnet_impair *out);
 #define VNET_BACKEND_RELAY_UDP 2  /* native client of the relay */
 #define VNET_BACKEND_RELAY_WS  3  /* browser client of the relay (Emscripten
                                      builds only; VNET_ENOTSUP elsewhere) */
+#define VNET_BACKEND_RELAY_WT  4  /* browser client of the relay over
+                                     WebTransport (Emscripten builds only).
+                                     `relay` is an "https://host:port/vnet" URL.
+                                     Datagrams are really unreliable and a lost
+                                     one stalls nothing. Fails (FAILED) where the
+                                     browser or the network has no WebTransport,
+                                     or (VNET_EMSGSIZE) if the check that a full
+                                     VNET_MAX_DATAGRAM datagram fits is lost to
+                                     very heavy packet loss: RELAY_AUTO would just
+                                     use the WebSocket then */
+#define VNET_BACKEND_RELAY_AUTO 5 /* browser client: try WebTransport, fall back
+                                     to WebSocket. Same `relay` as RELAY_WS
+                                     ("wss://host/vnet"); see relay_wt below.
+                                     vnet_status() says which one was chosen
+                                     (`transport`). Emscripten builds only */
 
 #define VNET_FAMILY_ANY 0   /* UDP: dual-stack IPv6 socket if available,
                                else IPv4 */
@@ -305,6 +325,25 @@ typedef struct vnet_config {
     void *clock_user;
     vnet_log_fn log;              /* NULL = silent */
     void *log_user;
+
+    /* Relay backends over WebTransport (VNET_BACKEND_RELAY_WT / _AUTO).
+     * Strings must stay valid only for the duration of vnet_create().
+     * (Added at the end of the struct, after the hooks.) */
+    const char *relay_wt;         /* AUTO: the WebTransport URL ("https://host:port/vnet").
+                                     NULL or "": derived from `relay` when that is
+                                     "wss://host[:port]/path" (-> "https://..."
+                                     with the same host, port and path); a plain
+                                     "ws://" `relay` has no WebTransport form, so
+                                     AUTO then uses WebSocket only */
+    const char *relay_cert_sha256; /* NULL: the browser verifies the relay's
+                                     certificate normally (production). Otherwise
+                                     64 hex digits, the SHA-256 of a relay
+                                     development certificate (-dev-cert), passed
+                                     to the browser as serverCertificateHashes */
+    int wt_timeout_ms;            /* AUTO: give WebTransport this long (connect,
+                                     room, datagram-size check) before falling
+                                     back to WebSocket; 0 = 3000. The WebSocket
+                                     attempt then gets relay_timeout_ms in full */
 } vnet_config;
 
 /* Set `cfg` to defaults (equivalent to zeroing it). */
@@ -415,9 +454,14 @@ typedef struct vnet_status_info {
     int state;               /* VNET_STATUS_* */
     int error;               /* FAILED: the VNET_E* reason (VNET_ETIMEDOUT,
                                 VNET_ENOROOM, VNET_EROOMFULL, VNET_ECONNREFUSED,
-                                VNET_ECLOSED ...). Otherwise 0 */
+                                VNET_ECLOSED ...; VNET_EMSGSIZE when a
+                                WebTransport connection cannot carry a
+                                VNET_MAX_DATAGRAM datagram). Otherwise 0 */
     const char *transport;   /* static name: "udp", "loopback", "relay-udp",
-                                "relay-ws" (later backends add their own) */
+                                "relay-ws", "relay-wt". With VNET_BACKEND_RELAY_AUTO
+                                it names the transport in use, so it changes
+                                from "relay-wt" to "relay-ws" if WebTransport
+                                failed; once READY it is final */
     char room[8];            /* relay: the room code (NUL-terminated) once
                                 READY, else "" */
     vnet_addr self;          /* relay: this context's virtual address

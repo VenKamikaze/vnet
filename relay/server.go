@@ -11,6 +11,9 @@ import (
 	"net/netip"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/webtransport-go"
 )
 
 // Server runs a Hub over UDP and WebSocket.
@@ -20,6 +23,10 @@ type Server struct {
 
 	mu   sync.Mutex
 	udp  *net.UDPConn
+	wt   *webtransport.Server
+	wtLn *quic.EarlyListener
+	wtTr *quic.Transport
+	wtPC net.PacketConn
 	wg   sync.WaitGroup
 	stop chan struct{}
 	once sync.Once
@@ -139,9 +146,14 @@ func (s *Server) Close() {
 		if s.udp != nil {
 			_ = s.udp.Close()
 		}
+		if s.wtLn != nil {
+			_ = s.wtLn.Close()
+			_ = s.wtTr.Close()
+			_ = s.wtPC.Close()
+		}
 		s.mu.Unlock()
 		s.hub.mu.RLock()
-		var conns []*wsConn
+		var conns []clientConn
 		for c := range s.hub.conns {
 			conns = append(conns, c)
 		}

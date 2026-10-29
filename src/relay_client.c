@@ -32,7 +32,7 @@ typedef struct rc_sock {
     rc_pkt *q;
 } rc_sock;
 
-enum { RC_HANDSHAKE, RC_READY, RC_FAILED };
+enum { RC_HANDSHAKE, RC_PROBE, RC_READY, RC_FAILED };
 
 typedef struct rc_state {
     const relay_transport_ops *ops;
@@ -58,7 +58,18 @@ typedef struct rc_state {
 
     uint64_t t_start;      // creation time: the handshake deadline counts from here
     unsigned hs_timeout_ms;
+    unsigned cfg_keepalive_ms;  // as configured (0: the relay's suggestion)
     unsigned keepalive_ms;
+
+    // Datagram-size probe (transports that cannot promise a full-size datagram).
+    uint64_t probe_next, probe_deadline;
+
+    // Fallback (VNET_BACKEND_RELAY_AUTO): if the first transport fails before
+    // the room is entered, fb opens the next one and the handshake starts over.
+    relay_fallback_fn fb;  // NULL when there is none (or once it has been used)
+    void *fb_arg;
+    unsigned primary_timeout_ms;
+    uint64_t stage_start;
     uint64_t ka_next;
     uint64_t last_rx;
 
@@ -190,6 +201,94 @@ static void queue_data(vnet *v, rc_state *st, const uint8_t *p, size_t n) {
     q->from.port = sport;
 }
 
+// ------------------------------------------------- datagram-size probe
+
+static int transport_may_truncate(const rc_state *st) {
+    return st->ops->max_data_frame && st->ops->max_data_frame(st->tp) < RELAY_WT_DATA_MAX;
+}
+
+static void enter_ready(rc_state *st, uint64_t now) {
+    st->phase = RC_READY;
+    st->ka_next = now + st->keepalive_ms;
+}
+
+static uint8_t probe_byte(size_t i, uint8_t octet) { return (uint8_t)(i * 7u + octet + 0x5au); }
+
+// A full-size DATA frame to ourselves (port 0: no socket has it), through the
+// relay. If it comes back, a VNET_MAX_DATAGRAM datagram fits both ways.
+static void send_probe(vnet *v, rc_state *st) {
+    uint8_t frame[RELAY_MAX_FRAME];
+    size_t n = 0;
+    frame[n++] = RELAY_T_DATA;
+    if (st->udp_style) {
+        memcpy(frame + n, st->token, RELAY_TOKEN_LEN);
+        n += RELAY_TOKEN_LEN;
+    }
+    frame[n++] = 10;
+    frame[n++] = 0;
+    frame[n++] = 0;
+    frame[n++] = st->octet;
+    put16(frame + n, RELAY_PROBE_PORT);
+    n += 2;
+    put16(frame + n, RELAY_PROBE_PORT);
+    n += 2;
+    for (size_t i = 0; i < VNET_MAX_DATAGRAM; i++) frame[n++] = probe_byte(i, st->octet);
+    int rc = st->ops->send(st->tp, frame, n);
+    if (rc < 0) vnet__logf(v, VNET_LOG_DEBUG, "datagram-size probe send failed (%d)", rc);
+}
+
+static void check_probe(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint64_t now) {
+    if (n != RELAY_WT_DATA_MAX || p[1] != 10 || p[2] != 0 || p[3] != 0 || p[4] != st->octet ||
+        get16(p + 5) != RELAY_PROBE_PORT || get16(p + 7) != RELAY_PROBE_PORT)
+        return;  // some other member's datagram, or not ours
+    for (size_t i = 0; i < VNET_MAX_DATAGRAM; i++)
+        if (p[RELAY_DATA_HDR_WS + i] != probe_byte(i, st->octet)) return;
+    st->last_rx = now;
+    vnet__logf(v, VNET_LOG_INFO, "a %d byte datagram fits over %s", (int)VNET_MAX_DATAGRAM, st->ops->name);
+    enter_ready(st, now);
+}
+
+// ------------------------------------------------------------- fallback
+
+// Start (or restart) the handshake with a fresh nonce.
+static int begin_handshake(rc_state *st) {
+    if (vnet__random(st->nonce, sizeof st->nonce) != 0) return -1;
+    st->hs_sent = 0;
+    memset(st->hs_cookie, 0, sizeof st->hs_cookie);
+    st->hs_backoff = 0;
+    st->hs_next = 0;
+    return 0;
+}
+
+// The first transport did not work out. Close it (a room or member it made
+// goes with the connection), open the fallback and handshake again on it,
+// with a new nonce: the relay would answer the old one with NONCE_REUSED.
+static void switch_transport(vnet *v, rc_state *st, const char *why, uint64_t now) {
+    relay_fallback_fn fb = st->fb;
+    st->fb = NULL;  // once
+    vnet__logf(v, VNET_LOG_INFO, "%s did not work (%s): falling back", st->ops->name, why);
+    if (st->tp) st->ops->destroy(st->tp);
+    st->tp = NULL;
+    const relay_transport_ops *ops = NULL;
+    void *tp = NULL;
+    int rc = fb(v, st->fb_arg, &ops, &tp);
+    if (rc != VNET_OK) {
+        fail(v, st, rc == VNET_ENOTSUP ? VNET_ECONNREFUSED : rc);
+        return;
+    }
+    st->ops = ops;
+    st->tp = tp;
+    st->udp_style = (ops->flags & RELAY_TPF_UDP_STYLE) != 0;
+    st->phase = RC_HANDSHAKE;
+    st->octet = 0;
+    memset(st->token, 0, sizeof st->token);
+    st->code[0] = 0;
+    st->keepalive_ms = st->cfg_keepalive_ms;
+    st->t_start = now;  // the fallback gets the whole handshake timeout
+    st->last_rx = now;
+    if (begin_handshake(st) != 0) fail(v, st, VNET_EIO);
+}
+
 static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint64_t now) {
     if (n == 0) return;
     switch (p[0]) {
@@ -212,9 +311,17 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
                 st->keepalive_ms = s ? s * 1000u : DEFAULT_KEEPALIVE_MS;
                 if (st->keepalive_ms > KEEPALIVE_MAX_MS) st->keepalive_ms = KEEPALIVE_MAX_MS;  // never let a relay's suggestion outlast its own timeout
             }
-            st->phase = RC_READY;
-            st->ka_next = now + st->keepalive_ms;
-            vnet__logf(v, VNET_LOG_INFO, "entered room %s as 10.0.0.%u", st->code, st->octet);
+            vnet__logf(v, VNET_LOG_INFO, "in room %s as 10.0.0.%u over %s", st->code, st->octet, st->ops->name);
+            if (transport_may_truncate(st)) {
+                // The transport cannot promise a full-size datagram: find out
+                // what really fits before the game is told it can send.
+                st->phase = RC_PROBE;
+                st->probe_deadline = now + RELAY_PROBE_TIMEOUT_MS;
+                send_probe(v, st);
+                st->probe_next = now + RELAY_PROBE_RETRY_MS;
+            } else {
+                enter_ready(st, now);
+            }
             break;
         case RELAY_T_ERROR: {
             if (n != RELAY_ERROR_LEN) return;
@@ -259,6 +366,10 @@ static void handle_frame(vnet *v, rc_state *st, const uint8_t *p, size_t n, uint
             }
             break;
         case RELAY_T_DATA:
+            if (st->phase == RC_PROBE) {
+                check_probe(v, st, p, n, now);
+                return;
+            }
             if (st->phase != RC_READY) return;
             st->last_rx = now;
             queue_data(v, st, p, n);
@@ -382,10 +493,24 @@ static void rc_poll(vnet *v) {
     if (st->phase == RC_FAILED) return;
     uint64_t now = vnet__now(v);
 
+    // Before the room is entered the first transport of a RELAY_AUTO context
+    // has primary_timeout_ms to get there; failing that, the fallback.
+    if (st->fb && st->phase != RC_READY && now - st->stage_start >= st->primary_timeout_ms) {
+        switch_transport(v, st, "timed out", now);
+        if (st->phase == RC_FAILED) return;
+    }
+
     int ts = st->ops->state(st->tp);
     if (ts == RELAY_TP_FAILED) {
-        fail(v, st, st->phase == RC_READY ? VNET_ECLOSED : VNET_ECONNREFUSED);
-        return;
+        if (st->fb && st->phase != RC_READY) {
+            switch_transport(v, st, "could not be opened", now);
+            if (st->phase == RC_FAILED) return;
+            ts = st->ops->state(st->tp);
+        }
+        if (ts == RELAY_TP_FAILED) {
+            fail(v, st, st->phase == RC_READY ? VNET_ECLOSED : VNET_ECONNREFUSED);
+            return;
+        }
     }
     if (ts == RELAY_TP_CONNECTING) {
         if (now - st->t_start >= st->hs_timeout_ms) fail(v, st, VNET_ETIMEDOUT);
@@ -424,6 +549,16 @@ static void rc_poll(vnet *v) {
             st->hs_backoff = st->hs_backoff * 2 > HANDSHAKE_RETRY_MAX_MS ? HANDSHAKE_RETRY_MAX_MS
                                                                           : st->hs_backoff * 2;
             st->hs_next = now + st->hs_backoff;
+        }
+    } else if (st->phase == RC_PROBE) {
+        if (now >= st->probe_deadline) {
+            vnet__logf(v, VNET_LOG_WARN, "a %d byte datagram does not fit over %s", (int)VNET_MAX_DATAGRAM,
+                       st->ops->name);
+            if (st->fb) switch_transport(v, st, "datagrams of full size do not fit", now);
+            else fail(v, st, VNET_EMSGSIZE);
+        } else if (now >= st->probe_next) {
+            send_probe(v, st);
+            st->probe_next = now + RELAY_PROBE_RETRY_MS;
         }
     } else {  // READY
         if (now - st->last_rx > 3u * st->keepalive_ms) {
@@ -481,10 +616,11 @@ static int rc_resolve(vnet *v, const char *hp, vnet_addr *out) {
 
 static void rc_destroy(vnet *v) {
     rc_state *st = v->bs;
-    if (st->phase == RC_READY) send_simple(v, st, RELAY_T_LEAVE);  // best effort
-    st->ops->destroy(st->tp);
+    if ((st->phase == RC_READY || st->phase == RC_PROBE) && st->tp) send_simple(v, st, RELAY_T_LEAVE);  // best effort
+    if (st->tp) st->ops->destroy(st->tp);
     for (int i = 0; i < st->nsocks; i++) free(st->socks[i].q);
     free(st->socks);
+    free(st->fb_arg);
     free(st);
 }
 
@@ -493,7 +629,9 @@ static const vnet_backend rc_backend = {
     rc_poll, rc_destroy, rc_status, rc_resolve,
 };
 
-int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp) {
+int vnet__relay_init_fallback(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp,
+                              unsigned primary_timeout_ms, relay_fallback_fn fb, const void *fb_arg,
+                              size_t fb_arg_len) {
     int rc = VNET_OK;
     rc_state *st = calloc(1, sizeof *st);
     if (!st) {
@@ -519,8 +657,19 @@ int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops 
         goto fail;
     }
     st->hs_timeout_ms = cfg->relay_timeout_ms ? (unsigned)cfg->relay_timeout_ms : DEFAULT_HANDSHAKE_TIMEOUT_MS;
-    st->keepalive_ms = (unsigned)cfg->keepalive_ms;  // 0: take the relay's suggestion
-    if (vnet__random(st->nonce, sizeof st->nonce) != 0) {
+    st->cfg_keepalive_ms = (unsigned)cfg->keepalive_ms;
+    st->keepalive_ms = st->cfg_keepalive_ms;  // 0: take the relay's suggestion
+    if (fb) {
+        st->fb_arg = malloc(fb_arg_len ? fb_arg_len : 1);
+        if (!st->fb_arg) {
+            rc = VNET_ENOMEM;
+            goto fail;
+        }
+        if (fb_arg_len) memcpy(st->fb_arg, fb_arg, fb_arg_len);
+        st->fb = fb;
+        st->primary_timeout_ms = primary_timeout_ms ? primary_timeout_ms : 3000u;
+    }
+    if (begin_handshake(st) != 0) {
         // No unpredictable nonce, no session: the nonce is a credential.
         vnet__logf(v, VNET_LOG_ERROR, "no secure random source for the handshake nonce");
         rc = VNET_EIO;
@@ -538,6 +687,7 @@ int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops 
     v->bs = st;
     // The clock may be injected (tests); take the start time only now.
     st->t_start = vnet__now(v);
+    st->stage_start = st->t_start;
     st->last_rx = st->t_start;
     // First poll sends the handshake once the transport is open. Do it now
     // too, so that a UDP relay is asked immediately.
@@ -547,6 +697,11 @@ int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops 
 fail:
     ops->destroy(tp);
     free(st->socks);
+    free(st->fb_arg);
     free(st);
     return rc;
+}
+
+int vnet__relay_init(vnet *v, const vnet_config *cfg, const relay_transport_ops *ops, void *tp) {
+    return vnet__relay_init_fallback(v, cfg, ops, tp, 0, NULL, NULL, 0);
 }

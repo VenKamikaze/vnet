@@ -9,6 +9,12 @@
 # (put TLS in front for wss://, see relay/README.md). Flags and VNET_RELAY_*
 # environment variables are described there too, e.g.
 #   docker run ... -e VNET_RELAY_MAX_MEMBERS=4 vnet-relay
+#
+# WebTransport (HTTP/3 over UDP, off unless -wt is given) needs a certificate
+# the image does not contain: mount one, or use -dev-cert for local trials:
+#   docker run --rm -p 7777:7777/udp -p 8080:8080 -p 4433:4433/udp \
+#       -v /etc/letsencrypt/live/relay.example.org:/certs:ro vnet-relay \
+#       -wt :4433 -wt-cert /certs/fullchain.pem -wt-key /certs/privkey.pem
 
 FROM golang:1.24-alpine AS build
 WORKDIR /src
@@ -19,6 +25,6 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vnet-relay ./cmd/v
 
 FROM scratch
 COPY --from=build /out/vnet-relay /vnet-relay
-EXPOSE 7777/udp 8080/tcp
+EXPOSE 7777/udp 8080/tcp 4433/udp
 USER 65534:65534
 ENTRYPOINT ["/vnet-relay"]

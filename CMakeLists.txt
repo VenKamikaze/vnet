@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(vnet
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "Virtual UDP for games: a small non-blocking datagram API with pluggable backends"
     LANGUAGES C)
 
@@ -37,9 +37,11 @@ add_library(vnet STATIC
     src/impair.c
     src/loopback.c
     src/random.c
+    src/relay_auto.c
     src/relay_client.c
     src/relay_udp.c
     src/relay_ws.c
+    src/relay_wt.c
     src/udp.c
     src/vnet.c)
 add_library(vnet::vnet ALIAS vnet)
@@ -63,7 +65,9 @@ endif()
 
 if(EMSCRIPTEN)
     # The browser WebSocket transport (VNET_BACKEND_RELAY_WS) uses Emscripten's
-    # <emscripten/websocket.h>. It needs no ports.
+    # <emscripten/websocket.h>. It needs no ports. The WebTransport transport
+    # (VNET_BACKEND_RELAY_WT / _AUTO) is EM_JS code inside relay_wt.c: no extra
+    # library, flag or file.
     target_link_libraries(vnet PUBLIC websocket.js)
 endif()
 

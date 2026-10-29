@@ -64,7 +64,7 @@ static void tp_destroy(void *p) {
     free(t);
 }
 
-static const relay_transport_ops udp_ops = {"relay-udp", RELAY_TPF_UDP_STYLE, tp_state, tp_send, tp_recv, tp_destroy};
+static const relay_transport_ops udp_ops = {"relay-udp", RELAY_TPF_UDP_STYLE, tp_state, tp_send, tp_recv, tp_destroy, NULL};
 
 // Resolve "host:port" / "[v6]:port": numeric addresses never block; a host
 // name is looked up once, here, with getaddrinfo().

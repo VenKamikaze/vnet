@@ -22,6 +22,7 @@ import (
 // gorilla/websocket allows one writer at a time and panics on concurrent
 // writes, so every write goes through write(), which holds wmu.
 type wsConn struct {
+	connState
 	hub      *Hub
 	c        *websocket.Conn
 	ip       netip.Addr // client address as seen (before ipKey)
@@ -34,6 +35,13 @@ type wsConn struct {
 	closeOnce sync.Once
 	wmu       sync.Mutex
 }
+
+func (c *wsConn) kind() connKind                  { return kindWS }
+func (c *wsConn) clientIP() netip.Addr            { return c.ip }
+func (c *wsConn) acceptedAt() time.Time           { return c.accepted }
+func (c *wsConn) getSession() *session            { return c.sess.Load() }
+func (c *wsConn) swapSession(s *session) *session { return c.sess.Swap(s) }
+func (c *wsConn) transportLive() bool             { return false } // pongs touch the session instead
 
 // write sends one message, serialised with every other write on the
 // connection and bounded by a deadline.
@@ -145,7 +153,7 @@ func (c *wsConn) handle(msg []byte, now time.Time, scratch *[]byte) bool {
 	s := c.sess.Load()
 	switch msg[0] {
 	case TypeCreate, TypeJoin:
-		return c.handshake(msg, now)
+		return h.connHandshake(c, msg, now)
 	case TypeLeave:
 		if s != nil {
 			h.leave(s)
@@ -173,8 +181,10 @@ func (c *wsConn) handle(msg []byte, now time.Time, scratch *[]byte) bool {
 	return true
 }
 
-func (c *wsConn) handshake(msg []byte, now time.Time) bool {
-	h := c.hub
+// connHandshake runs CREATE_ROOM / JOIN_ROOM for a connection of either
+// stream transport. The replies go through the connection's own queue. False
+// means close the connection.
+func (h *Hub) connHandshake(c clientConn, msg []byte, now time.Time) bool {
 	need := createLen
 	if msg[0] == TypeJoin {
 		need = joinLen
@@ -188,7 +198,7 @@ func (c *wsConn) handshake(msg []byte, now time.Time) bool {
 	copy(nonce[:], msg[2:2+NonceLen])
 	send := func(b []byte) { c.enqueue(b) }
 
-	if !h.ips.allowHandshake(c.ip, now) {
+	if !h.ips.allowHandshake(c.clientIP(), now) {
 		h.stats.rateLimited.Add(1)
 		send(encodeError(ErrRate, nonce))
 		return true
@@ -198,7 +208,7 @@ func (c *wsConn) handshake(msg []byte, now time.Time) bool {
 		send(encodeError(ErrBadVersion, nonce))
 		return true
 	}
-	req := hsReq{kind: msg[0], nonce: nonce, ws: c, ip: ipKey(c.ip)}
+	req := hsReq{kind: msg[0], nonce: nonce, conn: c, ip: ipKey(c.clientIP())}
 	if msg[0] == TypeJoin {
 		code, ok := normaliseCode(msg[createLen : createLen+CodeLen])
 		if !ok {
@@ -208,58 +218,97 @@ func (c *wsConn) handshake(msg []byte, now time.Time) bool {
 		}
 		req.code = code
 	}
-	if cur := c.sess.Load(); cur != nil && cur.nonce != nonce {
+	if cur := c.getSession(); cur != nil && cur.nonce != nonce {
 		send(encodeError(ErrAlreadyInRoom, nonce))
 		return true
 	}
 	reply, sess := h.handshake(req, now)
-	if sess != nil && c.sess.Swap(sess) == nil {
-		h.wsAuthenticated(c) // no longer "pending" for the per-address cap
+	if sess != nil && c.swapSession(sess) == nil {
+		h.connAuthenticated(c) // no longer "pending" for the per-address cap
 	}
 	send(reply)
 	return true
 }
 
-// acquireWS admits a new WebSocket from ip (a limiter key) or refuses it. The
-// check and the reservation are one step under the lock, so concurrent
-// upgrades cannot together exceed the limits.
-func (h *Hub) acquireWS(ip netip.Addr) bool {
+// acquireConn admits a new connection of the given kind from ip (a limiter
+// key) or refuses it. The check and the reservation are one step under the
+// lock, so concurrent upgrades cannot together exceed the limits.
+func (h *Hub) acquireConn(kind connKind, ip netip.Addr) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.wsReserved >= h.cfg.MaxSessions {
+	if h.connsHeld >= h.cfg.MaxSessions {
+		return false
+	}
+	if kind == kindWT && h.wtHeld >= h.cfg.MaxWT {
 		return false
 	}
 	for _, k := range keysFor(ip) {
 		if c := h.perIP[k]; c != nil {
-			_, _, cw, cp := h.capsFor(k)
-			if c.ws >= cw || c.pendingWS >= cp {
+			caps := h.capsFor(k)
+			if kind == kindWS && (c.ws >= caps.ws || c.pendingWS >= caps.pendingWS) {
+				return false
+			}
+			if kind == kindWT && (c.wt >= caps.wt || c.pendingWT >= caps.pendingWT) {
 				return false
 			}
 		}
 	}
-	h.wsReserved++
-	h.charge(ip, func(c *ipCount) { c.ws++; c.pendingWS++ })
+	h.connsHeld++
+	if kind == kindWT {
+		h.wtHeld++
+	}
+	h.charge(ip, func(c *ipCount) {
+		if kind == kindWS {
+			c.ws++
+			c.pendingWS++
+		} else {
+			c.wt++
+			c.pendingWT++
+		}
+	})
 	return true
 }
 
-// releaseWS gives back what acquireWS reserved (pending: the socket never
-// entered a room).
-func (h *Hub) releaseWS(ip netip.Addr, pending bool) {
+// releaseConn gives back what acquireConn reserved (pending: the connection
+// never entered a room, so it still holds its pending slot).
+func (h *Hub) releaseConn(kind connKind, ip netip.Addr, pending bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.wsReserved--
+	h.connsHeld--
+	if kind == kindWT {
+		h.wtHeld--
+	}
 	h.charge(ip, func(c *ipCount) {
-		c.ws--
-		if pending {
-			c.pendingWS--
+		if kind == kindWS {
+			c.ws--
+			if pending {
+				c.pendingWS--
+			}
+		} else {
+			c.wt--
+			if pending {
+				c.pendingWT--
+			}
 		}
 	})
 }
 
-func (h *Hub) wsAuthenticated(c *wsConn) {
+// connAuthenticated is called once when a connection enters a room: it no
+// longer counts as "pending" for the per-address cap.
+func (h *Hub) connAuthenticated(c clientConn) {
+	if !c.takePending() {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.charge(ipKey(c.ip), func(cnt *ipCount) { cnt.pendingWS-- })
+	kind := c.kind()
+	h.charge(ipKey(c.clientIP()), func(cnt *ipCount) {
+		if kind == kindWS {
+			cnt.pendingWS--
+		} else {
+			cnt.pendingWT--
+		}
+	})
 }
 
 // recoverPanic keeps a bug in one connection from taking the process down.
@@ -315,7 +364,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	h := s.hub
 	ip := s.clientIP(r)
 	key := ipKey(ip)
-	if !h.acquireWS(key) {
+	if !h.acquireConn(kindWS, key) {
 		h.stats.wsRefused.Add(1)
 		http.Error(w, "too many connections", http.StatusServiceUnavailable)
 		return
@@ -333,6 +382,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 		out:      make(chan []byte, h.cfg.WSSendQueue),
 		done:     make(chan struct{}),
 	}
+	c.pendingHeld.Store(true)
 	if err == nil {
 		func() {
 			h.mu.Lock()
@@ -355,7 +405,7 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 			}()
 			c.close()
 		}
-		h.releaseWS(key, err != nil || c.sess.Load() == nil)
+		h.releaseConn(kindWS, key, c.takePending())
 	}()
 	if err != nil {
 		return // Upgrade has replied

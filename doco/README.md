@@ -15,7 +15,7 @@ Each brief (`NN-*.md`) is one implement → review → merge cycle. Brief number
 |---|---|---|---|
 | 06 | [vnet core: API, loopback and native UDP](06-vnet-core.md) | — | done |
 | 10 | [Relay and WebSocket transport](10-vnet-relay-websocket.md) | 06 | done |
-| 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | todo |
+| 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | done |
 
 **Bit Riot briefs that consume vnet:** 07 (native lockstep, needs 06) and 12 (browser netplay, needs 10). A session doing those needs both repos attached.
 

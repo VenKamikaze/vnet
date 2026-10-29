@@ -25,20 +25,23 @@ import (
 const waitLimit = 5 * time.Second
 
 type env struct {
-	t     *testing.T
-	srv   *Server
-	clock *fakeClock
-	udp   *net.UDPAddr
-	http  *httptest.Server
-	stats *httptest.Server
-	wsURL string
+	t        *testing.T
+	srv      *Server
+	clock    *fakeClock
+	udp      *net.UDPAddr
+	http     *httptest.Server
+	stats    *httptest.Server
+	wsURL    string
+	wt       *net.UDPAddr // the WebTransport listener, if listenWT was called
+	certHash string       // hex SHA-256 of its development certificate
 }
 
 func newEnv(t *testing.T, mod func(*Config)) *env {
 	t.Helper()
 	clk := newFakeClock()
 	cfg := Config{Now: clk.Now, PingInterval: time.Hour,
-		MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6}
+		MaxSessionsPerIP: 1e6, MaxRoomsPerIP: 1e6, MaxWSPerIP: 1e6, MaxPendingWSPerIP: 1e6,
+		MaxWTPerIP: 1e6, MaxPendingWTPerIP: 1e6}
 	if mod != nil {
 		mod(&cfg)
 	}
@@ -796,8 +799,8 @@ func TestWebSocketBadFrameWhileTheWriterIsBusyDoesNotCrashTheRelay(t *testing.T)
 		waitFor(t, "replies to queue behind the stuck writer", func() bool {
 			srv.hub.mu.RLock()
 			defer srv.hub.mu.RUnlock()
-			for c := range srv.hub.conns {
-				if len(c.out) >= 5 {
+			for ci := range srv.hub.conns {
+				if c, ok := ci.(*wsConn); ok && len(c.out) >= 5 {
 					return true
 				}
 			}
@@ -997,8 +1000,8 @@ func TestSweepDoesNotStallBehindClientsThatStopReading(t *testing.T) {
 func queuedFrames(srv *Server, w *wsC) int {
 	srv.hub.mu.RLock()
 	defer srv.hub.mu.RUnlock()
-	if s := srv.hub.byToken[w.room.token]; s != nil && s.ws != nil {
-		return len(s.ws.out)
+	if s := srv.hub.byToken[w.room.token]; s != nil && s.conn != nil {
+		return len(s.conn.(*wsConn).out)
 	}
 	return -1
 }

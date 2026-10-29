@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,6 +42,15 @@ func main() {
 		perIPWS    = fs.Int("max-ws-per-ip", 128, "open WebSockets per source address")
 		perIPPend  = fs.Int("max-pending-ws-per-ip", 32, "WebSockets per source address that have not entered a room yet")
 		prefixFac  = fs.Int("ipv6-prefix-factor", 4, "an IPv6 /48 may hold this many times the per-address caps in total")
+		wtAddr     = fs.String("wt", "", "UDP listen address for WebTransport (HTTP/3), e.g. :4433 or :443; empty disables. Needs -wt-cert and -wt-key, or -dev-cert")
+		wtCert     = fs.String("wt-cert", "", "WebTransport: TLS certificate chain (PEM); reloaded when the file changes")
+		wtKey      = fs.String("wt-key", "", "WebTransport: TLS private key (PEM)")
+		devCert    = fs.Bool("dev-cert", false, "WebTransport, development only: generate a 13-day ECDSA certificate and print its SHA-256 hash (for serverCertificateHashes)")
+		devNames   = fs.String("dev-cert-names", "", "extra host names or IP addresses for the -dev-cert certificate, comma separated (localhost, 127.0.0.1 and ::1 are always there)")
+		maxWT      = fs.Int("max-wt", 4000, "WebTransport (QUIC) connections at once, with or without a session; each costs roughly 250 KB of memory")
+		perIPWT    = fs.Int("max-wt-per-ip", 128, "WebTransport (QUIC) connections per source address, with or without a session")
+		perIPPWT   = fs.Int("max-pending-wt-per-ip", 32, "WebTransport connections per source address that have not entered a room yet")
+		wtQBytes   = fs.Int("wt-queue-bytes", 65536, "bytes of datagrams queued per WebTransport client before its datagrams are dropped")
 		wsQBytes   = fs.Int("ws-queue-bytes", 65536, "bytes queued per WebSocket client before its datagrams are dropped")
 		statsAddr  = fs.String("stats", "", "serve /stats (JSON counters) on this address, e.g. 127.0.0.1:8081; off by default")
 		roomIdle   = fs.Duration("room-idle", 30*time.Minute, "close a room that has carried no data for this long")
@@ -74,6 +84,10 @@ func main() {
 		MaxPendingWSPerIP: *perIPPend,
 		PrefixFactor:      *prefixFac,
 		WSSendQueueBytes:  *wsQBytes,
+		MaxWT:             *maxWT,
+		MaxWTPerIP:        *perIPWT,
+		MaxPendingWTPerIP: *perIPPWT,
+		WTSendQueueBytes:  *wtQBytes,
 		RoomIdleTimeout:   *roomIdle,
 		SessionTimeout:    *sessTO,
 		KeepaliveInterval: *keepalive,
@@ -133,9 +147,55 @@ func main() {
 		statsSrv = &http.Server{Handler: srv.StatsHandler(), ReadHeaderTimeout: 10 * time.Second}
 		go func() { _ = statsSrv.Serve(ln) }()
 	}
+	var wtBound, wtCertHash string
+	if *wtAddr != "" {
+		var tc tls.Config
+		switch {
+		case *devCert && (*wtCert != "" || *wtKey != ""):
+			log.Fatal("-dev-cert and -wt-cert/-wt-key are alternatives")
+		case *devCert:
+			var names []string
+			if *devNames != "" {
+				names = strings.Split(*devNames, ",")
+			}
+			cert, hash, err := relay.NewDevCert(time.Now(), names...)
+			if err != nil {
+				log.Fatalf("dev cert: %v", err)
+			}
+			r, err := relay.NewStaticCert(cert, log.Printf)
+			if err != nil {
+				log.Fatalf("dev cert: %v", err)
+			}
+			tc.GetCertificate = r.GetCertificate
+			wtCertHash = hash
+			log.Printf("WebTransport DEVELOPMENT certificate (local trials only, NOT FOR PRODUCTION): SHA-256 %s, valid %v from now, a new one at every start; pass the hash as serverCertificateHashes and restart before it expires",
+				hash, relay.DevCertValidity)
+		case *wtCert != "" && *wtKey != "":
+			r, err := relay.NewCertReloader(*wtCert, *wtKey, log.Printf)
+			if err != nil {
+				log.Fatalf("webtransport: %v", err)
+			}
+			tc.GetCertificate = r.GetCertificate
+		default:
+			log.Fatal("-wt needs -wt-cert and -wt-key (or -dev-cert for local development)")
+		}
+		a, err := srv.ListenWT(*wtAddr, &tc)
+		if err != nil {
+			log.Fatalf("webtransport: %v", err)
+		}
+		wtBound = a.String()
+		if *devCert {
+			if w := relay.DevCertWarning(a); w != "" {
+				log.Print(w)
+			}
+		}
+	} else if *devCert || *wtCert != "" || *wtKey != "" {
+		log.Fatal("-dev-cert, -wt-cert and -wt-key need -wt")
+	}
 	// One machine-readable line for scripts and tests: the bound addresses
-	// (useful with port 0).
-	fmt.Printf("LISTEN udp=%s http=%s stats=%s\n", udpBound, httpBound, statsBound)
+	// (useful with port 0), then the WebTransport address and, in -dev-cert
+	// mode, the hash of the certificate.
+	fmt.Printf("LISTEN udp=%s http=%s stats=%s wt=%s wt_cert_sha256=%s\n", udpBound, httpBound, statsBound, wtBound, wtCertHash)
 	_ = os.Stdout.Sync()
 
 	srv.Run(ctx) // returns on SIGINT/SIGTERM after closing the server

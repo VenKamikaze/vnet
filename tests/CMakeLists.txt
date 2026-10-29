@@ -37,6 +37,7 @@ add_executable(vnet_tests
     test_lifecycle.cpp
     test_relay_client.cpp
     test_relay_ws_style.cpp
+    test_relay_fallback.cpp
     test_util.h
     relay_test_util.h)
 target_link_libraries(vnet_tests PRIVATE vnet GTest::gtest GTest::gtest_main)

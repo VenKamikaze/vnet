@@ -9,10 +9,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sort"
@@ -23,6 +31,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/webtransport-go"
 )
 
 const (
@@ -38,6 +48,10 @@ const (
 type client struct {
 	udp     *net.UDPConn
 	ws      *websocket.Conn
+	wt      *webtransport.Session // WebTransport: control frames on ctl, DATA as datagrams
+	ctl     *webtransport.Stream
+	wtRx    chan []byte
+	wtStop  context.CancelFunc
 	token   [16]byte
 	octet   byte
 	code    string
@@ -48,7 +62,17 @@ type client struct {
 	members int
 }
 
+// tokenless: WebSocket and WebTransport frames carry no session token.
+func (c *client) tokenless() bool { return c.ws != nil || c.wt != nil }
+
 func (c *client) write(b []byte) error {
+	if c.wt != nil {
+		if b[0] == typeData {
+			return c.wt.SendDatagram(b)
+		}
+		_, err := c.ctl.Write(append([]byte{byte(len(b) >> 8), byte(len(b))}, b...))
+		return err
+	}
 	if c.ws != nil {
 		return c.ws.WriteMessage(websocket.BinaryMessage, b)
 	}
@@ -57,11 +81,99 @@ func (c *client) write(b []byte) error {
 }
 
 func (c *client) read(b []byte) (int, error) {
+	if c.wt != nil {
+		select {
+		case m, ok := <-c.wtRx:
+			if !ok {
+				return 0, io.EOF
+			}
+			return copy(b, m), nil
+		case <-time.After(2 * time.Second):
+			return 0, errors.New("timeout")
+		}
+	}
 	if c.ws != nil {
 		_, m, err := c.ws.ReadMessage()
 		return copy(b, m), err
 	}
 	return c.udp.Read(b)
+}
+
+func (c *client) close() {
+	switch {
+	case c.wt != nil:
+		c.wtStop()
+		_ = c.wt.CloseWithError(0, "")
+	case c.ws != nil:
+		c.ws.Close()
+	default:
+		c.udp.Close()
+	}
+}
+
+// dialWT opens a WebTransport session whose certificate must have the given
+// SHA-256 (a relay -dev-cert), as a browser's serverCertificateHashes does.
+func dialWT(url, hexHash string) (*client, error) {
+	want, err := hex.DecodeString(hexHash)
+	if err != nil || len(want) != 32 {
+		return nil, errors.New("-wt-hash must be 64 hex digits")
+	}
+	d := &webtransport.Dialer{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13,
+			VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+				if len(raw) == 0 {
+					return errors.New("no certificate")
+				}
+				if sum := sha256.Sum256(raw[0]); !bytes.Equal(sum[:], want) {
+					return errors.New("certificate hash mismatch")
+				}
+				return nil
+			}},
+		QUICConfig: &quic.Config{EnableDatagrams: true, EnableStreamResetPartialDelivery: true},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, sess, err := d.Dial(ctx, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	rctx, stop := context.WithCancel(context.Background())
+	st, err := sess.OpenStreamSync(ctx)
+	if err != nil {
+		stop()
+		return nil, err
+	}
+	c := &client{wt: sess, ctl: st, wtRx: make(chan []byte, 1024), wtStop: stop}
+	go func() { // control frames, length prefixed
+		var hdr [2]byte
+		for {
+			if _, err := io.ReadFull(st, hdr[:]); err != nil {
+				return
+			}
+			b := make([]byte, int(hdr[0])<<8|int(hdr[1]))
+			if _, err := io.ReadFull(st, b); err != nil {
+				return
+			}
+			select {
+			case c.wtRx <- b:
+			case <-rctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { // datagrams
+		for {
+			b, err := sess.ReceiveDatagram(rctx)
+			if err != nil {
+				return
+			}
+			select {
+			case c.wtRx <- b:
+			default: // a receiver that cannot keep up loses datagrams
+			}
+		}
+	}()
+	return c, nil
 }
 
 func handshake(c *client, code string) error {
@@ -74,7 +186,7 @@ func handshake(c *client, code string) error {
 			f[0] = typeJoin
 			f = append(f, code...)
 		}
-		if c.ws == nil { // UDP: the retry cookie follows the fields, and the datagram is padded
+		if !c.tokenless() { // UDP: the retry cookie follows the fields, and the datagram is padded
 			f = append(f, make([]byte, 16)...)
 			if cookie != nil {
 				copy(f[len(f)-16:], cookie)
@@ -119,7 +231,7 @@ func handshake(c *client, code string) error {
 
 func (c *client) frame(dstOctet byte, payload []byte) []byte {
 	b := []byte{typeData}
-	if c.ws == nil {
+	if !c.tokenless() {
 		b = append(b, c.token[:]...)
 	}
 	b = append(b, 10, 0, 0, dstOctet, 0x13, 0x88, 0x13, 0x88)
@@ -157,6 +269,9 @@ func main() {
 	udpAddr := flag.String("udp", "127.0.0.1:7777", "relay UDP address")
 	wsURL := flag.String("ws", "", "relay WebSocket URL (used for the clients selected by -ws-every)")
 	wsEvery := flag.Int("ws-every", 0, "every Nth client uses WebSocket (0: none, 1: all)")
+	wtURL := flag.String("wt", "", "relay WebTransport URL (used for the clients selected by -wt-every)")
+	wtHash := flag.String("wt-hash", "", "SHA-256 of the relay's -dev-cert certificate, hex")
+	wtEvery := flag.Int("wt-every", 0, "every Nth client uses WebTransport (0: none, 1: all); checked before -ws-every")
 	pid := flag.Int("pid", 0, "relay process id, to report its CPU and memory")
 	rooms := flag.Int("rooms", 50, "rooms")
 	members := flag.Int("clients", 4, "clients per room")
@@ -172,7 +287,15 @@ func main() {
 		code := ""
 		for m := 0; m < *members; m++ {
 			c := &client{members: *members}
-			if *wsEvery > 0 && idx%*wsEvery == 0 {
+			if *wtEvery > 0 && idx%*wtEvery == 0 {
+				w, err := dialWT(*wtURL, *wtHash)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "wt dial:", err)
+					os.Exit(1)
+				}
+				w.members = *members
+				c = w
+			} else if *wsEvery > 0 && idx%*wsEvery == 0 {
 				conn, _, err := websocket.DefaultDialer.Dial(*wsURL, nil)
 				if err != nil {
 					fmt.Fprintln(os.Stderr, "ws dial:", err)
@@ -263,7 +386,11 @@ func main() {
 						}
 					}
 					if int(c.sent.Load())%(*pps*3) == 0 { // an occasional keepalive, like a real client
-						_ = c.write(append([]byte{typeKeepalive}, c.token[:]...))
+						if c.tokenless() {
+							_ = c.write([]byte{typeKeepalive})
+						} else {
+							_ = c.write(append([]byte{typeKeepalive}, c.token[:]...))
+						}
 					}
 				}
 			}(r, i, c, rc)
@@ -278,11 +405,7 @@ func main() {
 	}
 	rss, hwm := statusKB(*pid, "VmRSS"), statusKB(*pid, "VmHWM")
 	for _, c := range all {
-		if c.udp != nil {
-			c.udp.Close()
-		} else {
-			c.ws.Close()
-		}
+		c.close()
 	}
 	wg.Wait()
 
