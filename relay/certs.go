@@ -84,9 +84,75 @@ type CertReloader struct {
 	certMod  time.Time
 	keyMod   time.Time
 	lastScan time.Time
+
+	notAfter time.Time // end of validity of the certificate being served
+	lastNote time.Time // when an expiry warning was last logged
 }
 
-const certRecheck = time.Minute
+const (
+	certRecheck = time.Minute
+	// A certificate with less than this left is reported at every handshake
+	// after certNoteEvery since the last report; one that has expired too.
+	// (Let's Encrypt certificates are renewed with 30 days to go, so a warning
+	// at 7 days means the renewal is failing; a development certificate lasts
+	// 13 days, so it warns from the sixth.)
+	certWarnBefore = 7 * 24 * time.Hour
+	certNoteEvery  = time.Hour
+)
+
+// NewStaticCert serves one certificate that is never reloaded (the development
+// certificate), with the same expiry warnings as a CertReloader.
+func NewStaticCert(cert tls.Certificate, logf func(string, ...any)) (*CertReloader, error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	r := &CertReloader{logf: logf, now: time.Now, cert: &cert}
+	if err := r.parseExpiry(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (r *CertReloader) parseExpiry() error {
+	if len(r.cert.Certificate) == 0 {
+		return fmt.Errorf("empty certificate")
+	}
+	x, err := x509.ParseCertificate(r.cert.Certificate[0])
+	if err != nil {
+		return err
+	}
+	r.notAfter = x.NotAfter
+	return nil
+}
+
+// noteExpiry logs a warning when the certificate is close to the end of its
+// validity and an error when it has passed it, at most once per certNoteEvery.
+// Browsers refuse an expired certificate, and a relay that nobody watches
+// would otherwise just stop being reachable over WebTransport.
+func (r *CertReloader) noteExpiry(now time.Time) {
+	left := r.notAfter.Sub(now)
+	if left >= certWarnBefore || (!r.lastNote.IsZero() && now.Sub(r.lastNote) < certNoteEvery) {
+		return
+	}
+	r.lastNote = now
+	if left <= 0 {
+		r.logf("ERROR: the WebTransport certificate expired at %s; browsers refuse it, so WebTransport clients fall back to WebSocket or fail. Renew it (or restart, with -dev-cert)", r.notAfter.Format(time.RFC3339))
+		return
+	}
+	r.logf("WARNING: the WebTransport certificate expires in %s (at %s)", left.Round(time.Minute), r.notAfter.Format(time.RFC3339))
+}
+
+// DevCertWarning returns a warning to log if a development certificate is
+// being served on an address that other machines can reach (empty if it is a
+// loopback address): such a relay cannot be used by pages that pin the
+// certificate hash from elsewhere either, and is almost certainly a mistake.
+func DevCertWarning(addr net.Addr) string {
+	ua, ok := addr.(*net.UDPAddr)
+	if ok && ua.IP != nil && ua.IP.IsLoopback() {
+		return ""
+	}
+	return fmt.Sprintf("WARNING: -dev-cert on %s, which is not a loopback address: a development certificate is for local trials only (it lasts 13 days, changes at every start and is accepted only by pages that pin its hash). Use -wt-cert and -wt-key in production", addr)
+}
 
 // NewCertReloader loads the pair once; it fails if that does not work.
 func NewCertReloader(certFile, keyFile string, logf func(string, ...any)) (*CertReloader, error) {
@@ -109,7 +175,12 @@ func (r *CertReloader) load() error {
 	if err != nil {
 		return fmt.Errorf("loading %s and %s: %w", r.certFile, r.keyFile, err)
 	}
+	prev := r.cert
 	r.cert, r.certMod, r.keyMod = &c, cm, km
+	if err := r.parseExpiry(); err != nil {
+		r.cert = prev
+		return fmt.Errorf("parsing %s: %w", r.certFile, err)
+	}
 	return nil
 }
 
@@ -129,7 +200,9 @@ func (r *CertReloader) mods() (cert, key time.Time, err error) {
 func (r *CertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if now := r.now(); now.Sub(r.lastScan) >= certRecheck {
+	now := r.now()
+	defer r.noteExpiry(now)
+	if r.certFile != "" && now.Sub(r.lastScan) >= certRecheck {
 		r.lastScan = now
 		if cm, km, err := r.mods(); err == nil && (!cm.Equal(r.certMod) || !km.Equal(r.keyMod)) {
 			if err := r.load(); err != nil {

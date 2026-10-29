@@ -498,6 +498,23 @@ func TestWebTransportConnectionsWithoutASessionAreCappedPerAddress(t *testing.T)
 	}
 }
 
+func TestWebTransportGlobalCapRefusesConnectionsFromAnywhere(t *testing.T) {
+	e := newEnvWT(t, func(c *Config) { c.MaxWT = 2 })
+	a := dialWT(t, e.wt, e.certHash).create()
+	b := dialWT(t, e.wt, e.certHash).join(a.room.code)
+	if _, _, err := dialWTRaw(t, e.wt, e.certHash, nil); err == nil {
+		t.Fatal("a third connection was admitted with max-wt 2")
+	}
+	if n := e.srv.Stats().WTRefused; n < 1 {
+		t.Fatalf("wt_refused = %d", n)
+	}
+	// WebSockets and UDP members are not affected.
+	ws := dialWS(t, e.wsURL).join(a.room.code)
+	send(ws, a, 1, 1, "still fine")
+	expectData(t, a, ws, 1, 1, "still fine")
+	_ = b
+}
+
 func TestWebTransportSessionsArePerAddressCappedAndEnteringARoomFreesPendingSlots(t *testing.T) {
 	e := newEnvWT(t, func(c *Config) { c.MaxPendingWTPerIP = 1; c.MaxWTPerIP = 2 })
 	first := dialWT(t, e.wt, e.certHash) // pending: has a session but no room

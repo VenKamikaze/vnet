@@ -558,6 +558,43 @@ func TestWTAndWebSocketShareTheGlobalConnectionCap(t *testing.T) {
 	}
 }
 
+// WebTransport connections are much heavier than WebSocket ones (a QUIC
+// connection, several goroutines, buffers), so they have a cap of their own,
+// well below the cap they share with WebSockets (max-sessions), whoever the
+// connections come from.
+func TestWTHasAGlobalCapOfItsOwn(t *testing.T) {
+	th := newTestHub(t, func(c *Config) { c.MaxWT = 3; c.MaxSessions = 100 })
+	h := th.h
+	ip := func(i int) netip.Addr { return netip.MustParseAddr(fmt.Sprintf("198.51.100.%d", i)) }
+	var conns []*wtConn
+	for i := 1; i <= 3; i++ { // three different addresses: no per-address cap is involved
+		c, ok := h.wtAdmit(ip(i))
+		if !ok {
+			t.Fatalf("connection %d refused below the cap", i)
+		}
+		conns = append(conns, c)
+	}
+	if _, ok := h.wtAdmit(ip(4)); ok {
+		t.Fatal("the WebTransport cap of 3 was exceeded")
+	}
+	if h.snapshot().WTRefused != 1 {
+		t.Fatalf("refused = %d", h.snapshot().WTRefused)
+	}
+	// WebSockets are not held up by it.
+	if !h.acquireConn(kindWS, ip(5)) {
+		t.Fatal("a WebSocket was refused because of the WebTransport cap")
+	}
+	// A connection that ends gives its place back, once.
+	h.wtGone(conns[0])
+	h.wtGone(conns[0])
+	if _, ok := h.wtAdmit(ip(6)); !ok {
+		t.Fatal("a released place was not reusable")
+	}
+	if _, ok := h.wtAdmit(ip(7)); ok {
+		t.Fatal("a double release made room for a fourth connection")
+	}
+}
+
 func TestWTTokenIsNoCredentialOverUDP(t *testing.T) {
 	th := newTestHub(t, nil)
 	host := th.wtClient("192.0.2.1").create()
@@ -785,7 +822,7 @@ func TestWTStatsReportsBothKinds(t *testing.T) {
 }
 
 func TestConfigRejectsNegativeWebTransportLimits(t *testing.T) {
-	for _, c := range []Config{{MaxWTPerIP: -1}, {MaxPendingWTPerIP: -1}, {WTSendQueue: -1}} {
+	for _, c := range []Config{{MaxWT: -1}, {MaxWTPerIP: -1}, {MaxPendingWTPerIP: -1}, {WTSendQueue: -1}} {
 		if _, err := New(c); err == nil {
 			t.Fatalf("%+v accepted", c)
 		}

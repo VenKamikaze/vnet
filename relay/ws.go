@@ -239,6 +239,9 @@ func (h *Hub) acquireConn(kind connKind, ip netip.Addr) bool {
 	if h.connsHeld >= h.cfg.MaxSessions {
 		return false
 	}
+	if kind == kindWT && h.wtHeld >= h.cfg.MaxWT {
+		return false
+	}
 	for _, k := range keysFor(ip) {
 		if c := h.perIP[k]; c != nil {
 			caps := h.capsFor(k)
@@ -251,6 +254,9 @@ func (h *Hub) acquireConn(kind connKind, ip netip.Addr) bool {
 		}
 	}
 	h.connsHeld++
+	if kind == kindWT {
+		h.wtHeld++
+	}
 	h.charge(ip, func(c *ipCount) {
 		if kind == kindWS {
 			c.ws++
@@ -269,6 +275,9 @@ func (h *Hub) releaseConn(kind connKind, ip netip.Addr, pending bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.connsHeld--
+	if kind == kindWT {
+		h.wtHeld--
+	}
 	h.charge(ip, func(c *ipCount) {
 		if kind == kindWS {
 			c.ws--

@@ -73,8 +73,13 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 #include <emscripten.h>
 #include <stdlib.h>
 
-// Frames waiting in JavaScript for C; more are dropped (a lossy network).
+// Datagrams waiting in JavaScript for C; more are dropped (a lossy network).
+// Control frames wait in a queue of their own and are never dropped: a
+// datagram burst must not cost a ROOM or an ERROR. They are few (answers to
+// requests the client made), so a control queue this long means C has not
+// polled for a very long time, and the session is declared failed.
 #define JS_INBOX_FRAMES 256
+#define JS_CONTROL_FRAMES 256
 // Datagram writes the browser has not finished with; more are dropped rather
 // than queued behind stale ones (vnet is unreliable). Control writes that
 // stay unfinished this long mean the connection is stuck.
@@ -85,22 +90,33 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 // object is missing, as in an old browser or an insecure page) or the browser
 // refused the arguments. hash (32 bytes, or hashlen == 0) is a SHA-256
 // certificate hash for serverCertificateHashes.
-EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int inbox_frames, int max_frame, int ctl_max), {
+EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int inbox_frames, int max_frame, int ctl_max, int ctl_frames), {
   var T = Module.vnetWT || (Module.vnetWT = { next: 1, s: {} });
+  // Queue a frame for C. Datagrams: dropped when the queue is full or the
+  // frame is not acceptable. Control frames: never dropped; too many waiting
+  // means the session is stuck.
+  if (!T.enqueue) {
+    T.enqueue = function (s, control, u8) {
+      if (u8.length === 0 || u8.length > s.maxFrame) { s.drops++; return; }
+      if (control) {
+        if (s.qc.length >= s.ctlFrames) { if (s.state !== 3) { s.state = 2; s.reason = "control queue overflow"; } return; }
+        s.qc.push(u8);
+      } else {
+        if (s.q.length >= s.inbox) { s.drops++; return; }
+        s.q.push(u8);
+      }
+    };
+  }
   if (typeof WebTransport === "undefined") return 0;
   var opts = {};
   if (hashlen === 32) {
     opts.serverCertificateHashes = [{ algorithm: "sha-256", value: HEAPU8.slice(hash, hash + 32) }];
   }
-  var s = { id: T.next++, state: 0, q: [], maxdg: 0, dgInFlight: 0, ctlInFlight: 0, wt: null, dw: null, cw: null,
-            drops: 0, reason: "" };
+  var s = { id: T.next++, state: 0, q: [], qc: [], inbox: inbox_frames, maxFrame: max_frame, ctlFrames: ctl_frames,
+            maxdg: 0, dgInFlight: 0, ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
   try { s.wt = new WebTransport(UTF8ToString(url), opts); } catch (e) { return 0; }
   T.s[s.id] = s;
   var fail = function (why) { if (s.state !== 3) { s.state = 2; if (!s.reason) s.reason = String(why); } };
-  var push = function (u8) {
-    if (s.q.length >= inbox_frames || u8.length === 0 || u8.length > max_frame) { s.drops++; return; }
-    s.q.push(u8);
-  };
   // After the session is up, any end of it is a failure; before, too.
   s.wt.closed.then(function () { fail("closed"); }, function (e) { fail(e); });
   s.wt.ready.then(function () {
@@ -126,7 +142,7 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
           var n = (acc[0] << 8) | acc[1];
           if (n === 0 || n > ctl_max) { fail("bad control frame length " + n); return; }
           if (acc.length < 2 + n) break;
-          push(acc.slice(2, 2 + n));
+          T.enqueue(s, true, acc.slice(2, 2 + n));
           acc = acc.subarray(2 + n);
         }
         if (acc.length > 2 + ctl_max) { fail("control stream overrun"); return; }
@@ -137,7 +153,7 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
     (function pumpD() {
       dr.read().then(function (r) {
         if (r.done) return;
-        push(r.value);
+        T.enqueue(s, false, r.value);
         pumpD();
       }, function (e) { fail(e); });
     })();
@@ -163,8 +179,8 @@ EM_JS(int, vnet_wt_max_datagram, (int id), {
 // none, -2 if it did not fit (it is consumed, never truncated).
 EM_JS(int, vnet_wt_recv, (int id, uint8_t *buf, int cap), {
   var s = Module.vnetWT && Module.vnetWT.s[id];
-  if (!s || s.q.length === 0) return -1;
-  var f = s.q.shift();
+  if (!s || (s.qc.length === 0 && s.q.length === 0)) return -1;
+  var f = s.qc.length ? s.qc.shift() : s.q.shift();
   if (f.length > cap) return -2;
   HEAPU8.set(f, buf);
   return f.length;
@@ -287,7 +303,7 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
     wt_tp *t = calloc(1, sizeof *t);
     if (!t) return VNET_ENOMEM;
     t->v = v;
-    t->id = vnet_wt_open(url, hash, hashlen, JS_INBOX_FRAMES, RELAY_MAX_FRAME, RELAY_WT_CTL_MAX);
+    t->id = vnet_wt_open(url, hash, hashlen, JS_INBOX_FRAMES, RELAY_MAX_FRAME, RELAY_WT_CTL_MAX, JS_CONTROL_FRAMES);
     if (t->id <= 0) {
         free(t);
         return VNET_ENOTSUP;  // no WebTransport in this browser or page

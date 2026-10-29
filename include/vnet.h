@@ -229,7 +229,11 @@ int vnet_impair_parse(const char *spec, vnet_impair *out);
                                      `relay` is an "https://host:port/vnet" URL.
                                      Datagrams are really unreliable and a lost
                                      one stalls nothing. Fails (FAILED) where the
-                                     browser or the network has no WebTransport */
+                                     browser or the network has no WebTransport,
+                                     or (VNET_EMSGSIZE) if the check that a full
+                                     VNET_MAX_DATAGRAM datagram fits is lost to
+                                     very heavy packet loss: RELAY_AUTO would just
+                                     use the WebSocket then */
 #define VNET_BACKEND_RELAY_AUTO 5 /* browser client: try WebTransport, fall back
                                      to WebSocket. Same `relay` as RELAY_WS
                                      ("wss://host/vnet"); see relay_wt below.

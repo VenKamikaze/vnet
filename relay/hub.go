@@ -110,6 +110,7 @@ type Hub struct {
 	byNonce   map[[NonceLen]byte]*nonceEntry
 	conns     map[clientConn]struct{}
 	perIP     map[limKey]*ipCount
+	wtHeld    int      // WebTransport connections admitted and not yet finished (the check against MaxWT is made on this; they are also in connsHeld)
 	connsHeld int      // WebSocket upgrades and WebTransport connections admitted and not yet finished (the check against MaxSessions is made on this)
 	secret    [32]byte // keys the handshake cookies
 	// panicHook, if set (tests), is called with the name of a few critical

@@ -120,7 +120,15 @@ jobs:
           docker run -d --name relay -p 127.0.0.1:7777:7777/udp -p 127.0.0.1:8080:8080 -p 127.0.0.1:4433:4433/udp vnet-relay -wt :4433 -dev-cert
           for i in $(seq 50); do curl -fsS http://127.0.0.1:8080/healthz && break; sleep 0.2; done
           # (/stats is off by default since the brief 10 fix round: check the start-up line instead)
-          docker logs relay 2>&1 | grep -E '^LISTEN udp=.* wt=\[::\]:4433 wt_cert_sha256=[0-9a-f]{64}$'
+          # The start-up line comes after the HTTP listener is up (the development
+          # certificate is made in between), and the container's address family
+          # varies (wt=[::]:4433 or wt=0.0.0.0:4433): wait for it, boundedly.
+          ok=
+          for i in $(seq 50); do
+            if docker logs relay 2>&1 | grep -Eq '^LISTEN udp=.* wt=[^ ]*:4433 wt_cert_sha256=[0-9a-f]{64}$'; then ok=1; break; fi
+            sleep 0.2
+          done
+          [ -n "$ok" ] || { docker logs relay; exit 1; }
           docker rm -f relay
 
   browser:

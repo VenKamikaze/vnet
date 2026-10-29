@@ -204,6 +204,35 @@ async function main() {
       await nope2.ctx.close();
     }
 
+    console.log('a burst of datagrams cannot cost a control frame');
+    {
+      // The page's inbox queues frames for C. A page that has not polled for a
+      // while (a hidden tab) has a burst of datagrams waiting; the ROOM, ERROR or
+      // KEEPALIVE answer among them must not be the casualty. The queues are
+      // driven directly, in one synchronous step so the page cannot poll between.
+      const host = await openPeerPage(browser, webOrigin, wsUrl, null, { ...auto, timeout: '20000' });
+      await pageRoom(host);
+      const r = await host.page.evaluate(() => {
+        const T = Module.vnetWT, s = Object.values(T.s)[0];
+        for (let i = 0; i < 1000; i++) T.enqueue(s, false, new Uint8Array(20).fill(1));
+        T.enqueue(s, true, new Uint8Array([4]));
+        return { datagrams: s.q.length, control: s.qc.length, drops: s.drops, state: s.state };
+      });
+      check(r.control === 1 && r.datagrams === 256 && r.drops === 744 && r.state === 1, 'datagrams: 256 kept, 744 dropped; the control frame kept: ' + JSON.stringify(r));
+      await host.ctx.close();
+      // A control queue that overflows means the page is not polling at all: the
+      // session fails visibly (the game sees FAILED), it does not lose frames quietly.
+      const stuck = await openPeerPage(browser, webOrigin, wsUrl, null, { ...auto, timeout: '20000' });
+      await pageRoom(stuck);
+      await stuck.page.evaluate(() => {
+        const T = Module.vnetWT, s = Object.values(T.s)[0];
+        for (let i = 0; i < 300; i++) T.enqueue(s, true, new Uint8Array([4]));
+      });
+      const rs = await pageResult(stuck);
+      check(rs.ok === false && /closed by the relay/.test(rs.error), 'control queue overflow fails the session: ' + JSON.stringify(rs));
+      await stuck.ctx.close();
+    }
+
     // Everything has been closed by now: the relay holds nothing, and saw nothing odd.
     let st = await getJSON(relay.stats, '/stats');
     for (let i = 0; i < 1000 && (st.sessions !== 0 || st.webtransports !== 0 || st.websockets !== 0); i++) {

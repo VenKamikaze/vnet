@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -159,5 +160,109 @@ func TestCertReloaderPicksUpRenewedCertificatesAndKeepsGoodOnesOnErrors(t *testi
 	// Starting with unusable files fails at once.
 	if _, err := NewCertReloader(filepath.Join(dir, "none.crt"), key, nil); err == nil {
 		t.Fatal("missing file accepted")
+	}
+}
+
+// A certificate that is about to expire, or has, is reported in the log, so
+// that a relay nobody is watching does not just stop being reachable over
+// WebTransport. Reports are rate limited.
+func TestCertificateExpiryIsReported(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cert, _, _ := NewDevCert(now) // valid 13 days from 5 minutes before now
+	var mu sync.Mutex
+	var logs []string
+	r, err := NewStaticCert(cert, func(f string, a ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(f, a...))
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := now
+	r.now = func() time.Time { return at }
+	handshake := func() {
+		if c, err := r.GetCertificate(nil); err != nil || c == nil {
+			t.Fatalf("no certificate served: %v", err)
+		}
+	}
+	got := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), logs...) }
+	handshake()
+	at = now.Add(5 * 24 * time.Hour) // 8 days left: quiet
+	handshake()
+	if len(got()) != 0 {
+		t.Fatalf("a certificate with 8 days left was reported: %v", got())
+	}
+	at = now.Add(7 * 24 * time.Hour) // 6 days left: a warning
+	handshake()
+	if l := got(); len(l) != 1 || !strings.Contains(l[0], "WARNING") || !strings.Contains(l[0], "expires in") {
+		t.Fatalf("no warning with 6 days left: %v", l)
+	}
+	handshake() // rate limited
+	at = at.Add(30 * time.Minute)
+	handshake()
+	if len(got()) != 1 {
+		t.Fatalf("the warning is not rate limited: %v", got())
+	}
+	at = at.Add(time.Hour) // again, an hour later
+	handshake()
+	if len(got()) != 2 {
+		t.Fatalf("no second warning an hour later: %v", got())
+	}
+	at = now.Add(14 * 24 * time.Hour) // expired: an error, and the certificate is still served
+	handshake()
+	if l := got(); len(l) != 3 || !strings.Contains(l[2], "ERROR") || !strings.Contains(l[2], "expired") {
+		t.Fatalf("no error for an expired certificate: %v", l)
+	}
+}
+
+func TestExpiryIsTrackedAcrossReloads(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	soon, _, _ := NewDevCert(now.Add(-12 * 24 * time.Hour)) // expires in about a day
+	fresh, _, _ := NewDevCert(now)
+	crt, key := writePair(t, dir, "live", soon)
+	var logs []string
+	r, err := NewCertReloader(crt, key, func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk := newFakeClock()
+	clk.t = now
+	r.now = clk.Now
+	_, _ = r.GetCertificate(nil)
+	if len(logs) != 1 || !strings.Contains(logs[0], "WARNING") {
+		t.Fatalf("an old certificate was not reported at the first handshake: %v", logs)
+	}
+	// Renewed: the new expiry is the one that counts.
+	nc, nk := writePair(t, dir, "new", fresh)
+	_ = os.Rename(nc, crt)
+	_ = os.Rename(nk, key)
+	future := now.Add(time.Hour)
+	_ = os.Chtimes(crt, future, future)
+	_ = os.Chtimes(key, future, future)
+	clk.Advance(2 * time.Hour) // past the report interval and the recheck interval
+	logs = nil
+	_, _ = r.GetCertificate(nil)
+	for _, l := range logs {
+		if strings.Contains(l, "expire") {
+			t.Fatalf("the renewed certificate was still reported as expiring: %v", logs)
+		}
+	}
+}
+
+func TestDevCertOnAReachableAddressIsWarnedAbout(t *testing.T) {
+	for _, tc := range []struct {
+		addr string
+		warn bool
+	}{{"127.0.0.1:4433", false}, {"[::1]:4433", false}, {"0.0.0.0:4433", true}, {"[::]:4433", true}, {"192.0.2.7:4433", true}} {
+		ua, err := net.ResolveUDPAddr("udp", tc.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := DevCertWarning(ua)
+		if (w != "") != tc.warn || (tc.warn && !strings.Contains(w, "local trials only")) {
+			t.Errorf("%s: warning %q, want one: %v", tc.addr, w, tc.warn)
+		}
 	}
 }

@@ -47,6 +47,7 @@ func main() {
 		wtKey      = fs.String("wt-key", "", "WebTransport: TLS private key (PEM)")
 		devCert    = fs.Bool("dev-cert", false, "WebTransport, development only: generate a 13-day ECDSA certificate and print its SHA-256 hash (for serverCertificateHashes)")
 		devNames   = fs.String("dev-cert-names", "", "extra host names or IP addresses for the -dev-cert certificate, comma separated (localhost, 127.0.0.1 and ::1 are always there)")
+		maxWT      = fs.Int("max-wt", 4000, "WebTransport (QUIC) connections at once, with or without a session; each costs roughly 250 KB of memory")
 		perIPWT    = fs.Int("max-wt-per-ip", 128, "WebTransport (QUIC) connections per source address, with or without a session")
 		perIPPWT   = fs.Int("max-pending-wt-per-ip", 32, "WebTransport connections per source address that have not entered a room yet")
 		wtQBytes   = fs.Int("wt-queue-bytes", 65536, "bytes of datagrams queued per WebTransport client before its datagrams are dropped")
@@ -83,6 +84,7 @@ func main() {
 		MaxPendingWSPerIP: *perIPPend,
 		PrefixFactor:      *prefixFac,
 		WSSendQueueBytes:  *wsQBytes,
+		MaxWT:             *maxWT,
 		MaxWTPerIP:        *perIPWT,
 		MaxPendingWTPerIP: *perIPPWT,
 		WTSendQueueBytes:  *wtQBytes,
@@ -160,10 +162,14 @@ func main() {
 			if err != nil {
 				log.Fatalf("dev cert: %v", err)
 			}
-			tc.Certificates = []tls.Certificate{cert}
+			r, err := relay.NewStaticCert(cert, log.Printf)
+			if err != nil {
+				log.Fatalf("dev cert: %v", err)
+			}
+			tc.GetCertificate = r.GetCertificate
 			wtCertHash = hash
-			log.Printf("WebTransport development certificate: valid %v, SHA-256 %s (pass it as serverCertificateHashes; restart before it expires)",
-				relay.DevCertValidity, hash)
+			log.Printf("WebTransport DEVELOPMENT certificate (local trials only, NOT FOR PRODUCTION): SHA-256 %s, valid %v from now, a new one at every start; pass the hash as serverCertificateHashes and restart before it expires",
+				hash, relay.DevCertValidity)
 		case *wtCert != "" && *wtKey != "":
 			r, err := relay.NewCertReloader(*wtCert, *wtKey, log.Printf)
 			if err != nil {
@@ -178,6 +184,11 @@ func main() {
 			log.Fatalf("webtransport: %v", err)
 		}
 		wtBound = a.String()
+		if *devCert {
+			if w := relay.DevCertWarning(a); w != "" {
+				log.Print(w)
+			}
+		}
 	} else if *devCert || *wtCert != "" || *wtKey != "" {
 		log.Fatal("-dev-cert, -wt-cert and -wt-key need -wt")
 	}

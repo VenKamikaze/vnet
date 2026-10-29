@@ -19,7 +19,8 @@ type Config struct {
 	MaxRoomsPerIP     int           // rooms created and still alive; default 16
 	MaxWSPerIP        int           // open WebSockets; default 128
 	MaxPendingWSPerIP int           // WebSockets that have not entered a room yet; default 32
-	MaxWTPerIP        int           // WebTransport (QUIC) connections, whether or not they have a session; default 128
+	MaxWT             int           // WebTransport (QUIC) connections at once, whether or not they have a session (each costs roughly 250 KB; see relay/README.md); default 4000
+	MaxWTPerIP        int           // WebTransport (QUIC) connections per source address, whether or not they have a session; default 128
 	MaxPendingWTPerIP int           // of those, the ones that have not entered a room yet; default 32
 	PrefixFactor      int           // an IPv6 /48 may hold this many times the per-address caps above; default 4
 	RoomIdleTimeout   time.Duration // a room with no DATA for this long is closed; default 30 min
@@ -98,6 +99,7 @@ func (c Config) withDefaults() (Config, error) {
 	def(&c.MaxWSPerIP, 128)
 	def(&c.MaxPendingWSPerIP, 32)
 	def(&c.PrefixFactor, 4)
+	def(&c.MaxWT, 4000)
 	def(&c.MaxWTPerIP, 128)
 	def(&c.MaxPendingWTPerIP, 32)
 	def(&c.WTSendQueue, 128)
@@ -137,7 +139,7 @@ func (c Config) withDefaults() (Config, error) {
 	if c.MaxMembers < 2 || c.MaxMembers > 254 {
 		return c, fmt.Errorf("MaxMembers must be 2..254, got %d", c.MaxMembers)
 	}
-	if c.MaxRooms < 0 || c.MaxSessions < 0 || c.WSSendQueue < 0 || c.WTSendQueue < 0 || c.MaxWTPerIP < 0 || c.MaxPendingWTPerIP < 0 {
+	if c.MaxRooms < 0 || c.MaxSessions < 0 || c.WSSendQueue < 0 || c.WTSendQueue < 0 || c.MaxWT < 0 || c.MaxWTPerIP < 0 || c.MaxPendingWTPerIP < 0 {
 		return c, fmt.Errorf("negative limit")
 	}
 	if c.KeepaliveInterval < time.Second {

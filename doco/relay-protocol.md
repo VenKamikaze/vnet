@@ -98,6 +98,10 @@ WebTransport gives a browser what WebSocket cannot: **unreliable datagrams** tha
 
 **Browsers do not promise 1109 bytes.** `datagrams.maxDatagramSize` is a conservative bound: Chromium 153 reports **1024** while delivering datagrams of at least 1109 bytes in both directions. The vnet client therefore treats a reported size below 1109 as "unknown" and **probes** (see [Client guidance](#client-guidance)); it does not trust the number and does not refuse on it.
 
+**Why one successful probe is enough.** The probe proves what the two endpoints and the browser will carry: the browser's own datagram limit, the relay's `max_datagram_frame_size`, and the connection's current packet size. It need not be repeated or re-run because the path cannot get *smaller than a full frame* afterwards: QUIC requires every path to carry UDP datagrams of at least **1200 bytes** (RFC 9000, section 14: a client's Initial packets are padded to 1200 bytes and the handshake cannot complete over a path that drops them; the packet size may never fall below that floor), and a full `DATA` frame needs far less than that in one packet: 1109 bytes of frame plus the DATAGRAM frame header (1 to 3 bytes), the short packet header (1 byte, the connection ID, at most 4 bytes of packet number) and the 16-byte AEAD tag, about 1140 bytes in all. So any path that completed the QUIC handshake carries a probe-sized datagram, and the one thing that can still differ, the limits on the endpoints, is what the probe measured. (PMTU discovery can only *raise* the size; datagrams larger than the current size are rejected by the sender rather than fragmented, which is why the relay counts them as dropped, not fatal.)
+
+**A spurious failure is possible under very heavy loss.** The probe is unreliable like everything it protects: if every one of its repeats in 1.5 s is lost (six sends at 250 ms; a path losing, say, most packets), the client concludes that full-size datagrams do not fit. With `VNET_BACKEND_RELAY_AUTO` that only means the WebSocket is used, which is the right choice on such a path anyway. With the explicit `VNET_BACKEND_RELAY_WT` it is reported as `VNET_EMSGSIZE` (FAILED), so a game that insists on WebTransport should treat that error as "try again, or use `RELAY_AUTO`".
+
 **Certificates.** Production: a certificate for the relay's host name, from a public CA (`-wt-cert`, `-wt-key`). Development: `-dev-cert` makes a 13-day ECDSA P-256 certificate and prints its SHA-256; the page passes it as `serverCertificateHashes`. Browsers accept a certificate by hash only if it is X.509v3, valid now, has a validity period of **less than two weeks**, and does not use an RSA key.
 
 ## Rooms and virtual addresses
@@ -154,6 +158,7 @@ All configurable; the defaults are in `relay/config.go`, the flags in `relay/cmd
 | WebSocket send queue | 128 frames and 64 KiB | frames to that client dropped (`ws_queue_drops`) |
 | WebSocket write | 5 s | the connection is closed |
 | WebSocket message size | 1125 bytes | connection closed |
+| QUIC connections, relay-wide (`-max-wt`) | 4000 | the connection is refused; the browser backend falls back to WebSocket |
 | QUIC connections per source address (a session or not) / not yet in a room | 128 / 32 | the connection is refused (QUIC `CONNECTION_REFUSED`); the browser backend falls back to WebSocket |
 | WebTransport datagram queue | 128 datagrams and 64 KiB | datagrams to that client dropped (`wt_datagram_drops`) |
 | WebTransport control stream: frame length / queued answers / write | 64 bytes / 32 frames / 5 s | the session is closed |
