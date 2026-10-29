@@ -519,26 +519,40 @@ static int rc_recv(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
     return (int)p->len;
 }
 
-// The application did not call vnet_poll() for `gap` ms: a hidden browser tab,
-// a laptop that slept, a debugger. That says nothing about the relay, which
-// keeps the session alive for as long as the connection answers its pings, so
-// the clocks that judge the relay (the handshake deadline, the primary
-// transport's deadline, the probe, three silent keepalive intervals) are moved
-// forward by the gap instead of being found expired. In a room that is the
-// silence clock, and the KEEPALIVE that falls due during any gap longer than an
-// interval goes out in the same poll: if the relay really did forget us, its
-// answer (an error) says so now rather than after three more intervals.
-static void resume_after_gap(rc_state *st, uint64_t gap, uint64_t now) {
+// The application did not call vnet_poll() for `gap` ms (more than the
+// suspension threshold): a hidden browser tab, a laptop that slept, a debugger.
+// That says nothing about the relay, which keeps the session alive for as long
+// as the connection answers its pings, so the clocks that judge the relay are
+// moved forward. But only by the part of the gap that was not time in which this
+// client could have been expected to hear from the relay, never by all of it:
+//   - the silence clock (three keepalive intervals) is credited with the gap
+//     less one keepalive interval, so a loop that polls just slower than the
+//     keepalive (an idle `vnet_wait(); vnet_poll();` loop sleeps exactly until
+//     the next keepalive is due) still finds a dead relay after about three
+//     intervals instead of being reset by every poll;
+//   - the one-shot deadlines (handshake, the primary transport's, the probe) are
+//     credited with the gap less SUSPEND_GAP_FLOOR_MS, so a page that comes back
+//     after a minute still has most of its time, while a slow poller cannot keep
+//     extending them forever.
+// The KEEPALIVE that falls due during a gap longer than an interval goes out in
+// the same poll: if the relay really did forget us, its answer (an error) says
+// so now rather than after three more intervals.
+static void resume_after_gap(rc_state *st, uint64_t gap, uint64_t now, uint64_t ka) {
+    uint64_t oneshot = gap - SUSPEND_GAP_FLOOR_MS;  // gap > the threshold >= the floor
     switch (st->phase) {
         case RC_HANDSHAKE:
         case RC_PROBE:
-            st->t_start += gap;
-            st->stage_start += gap;
-            st->probe_deadline += gap;
-            st->probe_next += gap;
+            st->t_start += oneshot;
+            st->stage_start += oneshot;
+            st->probe_deadline += oneshot;
+            st->probe_next += oneshot;
             break;
         case RC_READY:
-            st->last_rx = now;
+            st->last_rx += gap - ka;
+            if (st->last_rx > now) st->last_rx = now;
+            // A KEEPALIVE sent before the gap is answered, if at all, on a clock
+            // that stood still: that is not a round trip.
+            st->ka_pending = 0;
             break;
         default:
             break;
@@ -552,12 +566,15 @@ static void rc_poll(vnet *v) {
 
     {
         uint64_t gap = now > st->last_poll ? now - st->last_poll : 0;
-        uint64_t limit = st->keepalive_ms ? st->keepalive_ms : DEFAULT_KEEPALIVE_MS;
-        if (limit < SUSPEND_GAP_FLOOR_MS) limit = SUSPEND_GAP_FLOOR_MS;
+        uint64_t ka = st->keepalive_ms ? st->keepalive_ms : DEFAULT_KEEPALIVE_MS;
+        uint64_t limit = ka < SUSPEND_GAP_FLOOR_MS ? SUSPEND_GAP_FLOOR_MS : ka;
         if (gap > limit) {
-            vnet__logf(v, VNET_LOG_INFO, "no vnet_poll() for %u ms: treated as the application being suspended",
-                       (unsigned)(gap > 0xffffffffu ? 0xffffffffu : gap));
-            resume_after_gap(st, gap, now);
+            // (Quiet for a gap that only just exceeds the threshold: that is an
+            // idle vnet_wait() loop, not a suspension.)
+            if (gap > 2 * limit)
+                vnet__logf(v, VNET_LOG_INFO, "no vnet_poll() for %u ms: treated as the application being suspended",
+                           (unsigned)(gap > 0xffffffffu ? 0xffffffffu : gap));
+            resume_after_gap(st, gap, now, ka);
         }
         st->last_poll = now;
     }

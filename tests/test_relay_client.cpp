@@ -756,7 +756,9 @@ TEST_F(RelayClient, SilenceIsStillSilenceAfterTheGap) {
     clk.now += 60000;
     vnet_poll(v);
     ASSERT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
-    for (int i = 0; i < 3; i++) {
+    // One keepalive interval of the gap counts as silence (the relay had that
+    // long to answer the keepalive sent on resume), then two more polled ones.
+    for (int i = 0; i < 2; i++) {
         clk.now += 5000;
         vnet_poll(v);
         EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY) << i;
@@ -796,12 +798,13 @@ TEST_F(RelayClient, AGapDuringTheHandshakeExtendsItsDeadline) {
     Start(nullptr, 0, 10000);
     clk.now += 60000;
     vnet_poll(v);
-    for (int i = 0; i < 3; i++) {
-        clk.now += 3000;
+    // 1 s of the minute counts (the rest was sleep): 9 s of polling are left.
+    for (int ms : {3000, 3000, 2999}) {
+        clk.now += ms;
         vnet_poll(v);
     }
     EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_CONNECTING);
-    clk.now += 1001;
+    clk.now += 1;
     vnet_poll(v);
     vnet_status_info st;
     EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_FAILED);
@@ -918,6 +921,99 @@ TEST_F(RelayClient, TheWakeCallbackIsNeverCalledByTheNativeRelayClient) {
     clk.now += 60000;
     vnet_poll(v);
     EXPECT_EQ(wakes, 0);
+}
+
+TEST_F(RelayClient, AWaitAndPollLoopFindsADeadRelayInAboutThreeIntervals) {
+    // The idle loop of a headless peer: vnet_wait() sleeps until the next
+    // keepalive is due, vnet_poll() sends it. Each poll then follows the last
+    // by one keepalive interval plus a millisecond or two, which must not be
+    // mistaken for the application sleeping. Real clock, 1 s keepalive.
+    addr = relay.addr();
+    vnet_config cfg = RelayUdpConfig(relay, &clk);
+    cfg.relay = addr.c_str();
+    cfg.clock = nullptr;  // the system clock
+    cfg.clock_user = nullptr;
+    cfg.keepalive_ms = 1000;
+    v = vnet_create(&cfg, nullptr);
+    ASSERT_NE(v, nullptr);
+    ASSERT_TRUE(relay.RecvType(RELAY_T_CREATE, &req));
+    Enter(1);  // and now the relay says nothing at all
+    auto t0 = std::chrono::steady_clock::now();
+    vnet_status_info st;
+    while (vnet_status(v, &st) == VNET_STATUS_READY && MsSince(t0) < 9000) {
+        vnet_wait(v, 10000);
+        vnet_poll(v);
+    }
+    double ms = MsSince(t0);
+    EXPECT_EQ(st.state, VNET_STATUS_FAILED);
+    EXPECT_EQ(st.error, VNET_ETIMEDOUT);
+    EXPECT_GE(ms, 2500);
+    EXPECT_LT(ms, 5500) << "three intervals of 1 s, not 'never'";
+}
+
+TEST_F(RelayClient, PollingJustSlowerThanTheKeepaliveStillFindsADeadRelay) {
+    // Gaps of keepalive + epsilon (the shape of the loop above, on the injected
+    // clock so that the default 5 s interval can be tested): the relay is
+    // silent, so the session is lost after about three intervals of polling.
+    for (int ka : {0, 1000}) {
+        Start(nullptr, ka);
+        Enter(1, "ABCDEF", 8, ka ? 1 : 5);
+        unsigned interval = ka ? (unsigned)ka : 5000u;
+        int polls = 0;
+        while (vnet_status(v, nullptr) == VNET_STATUS_READY && polls < 20) {
+            clk.now += interval + 2;
+            vnet_poll(v);
+            polls++;
+        }
+        vnet_status_info st;
+        EXPECT_EQ(vnet_status(v, &st), VNET_STATUS_FAILED) << ka;
+        EXPECT_EQ(st.error, VNET_ETIMEDOUT);
+        EXPECT_GE(polls, 3) << ka;
+        EXPECT_LE(polls, 4) << ka << ": three intervals, as without any slack";
+        vnet_destroy(v);
+        v = nullptr;
+    }
+}
+
+TEST_F(RelayClient, ASessionThatWasQuietForTwoIntervalsStillSurvivesASuspension) {
+    // The relay answered the last time ~10 s ago (keepalives lost?), then the
+    // page slept for a minute: one interval of that counts as silence, which is
+    // 15 s in all, still within the limit.
+    Start();
+    Enter(1);
+    clk.now += 4999;
+    vnet_poll(v);
+    clk.now += 5000;
+    vnet_poll(v);  // 9999 ms since the relay was last heard
+    ASSERT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
+    clk.now += 60000;
+    vnet_poll(v);
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);
+    Bytes b;
+    EXPECT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &b));
+}
+
+TEST_F(RelayClient, AnAnswerQueuedBeforeAGapIsNotARoundTripOfTheGap) {
+    Start();
+    Enter(1);
+    relay.Drain();
+    clk.now += 5000;
+    vnet_poll(v);  // KEEPALIVE out
+    Bytes ka;
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});  // answered at once, but the application is away
+    clk.now += 60000;
+    vnet_poll(v);                          // reads the answer after the minute
+    vnet_status_info st;
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, -1) << "not 60000";
+    // The next real round trip is measured.
+    ASSERT_TRUE(relay.RecvType(RELAY_T_KEEPALIVE, &ka));
+    clk.now += 31;
+    relay.Send(Bytes{RELAY_T_KEEPALIVE});
+    vnet_poll(v);
+    vnet_status(v, &st);
+    EXPECT_EQ(st.relay_rtt_ms, 31);
 }
 
 TEST_F(RelayClient, AGameThatPollsSlowerThanAShortKeepaliveStillFindsSilence) {
