@@ -9,8 +9,10 @@
 #include <set>
 #include <vector>
 
+#if defined(VNET_TEST_FAKE_IPV6)  // the --wrap seam (ipv6_shim.cpp), Linux only
 extern "C" int g_last_rcvbuf;
 extern "C" int g_fail_rcvbuf;
+#endif
 
 using Clock = std::chrono::steady_clock;
 static double MsSince(Clock::time_point t) {
@@ -541,6 +543,7 @@ TEST(ResolveHost, AnUnknownNameIsAnIoErrorNotAHang) {
 
 // --------------------------------------------------------- SO_RCVBUF
 
+#if defined(VNET_TEST_FAKE_IPV6)
 struct RcvbufReset {
     ~RcvbufReset() {
         g_last_rcvbuf = 0;
@@ -578,6 +581,8 @@ TEST(UdpReceiveBuffer, AKernelThatRefusesIsIgnored) {
     EXPECT_NE(log[0].find("SO_RCVBUF"), std::string::npos);
     vnet_destroy(u);
 }
+
+#endif  // VNET_TEST_FAKE_IPV6
 
 TEST(UdpReceiveBuffer, ABacklogBeyondTheKernelDefaultIsKept) {
     EnvGuard env;
