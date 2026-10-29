@@ -920,6 +920,16 @@ TEST_F(RelayClient, TheWakeCallbackIsNeverCalledByTheNativeRelayClient) {
     EXPECT_EQ(wakes, 0);
 }
 
+TEST_F(RelayClient, AGameThatPollsSlowerThanAShortKeepaliveStillFindsSilence) {
+    // keepalive 100 ms, a poll every 400 ms: that is slow polling, not a
+    // suspension (the floor is one second), or silence would never be noticed.
+    Start(nullptr, 100);
+    Enter(1);
+    clk.now += 400;
+    vnet_poll(v);
+    EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_FAILED);
+}
+
 // ---- status: relay_rtt_ms and max_members
 
 TEST_F(RelayClient, StatusCarriesTheRoomsMemberLimit) {

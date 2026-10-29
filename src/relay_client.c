@@ -524,10 +524,11 @@ static int rc_recv(vnet *v, int s, void *buf, size_t cap, vnet_addr *from) {
 // keeps the session alive for as long as the connection answers its pings, so
 // the clocks that judge the relay (the handshake deadline, the primary
 // transport's deadline, the probe, three silent keepalive intervals) are moved
-// forward by the gap instead of being found expired. Returns 1 in a room, where
-// the caller sends a KEEPALIVE at once: if the relay really did forget us, the
+// forward by the gap instead of being found expired. In a room that is the
+// silence clock, and the KEEPALIVE that falls due during any gap longer than an
+// interval goes out in the same poll: if the relay really did forget us, its
 // answer (an error) says so now rather than after three more intervals.
-static int resume_after_gap(rc_state *st, uint64_t gap, uint64_t now) {
+static void resume_after_gap(rc_state *st, uint64_t gap, uint64_t now) {
     switch (st->phase) {
         case RC_HANDSHAKE:
         case RC_PROBE:
@@ -535,13 +536,12 @@ static int resume_after_gap(rc_state *st, uint64_t gap, uint64_t now) {
             st->stage_start += gap;
             st->probe_deadline += gap;
             st->probe_next += gap;
-            return 0;
+            break;
         case RC_READY:
             st->last_rx = now;
-            st->ka_pending = 0;  // a pre-gap answer, if it ever comes, is no round trip
-            return 1;
+            break;
         default:
-            return 0;
+            break;
     }
 }
 
@@ -550,7 +550,6 @@ static void rc_poll(vnet *v) {
     if (st->phase == RC_FAILED) return;
     uint64_t now = vnet__now(v);
 
-    int resumed = 0;
     {
         uint64_t gap = now > st->last_poll ? now - st->last_poll : 0;
         uint64_t limit = st->keepalive_ms ? st->keepalive_ms : DEFAULT_KEEPALIVE_MS;
@@ -558,7 +557,7 @@ static void rc_poll(vnet *v) {
         if (gap > limit) {
             vnet__logf(v, VNET_LOG_INFO, "no vnet_poll() for %u ms: treated as the application being suspended",
                        (unsigned)(gap > 0xffffffffu ? 0xffffffffu : gap));
-            resumed = resume_after_gap(st, gap, now);
+            resume_after_gap(st, gap, now);
         }
         st->last_poll = now;
     }
@@ -633,7 +632,7 @@ static void rc_poll(vnet *v) {
     } else {  // READY
         if (now - st->last_rx > 3u * st->keepalive_ms) {
             fail(v, st, VNET_ETIMEDOUT);
-        } else if (resumed || now >= st->ka_next) {
+        } else if (now >= st->ka_next) {
             send_keepalive(v, st, now);
             st->ka_next = now + st->keepalive_ms;
         }
