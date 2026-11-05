@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vnet relay_peer</title>
+</head>
+<body>
+<pre id="log">relay_peer (vnet browser example). Query: ?relay=ws://HOST:PORT/vnet&amp;room=CODE&amp;count=100&amp;backend=auto&amp;wt=https://HOST:PORT/vnet&amp;cert=SHA256HEX</pre>
+<script>
+// Arguments come from the page URL so that a test (or a person) can aim the
+// same wasm file at any relay and room.
+var q = new URLSearchParams(location.search);
+var args = ['--relay', q.get('relay') || 'ws://127.0.0.1:8080/vnet'];
+if (q.get('room')) args.push('--room', q.get('room'));
+if (q.get('count')) args.push('--count', q.get('count'));
+if (q.get('timeout')) args.push('--timeout', q.get('timeout'));
+if (q.get('backend')) args.push('--backend', q.get('backend'));
+if (q.get('wt')) args.push('--relay-wt', q.get('wt'));
+if (q.get('cert')) args.push('--cert-hash', q.get('cert'));
+if (q.get('wttimeout')) args.push('--wt-timeout', q.get('wttimeout'));
+if (q.get('maxlen')) args.push('--maxlen', q.get('maxlen'));
+if (q.get('verbose')) args.push('--verbose');
+if (q.get('mode')) args.push('--mode', q.get('mode'));
+window.vnetLog = [];
+var Module = {
+  arguments: args,
+  print: function (t) { window.vnetLog.push(t); document.getElementById('log').textContent += '\n' + t; },
+  printErr: function (t) { window.vnetLog.push('ERR ' + t); }
+};
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

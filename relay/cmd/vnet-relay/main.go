@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MIT
+
+// Command vnet-relay is the vnet relay server: one static binary serving
+// native UDP clients and browser WebSocket clients. Terminate TLS in front of
+// it (Caddy, nginx) for wss://.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/VenKamikaze/vnet/relay"
+)
+
+// Every flag can also be set from the environment as VNET_RELAY_<NAME>
+// (upper case, '-' -> '_'); the flag wins.
+func envName(flagName string) string {
+	return "VNET_RELAY_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+func main() {
+	fs := flag.NewFlagSet("vnet-relay", flag.ExitOnError)
+	var (
+		udpAddr    = fs.String("udp", ":7777", "UDP listen address for native clients (empty disables)")
+		httpAddr   = fs.String("http", ":8080", "HTTP listen address; WebSocket clients connect to /vnet (empty disables)")
+		maxMembers = fs.Int("max-members", 8, "members per room, including the creator (2..253; 10.0.0.254 and .255 are reserved)")
+		maxRooms   = fs.Int("max-rooms", 1000, "rooms at once")
+		maxSess    = fs.Int("max-sessions", 20000, "members at once (also caps open WebSockets)")
+		perIPSess  = fs.Int("max-sessions-per-ip", 128, "members at once per source address (IPv6: per /64); many players behind one NAT share it")
+		perIPRooms = fs.Int("max-rooms-per-ip", 16, "rooms created and still alive per source address")
+		perIPWS    = fs.Int("max-ws-per-ip", 128, "open WebSockets per source address")
+		perIPPend  = fs.Int("max-pending-ws-per-ip", 32, "WebSockets per source address that have not entered a room yet")
+		prefixFac  = fs.Int("ipv6-prefix-factor", 4, "an IPv6 /48 may hold this many times the per-address caps in total")
+		wtAddr     = fs.String("wt", "", "UDP listen address for WebTransport (HTTP/3), e.g. :4433 or :443; empty disables. Needs -wt-cert and -wt-key, or -dev-cert")
+		wtCert     = fs.String("wt-cert", "", "WebTransport: TLS certificate chain (PEM); reloaded when the file changes")
+		wtKey      = fs.String("wt-key", "", "WebTransport: TLS private key (PEM)")
+		devCert    = fs.Bool("dev-cert", false, "WebTransport, development only: generate a 13-day ECDSA certificate and print its SHA-256 hash (for serverCertificateHashes)")
+		devNames   = fs.String("dev-cert-names", "", "extra host names or IP addresses for the -dev-cert certificate, comma separated (localhost, 127.0.0.1 and ::1 are always there)")
+		maxWT      = fs.Int("max-wt", 4000, "WebTransport (QUIC) connections at once, with or without a session; each costs roughly 250 KB of memory")
+		perIPWT    = fs.Int("max-wt-per-ip", 128, "WebTransport (QUIC) connections per source address, with or without a session")
+		perIPPWT   = fs.Int("max-pending-wt-per-ip", 32, "WebTransport connections per source address that have not entered a room yet")
+		wtQBytes   = fs.Int("wt-queue-bytes", 65536, "bytes of datagrams queued per WebTransport client before its datagrams are dropped")
+		wsQBytes   = fs.Int("ws-queue-bytes", 65536, "bytes queued per WebSocket client before its datagrams are dropped")
+		statsAddr  = fs.String("stats", "", "serve /stats (JSON counters) on this address, e.g. 127.0.0.1:8081; off by default")
+		roomIdle   = fs.Duration("room-idle", 30*time.Minute, "close a room that has carried no data for this long")
+		sessTO     = fs.Duration("session-timeout", 15*time.Second, "drop a member silent for this long")
+		keepalive  = fs.Duration("keepalive", 5*time.Second, "keepalive interval advertised to clients")
+		pps        = fs.Float64("client-pps", 600, "per-client sustained packets per second")
+		bps        = fs.Float64("client-bps", 600000, "per-client sustained bytes per second")
+		hsRate     = fs.Float64("handshake-rate", 20, "CREATE_ROOM/JOIN_ROOM per second per source IP (many players behind one NAT share it)")
+		hsBurst    = fs.Float64("handshake-burst", 50, "handshake burst per source IP")
+		origins    = fs.String("origins", "*", "comma-separated Origin hosts allowed to open a WebSocket, or *")
+		trustXFF   = fs.Bool("trust-forwarded-for", false, "take client IPs from X-Forwarded-For (only behind a trusted proxy)")
+		verbose    = fs.Bool("v", false, "log room creation and closure")
+	)
+	// Environment first, then the command line on top.
+	fs.VisitAll(func(f *flag.Flag) {
+		if v, ok := os.LookupEnv(envName(f.Name)); ok {
+			if err := fs.Set(f.Name, v); err != nil {
+				log.Fatalf("%s=%q: %v", envName(f.Name), v, err)
+			}
+		}
+	})
+	_ = fs.Parse(os.Args[1:])
+
+	cfg := relay.Config{
+		MaxMembers:        *maxMembers,
+		MaxRooms:          *maxRooms,
+		MaxSessions:       *maxSess,
+		MaxSessionsPerIP:  *perIPSess,
+		MaxRoomsPerIP:     *perIPRooms,
+		MaxWSPerIP:        *perIPWS,
+		MaxPendingWSPerIP: *perIPPend,
+		PrefixFactor:      *prefixFac,
+		WSSendQueueBytes:  *wsQBytes,
+		MaxWT:             *maxWT,
+		MaxWTPerIP:        *perIPWT,
+		MaxPendingWTPerIP: *perIPPWT,
+		WTSendQueueBytes:  *wtQBytes,
+		RoomIdleTimeout:   *roomIdle,
+		SessionTimeout:    *sessTO,
+		KeepaliveInterval: *keepalive,
+		ClientPPS:         *pps,
+		ClientBPS:         *bps,
+		HandshakePerSec:   *hsRate,
+		HandshakeBurst:    *hsBurst,
+		// Every handshake costs two replies (RETRY, then ROOM or ERROR).
+		ReplyPerSec:       *hsRate * 2,
+		ReplyBurst:        *hsBurst * 2,
+		TrustForwardedFor: *trustXFF,
+	}
+	if *origins != "" && *origins != "*" {
+		cfg.AllowedOrigins = strings.Split(*origins, ",")
+	}
+	if *verbose {
+		cfg.Logf = log.Printf
+	}
+	srv, err := relay.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var udpBound, httpBound string
+	if *udpAddr != "" {
+		a, err := srv.ListenUDP(*udpAddr)
+		if err != nil {
+			log.Fatalf("udp: %v", err)
+		}
+		udpBound = a.String()
+	}
+	var httpSrv *http.Server
+	if *httpAddr != "" {
+		ln, err := net.Listen("tcp", *httpAddr)
+		if err != nil {
+			log.Fatalf("http: %v", err)
+		}
+		httpBound = ln.Addr().String()
+		httpSrv = &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() {
+			if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("http: %v", err)
+			}
+		}()
+	}
+	var statsBound string
+	var statsSrv *http.Server
+	if *statsAddr != "" {
+		ln, err := net.Listen("tcp", *statsAddr)
+		if err != nil {
+			log.Fatalf("stats: %v", err)
+		}
+		statsBound = ln.Addr().String()
+		statsSrv = &http.Server{Handler: srv.StatsHandler(), ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = statsSrv.Serve(ln) }()
+	}
+	var wtBound, wtCertHash string
+	if *wtAddr != "" {
+		var tc tls.Config
+		switch {
+		case *devCert && (*wtCert != "" || *wtKey != ""):
+			log.Fatal("-dev-cert and -wt-cert/-wt-key are alternatives")
+		case *devCert:
+			var names []string
+			if *devNames != "" {
+				names = strings.Split(*devNames, ",")
+			}
+			cert, hash, err := relay.NewDevCert(time.Now(), names...)
+			if err != nil {
+				log.Fatalf("dev cert: %v", err)
+			}
+			r, err := relay.NewStaticCert(cert, log.Printf)
+			if err != nil {
+				log.Fatalf("dev cert: %v", err)
+			}
+			tc.GetCertificate = r.GetCertificate
+			wtCertHash = hash
+			log.Printf("WebTransport DEVELOPMENT certificate (local trials only, NOT FOR PRODUCTION): SHA-256 %s, valid %v from now, a new one at every start; pass the hash as serverCertificateHashes and restart before it expires",
+				hash, relay.DevCertValidity)
+		case *wtCert != "" && *wtKey != "":
+			r, err := relay.NewCertReloader(*wtCert, *wtKey, log.Printf)
+			if err != nil {
+				log.Fatalf("webtransport: %v", err)
+			}
+			tc.GetCertificate = r.GetCertificate
+		default:
+			log.Fatal("-wt needs -wt-cert and -wt-key (or -dev-cert for local development)")
+		}
+		a, err := srv.ListenWT(*wtAddr, &tc)
+		if err != nil {
+			log.Fatalf("webtransport: %v", err)
+		}
+		wtBound = a.String()
+		if *devCert {
+			if w := relay.DevCertWarning(a); w != "" {
+				log.Print(w)
+			}
+		}
+	} else if *devCert || *wtCert != "" || *wtKey != "" {
+		log.Fatal("-dev-cert, -wt-cert and -wt-key need -wt")
+	}
+	// One machine-readable line for scripts and tests: the bound addresses
+	// (useful with port 0), then the WebTransport address and, in -dev-cert
+	// mode, the hash of the certificate.
+	fmt.Printf("LISTEN udp=%s http=%s stats=%s wt=%s wt_cert_sha256=%s\n", udpBound, httpBound, statsBound, wtBound, wtCertHash)
+	_ = os.Stdout.Sync()
+
+	srv.Run(ctx) // returns on SIGINT/SIGTERM after closing the server
+	if statsSrv != nil {
+		_ = statsSrv.Close()
+	}
+	if httpSrv != nil {
+		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdown)
+	}
+}
