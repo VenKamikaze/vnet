@@ -26,13 +26,13 @@ As a subdirectory or with `FetchContent` (use `GIT_REPOSITORY`; archive download
 include(FetchContent)
 FetchContent_Declare(vnet
     GIT_REPOSITORY https://github.com/VenKamikaze/vnet.git
-    GIT_TAG        v0.4.1)          # pin a release tag or commit
+    GIT_TAG        v0.5.0)          # pin a release tag or commit
 FetchContent_MakeAvailable(vnet)
 
 target_link_libraries(mygame PRIVATE vnet::vnet)
 ```
 
-Releases are tagged `vMAJOR.MINOR.PATCH`, matching the CMake project version: `v0.1.0` (core, brief 06), `v0.2.0` (relay and WebSocket, brief 10), `v0.3.0` (WebTransport, brief 11), `v0.4.0` (API polish and browser lifecycle, brief 14), `v0.4.1` (WebTransport datagram bursts, brief 15). Pin an exact tag: from 0.3.0 on 0.x releases only add to the API, but CMake's `find_package(vnet 0.x)` treats every 0.x as compatible, which is more generous than that (policy in [`doco/integration.md`](doco/integration.md#api-stability)). (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
+Releases are tagged `vMAJOR.MINOR.PATCH`, matching the CMake project version: `v0.1.0` (core, brief 06), `v0.2.0` (relay and WebSocket, brief 10), `v0.3.0` (WebTransport, brief 11), `v0.4.0` (API polish and browser lifecycle, brief 14), `v0.5.0` (WebTransport datagram bursts and `vnet_stats.tx_dropped`, brief 15). Pin an exact tag: from 0.3.0 on 0.x releases only add to the API, but CMake's `find_package(vnet 0.x)` treats every 0.x as compatible, which is more generous than that (policy in [`doco/integration.md`](doco/integration.md#api-stability)). (Or `add_subdirectory(ext/vnet)` for a submodule.) As a subproject, the tests and install rules are off by default.
 
 Or install it and use `find_package`:
 

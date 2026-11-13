@@ -60,7 +60,7 @@ Check this first. Count the datagrams sent per JavaScript task, and see whether 
 3. **Report drops.**
    - If `vnet_stats` (or the equivalent) does not already count the browser-side WebTransport drops, consider counting them, so that a game can see them without reading `Module.vnetWT`.
    - Keep the API compatible (14's API polish).
-4. **Release.** After the merge, tag a release (`v0.4.1`, or what the versioning rule says), since consumers pin a tag. The user decides on merging into `main`.
+4. **Release.** After the merge, tag a release (`v0.5.0`: the user chose a minor bump, as every earlier release that added an API field took one), since consumers pin a tag. The user decides on merging into `main`.
 
 ## Out of scope
 
@@ -94,7 +94,7 @@ Check this first. Count the datagrams sent per JavaScript task, and see whether 
 
 ## Outcome
 
-Implemented on `claude/webtransport-datagram-bursts-u1oaqa` (used in place of `vnet/15-wt-datagram-bursts`, the one branch the cloud session could push). CMake version and `VNET_VERSION_*` are 0.4.1; the user tags `v0.4.1` after the merge (the cloud session cannot push tags): `git tag -a v0.4.1 -m "vnet 0.4.1: WebTransport datagram bursts" <merge commit> && git push origin v0.4.1`. Chromium 153.0.8010.12 under Playwright, a loopback relay, no impairment. **Firefox was not tested**: Playwright's Firefox is not installed here (`firefox.launch()` fails, and `playwright install` is not allowed).
+Implemented on `claude/webtransport-datagram-bursts-u1oaqa` (used in place of `vnet/15-wt-datagram-bursts`, the one branch the cloud session could push). CMake version and `VNET_VERSION_*` are **0.5.0** (the user chose a minor bump: adding `vnet_stats.tx_dropped` is an API addition, and every earlier addition took a minor); the user tags `v0.5.0` after the merge (the cloud session cannot push tags): `git tag -a v0.5.0 -m "vnet 0.5.0: WebTransport datagram bursts" <merge commit> && git push origin v0.5.0`. A review round followed the first implementation; its findings are folded into the sections below. Chromium 153.0.8010.12 under Playwright, a loopback relay, no impairment. **Firefox was not tested**: Playwright's Firefox is not installed here (`firefox.launch()` fails, and `playwright install` is not allowed).
 
 ### The cause is confirmed
 
@@ -108,7 +108,18 @@ Implemented on `claude/webtransport-datagram-bursts-u1oaqa` (used in place of `v
 
 ### The option chosen
 
-A datagram is dropped (`VNET_EAGAIN`, `s.drops`, `vnet_stats.tx_dropped`) when **the oldest unsettled write is older than 250 ms** (`JS_DATAGRAM_STALL_MS`: the connection is stalled, and what is queued is stale; normal writes settle in milliseconds) **or when 512 are queued** (`JS_MAX_DATAGRAMS_IN_FLIGHT`, a memory bound: at most about 560 KB of copies, and 512 settle in about 90 ms, far below the stall age). `s.dgT` holds the issue time of every unsettled write.
+A datagram is dropped (`VNET_EAGAIN`, `s.drops`, `vnet_stats.tx_dropped`) when **512 are queued** (`JS_MAX_DATAGRAMS_IN_FLIGHT`, a memory bound: at most about 560 KB of copies) **or when the oldest unsettled write is stale**: it is older than 250 ms (`JS_DATAGRAM_STALL_MS`; normal writes settle in milliseconds), **counted from the first turn of the event loop after it was made**, **and** the event loop has turned at least 3 times since (`JS_DATAGRAM_STALL_TURNS`). Turns are counted by a `MessageChannel` ping posted from the send path, one outstanding at a time (so nothing runs when nothing is sent); a `setTimeout` would be throttled in a hidden tab, a message is not.
+
+**Why the turn rule (found in review).** The first version had the age alone, measured from the `write()` call. Chromium's datagram sink takes one write at a time, so after a long task the queue drains one write per main-thread round trip, and the game's next timer task can run before the settle tasks. Age then includes time the page itself could not settle anything. Measured in Chromium 153 against a loopback relay: send 10, busy-wait 300 ms in the same task, send 10 (3 rounds): 30 of 60 accepted; a game load (3 peers + 3 extras every 25 ms) while another page task hogs the main thread 300 ms every 700 ms or 400 ms every 1000 ms: 6 and 12 drops, where 0.4.0 had none. A drop-free rule has to ignore time spent in a task that is still running or that just ended. Options weighed:
+
+- *Age from issue time, as before* (rejected): the regression above.
+- *Age from the first turn after issue, plus 3 turns* (chosen): the same-task case has no turn at all, so nothing is dropped; a hog between game steps gives the settle tasks the chance to run before 3 more turns accumulate; and the age is still kept per head write, so under a frozen relay (Chromium still settles about one write per 0.5 s) a head that is already old when it becomes head is stale at once, and the queue stays at about 100.
+- *Time since the head changed* (rejected, measured): each settle under the frozen relay restarts the clock, and the queue grew to 486.
+- *A `setTimeout` turn counter* (rejected): throttled in hidden tabs.
+
+**Hidden tabs.** Playwright's headless Chromium keeps `document.visibilityState` at `visible` however many pages are opened, so a hidden tab could not be made; what was run is a sender with a 1 Hz game loop (the cadence of a throttled tab) sending 18 datagrams in a step: 108 of 108. By reasoning: message events are not timer-throttled, so turns are counted; in a throttled tab the game itself sends about once a second, so a real stall is noticed at the third send (3 s) instead of 250 ms, and the cap bounds what is queued meanwhile. Brief 14's wake callback (`cfg.wake`) is unaffected: it runs from the page's own promise handlers, not this path.
+
+**What the rule does not cover.** A page whose main thread is saturated for about a second or more without an idle gap (the 300 ms-busy step with a 300 ms gap measured from the step start, i.e. 100% busy for 900 ms) can still have a datagram refused when the queue has not drained for that long: one HELLO answer was dropped in that scenario. That is the page failing to keep up, and the game's own loop is no better off. **Memory Chromium holds:** under a stall (SIGSTOP of the relay) Chromium itself buffers about 375 more already-settled datagrams, bounded by Chromium but stale in a way this rule cannot see.
 
 Why not the others:
 
@@ -121,11 +132,11 @@ Firefox (not run): it implements the same `WebTransportDatagramDuplexStream` att
 
 **The control path** (`JS_MAX_CONTROL_IN_FLIGHT` = 64) was checked and left alone. It carries only handshake requests, timed keepalives and a close: a few frames, on timers, never a burst, and a client cannot send 64 in one task through any API. Counting unsettled writes there is right, because a control write that stays unsettled means a stuck stream, which ends the session.
 
-**`relay_ws.c`** has no such bug: it limits on `WebSocket.bufferedAmount` (bytes, 64 KiB), which is exactly the browser's queue and is not tied to promises. The burst test passes over WebSocket too (3 x 22 datagrams in one task, 198 of 198). Note the limit is in bytes: a burst of more than about 59 datagrams of the maximum size (1109 bytes) in one task would be dropped there, which is back-pressure by definition, not this bug.
+**`relay_ws.c` has the same limit, measured in bytes (corrected in review).** It limits on `WebSocket.bufferedAmount` (64 KiB), and `bufferedAmount` cannot shrink inside the task that sends either: the browser drains it later. So one task that sends more than about 64 KiB is cut: 3 x 25 datagrams of 1100 bytes in one task over WebSocket: 60 of 75 accepted; 3 x 20 x 1100 bytes and 3 x 200 x 100 bytes lose nothing (the burst test here, 3 x 22 x 100 bytes, passes). It is the same bug, but only above about 59 maximum-size datagrams in one task, which small game packets do not reach; not changed here (the brief fixes WebSocket only if the same bug is found, and a byte limit that tolerates a burst needs its own design: an age/turn rule like the WebTransport one, or a higher byte cap). **Follow-up.**
 
 ### Drops are reported
 
-`vnet_stats` gained `tx_dropped` at the end (source compatible, 0.4.1): every `vnet_sendto()` that the backend refused with `VNET_EAGAIN` (WebTransport stalled, WebSocket `bufferedAmount` over 64 KiB, a full UDP socket buffer). `Module.vnetWT.s[id].drops` still counts them in the page. The relay also counts only what reaches it; it saw no drops and no rate limiting in the runs.
+`vnet_stats` gained `tx_dropped` at the end (source compatible, 0.5.0): every datagram the backend refused with `VNET_EAGAIN`, at `vnet_sendto()` or, with impairment, when `vnet_poll()` released a delayed datagram (`vnet_sendto()` had returned success then). Sources: UDP `EWOULDBLOCK`/`EAGAIN`/`ENOBUFS`, relay-udp (the inner UDP socket), relay-ws `bufferedAmount` over 64 KiB, relay-wt cap or stall rule; never loopback; relay control frames are not counted. A unit test covers the impaired path (`RelayWsStyle.ImpairedDatagramRefusedWhenReleasedCountsAsDropped`); a UDP test is not cheap (it needs a full kernel send buffer) and was skipped. `Module.vnetWT.s[id].drops` still counts them in the page. The relay also counts only what reaches it; it saw no drops and no rate limiting in the runs.
 
 ### Numbers (AC4)
 
@@ -139,21 +150,36 @@ Firefox (not run): it implements the same `WebTransportDatagramDuplexStream` att
 | game, 7 peers + 3 extra, one tic per task (10 per task) | 1600 of 1600 | 1600 of 1600 |
 | game, 3 peers + 3 extra, every 8th step 3 tics in one task (18 per task) | 1157 of 1200 (43 dropped) | 1200 of 1200 |
 | game, 7 peers + 3 extra, every 8th step 3 tics in one task (30 per task) | 1716 of 2000 (284 dropped) | 2000 of 2000 |
+| 10 datagrams, 300 ms busy-wait in the same task, 10 more, 3 rounds (60) | 47 of 60 (13 dropped) | 60 of 60 |
+| game, 3 peers + 3 extra, another task hogs the main thread 300 ms every 700 ms (960) | 960 of 960 | 960 of 960 (an age-only rule: 6 dropped) |
+| the same, 400 ms every 1000 ms (960) | 960 of 960 | 960 of 960 (an age-only rule: 12 dropped) |
 
-So a steady 40 tics a second to 3 or 7 peers with a few extras stays under 16 per task and did not drop even before; the drops need more than 16 sends in one task (several tics when a frame falls behind, a resend burst, more peers or extras). Every drop makes the game resend, which makes the next burst bigger: the feedback the brief describes. A first version of the 7-peer scenario ran every step with 3 tics (1200 datagrams a second); the **relay** rate-limits a client at 600 a second sustained (`-client-pps`), so that is not a fair test: the final scenario keeps the average at about 500. The test also checks that the relay rate limited and dropped nothing. Not checked: jfsw-browser itself (AC5), and a real network.
+So a steady 40 tics a second to 3 or 7 peers with a few extras stays under 16 per task and did not drop even before; the drops need more than 16 sends in one task (several tics when a frame falls behind, a resend burst, more peers or extras). Every drop makes the game resend, which makes the next burst bigger: the feedback the brief describes. A first version of the 7-peer scenario ran every step with 3 tics (1200 datagrams a second); the **relay** rate-limits a client at 600 a second sustained (`-client-pps`), so that is not a fair test: the final scenario keeps the average at about 500. The test also checks that the relay rate limited and dropped nothing. All "after" numbers were re-measured with the final code (`wt_burst.test.js`); the "before" ones are from 0.4.0 (`relay_wt.c` as of `579a410`) and, in the last two rows, from the first-round age-only rule. Not checked: jfsw-browser itself (AC5), and a real network.
 
 ### Back-pressure and the mutation (tests 2 and 3)
 
-- A datagram writer whose writes never settle (the page wraps `WebTransport`): of 2560 sends in 40 bursts of 64, 509 were accepted, the page was given 512 writes, 2051 got `VNET_EAGAIN`, the queue held 512, and the drop counts agree. Before: 15 accepted.
-- A relay frozen with SIGSTOP while the sender keeps sending (10 per 25 ms): no drops while it reads; drops start once it stops; the queue stays at about 100 writes (the age rule, not the cap); the session is still up while the relay is only frozen, and **fails when the relay is killed, as today** (`session closed by the relay`, 0.6 s).
-- **Mutation 1:** with the old limit (cap of 16, no age rule) 6 checks fail in `wt_burst.test.js` (the three burst checks, the 255 burst and both catch-up game loads). With the whole old code restored the same checks fail (7 with the queue check). **Mutation 2:** no cap and no age rule (unbounded): 8 checks fail (queue size, drops counted, drops once the relay stops reading). Both restored; not committed.
+- **The cap alone (a writer whose writes never settle; the page wraps `WebTransport`):** one burst of 600 datagrams in a single task, which the age rule cannot touch. Exactly 512 writes were made and are queued (511 data datagrams and one HELLO answer), 89 got `VNET_EAGAIN`, the drop counts agree. Before: 15 accepted.
+- **The age rule alone (a relay frozen with SIGSTOP while the sender keeps sending, 10 per 25 ms):** no drops while it reads; drops start once it stops; the queue stays at about 107 writes, far below the cap (the test requires fewer than 300); the session is still up while the relay is only frozen, and **fails when the relay is killed, as today** (`session closed by the relay`, 0.6 s).
+- **The long task:** 300 ms of busy-waiting in the task, and a hog task of 300 and 400 ms between game steps: zero drops in all three.
+- **Robustness:** `wt_burst.test.js` has a 10-minute watchdog that kills every child process and exits 1, every `page.evaluate`, `ctx.close()` and `browser.close()` has a 15 s timeout, children (relays, receivers) are killed in `finally`, and the CI `browser` job has `timeout-minutes: 40`.
+
+**Mutations** (applied to `src/relay_wt.c`, run against `wt_burst.test.js`, restored, never committed). Every one fails at least one check:
+
+| mutation | checks failed | which |
+|---|---|---|
+| old limit: cap 16, no age rule | 10 | the three burst checks, the 255 burst, both catch-up loads, the 300 ms task, the cap checks (16 queued) |
+| the whole 0.4.0 file | 10 | the same, and the queue checks (no `dgT`) |
+| cap only (512, no age rule) | 1 | the frozen relay's queue is 512, not below 300 |
+| age only (250 ms from the call, no cap, no turn rule) | 6 | the 300 ms task (30 of 60), both hogs (6 and 12 dropped), the 600 burst (608 queued, none refused) |
+| neither (unbounded) | 7 | the 600 burst, no drops on the frozen relay, the queue |
+| the turn rule removed (age 250 ms from the call, cap kept: the first-round code) | 2 | the 300 ms task (30 of 60) and the 400 ms hog (12 dropped); the 300 ms hog is timing dependent and passed once |
 
 ### Bit Riot
 
-Read-only, on its `claude` branch (`81e8dbc`). The host's `LockstepSession::hostSend()` runs on each `pump()` and sends, per present peer, one `TICKS` when there is something new or unacknowledged (resent after 40 ms) and an empty `TICKS` as a keepalive, plus a `LOBBY` broadcast to every peer now and then, plus the catch-up window for each late joiner (`CATCHUP_WINDOW_PACKETS` = 8 datagrams). `MAX_PEERS` is 6, so up to 5 peers. A 4-player browser host (3 peers) sends about 3 to 9 in a pump in steady state, **under 16**, but it can **pass 16** in one task when a frame runs several pumps (hitch, extra ticks), when resends coincide with new ticks and the lobby broadcast, or a late joiner is being caught up (up to 8 more); a 6-player host or a mid-join reaches it more easily. I did not run Bit Riot. With 0.4.1 none of these is dropped by vnet.
+Read-only, on its `claude` branch (`81e8dbc`). The host's `LockstepSession::hostSend()` runs on each `pump()` and sends, per present peer, one `TICKS` when there is something new or unacknowledged (resent after 40 ms) and an empty `TICKS` as a keepalive, plus a `LOBBY` broadcast to every peer now and then, plus the catch-up window for each late joiner (`CATCHUP_WINDOW_PACKETS` = 8 datagrams). `MAX_PEERS` is 6, so up to 5 peers. A 4-player browser host (3 peers) sends about 3 to 9 in a pump in steady state, **under 16**, but it can **pass 16** in one task when a frame runs several pumps (hitch, extra ticks), when resends coincide with new ticks and the lobby broadcast, or a late joiner is being caught up (up to 8 more); a 6-player host or a mid-join reaches it more easily. I did not run Bit Riot. With 0.5.0 none of these is dropped by vnet.
 
 ### Deviations and follow-ups
 
 - Branch name (see the top). CTest (configured like CI's Linux job, 275 tests, including `relay_go_tests`): all pass, except that this container's kernel has no IPv6 (no `/proc/sys/net/ipv6`, no `::1`), so `UdpFamily.Ipv6LoopbackRoundTrip` is skipped, and with `VNET_REQUIRE_IPV6=1` it and `UdpFamily.DualStackOrFallbackReachesIpv4PeersAndReportsIpv4Senders` fail for that reason alone. CI creates `::1` first.
 - New: `examples/burst_probe.c` (browser sender, native receivers), `tests/browser/wt_burst.test.js` (run by `scripts/test-browser.sh`), the measurement tool, and `?arg=` pass-through in `examples/shell.html`.
-- Follow-ups: try jfsw-browser at 0.4.1 (AC5); Firefox and Safari by hand (the cap and age rule are browser independent, but their write timing was not measured); a relay-side per-client limit of 600 datagrams a second is worth knowing about for 7-player hosts with resend storms (not a bug).
+- Follow-ups: try jfsw-browser at 0.5.0 (AC5); **WebSocket's byte limit in one task** (above); Firefox and Safari by hand (the cap and age rule are browser independent, but their write timing was not measured); a relay-side per-client limit of 600 datagrams a second is worth knowing about for 7-player hosts with resend storms (not a bug).

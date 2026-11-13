@@ -17,9 +17,9 @@ Each brief (`NN-*.md`) is one implement → review → merge cycle. Brief number
 | 10 | [Relay and WebSocket transport](10-vnet-relay-websocket.md) | 06 | done |
 | 11 | [WebTransport datagrams](11-vnet-webtransport.md) | 10 | done |
 | 14 | [API polish and browser lifecycle](14-vnet-api-polish.md) (from the [design review](design-review.md)) | 11 | done |
-| 15 | [WebTransport drops datagrams sent in a burst](15-wt-datagram-bursts.md) (found by jfsw-browser, 13 Nov 2026) | 14 | implemented, in review (0.4.1) |
+| 15 | [WebTransport drops datagrams sent in a burst](15-wt-datagram-bursts.md) (found by jfsw-browser, 13 Nov 2026) | 14 | implemented, in review (0.5.0) |
 
-**State (13 Nov 2026): brief 15 is implemented and in review (CMake version 0.4.1, branch `claude/webtransport-datagram-bursts-u1oaqa`); `v0.4.1` is tagged after the merge.** **State (29 Oct 2026):** 06, 10, 11 and 14 are done and merged into `claude` (14: merge eb1feeb, CMake version 0.4.0). Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11), `v0.4.0` (14). Consumers pin a tag. No brief is open. CI (GitHub Actions) runs on pushes to `main`, `claude`, `vnet/**` and `fix/**`, and is green on all seven jobs; it never ran before 29 Oct because the workflow file was invalid YAML.
+**State (13 Nov 2026): brief 15 is implemented and in review (CMake version 0.5.0, branch `claude/webtransport-datagram-bursts-u1oaqa`); `v0.5.0` is tagged after the merge.** **State (29 Oct 2026):** 06, 10, 11 and 14 are done and merged into `claude` (14: merge eb1feeb, CMake version 0.4.0). Releases are tagged: `v0.1.0` (06), `v0.2.0` (10), `v0.3.0` (11), `v0.4.0` (14). Consumers pin a tag. No brief is open. CI (GitHub Actions) runs on pushes to `main`, `claude`, `vnet/**` and `fix/**`, and is green on all seven jobs; it never ran before 29 Oct because the workflow file was invalid YAML.
 
 **Bit Riot briefs that consume vnet:** 07 (native lockstep, needs 06) and 12 (browser netplay, needs 10). Both start after 14, which added what they need (impairment changes on a live context and integration docs for 07; the hidden-tab fix, wake callback and portable relay backend for 12). A session doing those needs both repos attached.
 
