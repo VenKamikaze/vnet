@@ -15,7 +15,11 @@
 //      sends of one task, and a page task that hogs the main thread for 300 to
 //      400 ms every second between game steps, lose nothing (the rule that
 //      drops stale datagrams must not count time the page itself spent
-//      unable to settle writes).
+//      unable to settle writes). Also with no idle at all: a 300 ms task every
+//      300 ms, a game of 9 frames a second whose frames never end before the
+//      next one starts, and a task that hogs 99 percent of the main thread. The
+//      browser's own queue of datagrams (Chromium: one at a time) then drains
+//      one datagram per task; nothing may be refused (396 of 480 were).
 //   4. Back-pressure is real and bounded: with a datagram writer whose writes
 //      never settle (the browser stops sending), and with a relay that is
 //      frozen (SIGSTOP), the queue stays bounded and the datagrams past the
@@ -106,6 +110,19 @@ function allArrived(r, what) {
   check(r.errors.length === 0, 'no page errors ' + r.errors.join('; '));
 }
 
+// For a page that is busy all the time: nothing may be REFUSED by vnet (that is what
+// is under test). What the browser then loses on the way (once vnet has raised its
+// queue the datagrams leave in floods of 10 to 20 at a time, and a few of a flood
+// are lost, 7 of 120 at most in 20 runs: see the Outcome of brief 15) is not counted
+// against it, but at least 90 percent must arrive.
+function noneRefused(r, what) {
+  const exp = r.recv.reduce((a, x) => a + (x ? x.expect : 0), 0), got = r.recv.reduce((a, x) => a + (x ? x.distinct : 0), 0);
+  check(r.sender.ok && r.sender.eagain === 0 && r.sender.tx_dropped === 0 && r.sender.accepted === r.sender.attempted && (!r.js || r.js.drops === 0),
+    `${what}: ${summary(r)}`);
+  check(exp > 0 && got >= 0.9 * exp, `${what}: at least 90 percent arrived (${got} of ${exp})`);
+  check(r.errors.length === 0, 'no page errors ' + r.errors.join('; '));
+}
+
 async function main() {
   const relay = await startRelay(['-wt', '127.0.0.1:0', '-dev-cert']);
   track(relay.child);
@@ -153,21 +170,30 @@ async function main() {
     }
 
     // ---- 3. a long task is not back-pressure
-    console.log('WebTransport: 10 datagrams, 300 ms of busy-waiting in the same task, 10 more (3 times)');
+    console.log('WebTransport: 10 datagrams, 300 ms of busy-waiting in the same task, 10 more, never idle (6 times)');
     {
       // Nothing can settle inside the task, so the first write is 300 ms old when
-      // the second ten are sent; the connection is fine. (A step is 300 ms busy
-      // and 400 ms idle: a page that never goes idle for a second is another matter.)
-      const r = await run(browser, origin, relay, wt, 1, ['--mode', 'burst', '--burst', '10', '--rounds', '3', '--gap', '700', '--payload', '100', '--busy', '300']);
-      allArrived(r, 'a 300 ms task between two bursts');
+      // the second ten are sent; the connection is fine. The page is busy all the
+      // time (a 300 ms task every 300 ms): the datagrams leave at the end of each
+      // task, none may be refused.
+      const r = await run(browser, origin, relay, wt, 1, ['--mode', 'burst', '--burst', '10', '--rounds', '6', '--gap', '300', '--payload', '100', '--busy', '300']);
+      noneRefused(r, 'a 300 ms task between two bursts, no idle');
     }
-    for (const [hog, period] of [[300, 700], [400, 1000]]) {
-      console.log(`WebTransport, game load every 25 ms while another page task hogs the main thread ${hog} ms every ${period} ms`);
+    console.log('WebTransport: a game that never idles (6 datagrams, 112 ms of frame work, 6 more; about 9 frames a second)');
+    {
+      // Chromium's default outgoingHighWaterMark of 1 let ONE datagram out per task here:
+      // 396 of 480 were refused while the connection was fine.
+      const r = await run(browser, origin, relay, wt, 1, ['--mode', 'burst', '--burst', '6', '--rounds', '40', '--gap', '0', '--payload', '100', '--busy', '112']);
+      noneRefused(r, 'frames of 112 ms, no idle');
+    }
+    for (const [hog, period] of [[300, 700], [400, 1000], [110, 1]]) {
+      const strict = period > 1;
+      console.log(`WebTransport, game load every 25 ms while another page task hogs the main thread ${hog} ms, then idles ${period} ms`);
       const init = `(() => { const L = ${hog}, P = ${period}; window.__hogs = 0;
         setTimeout(function hog() { const u = performance.now() + L; while (performance.now() < u) {} window.__hogs++; setTimeout(hog, P); }, 1500); })()`;
       const r = await run(browser, origin, relay, wt, 3,
         ['--mode', 'game', '--ticks', '160', '--interval', '25', '--extra', '3', '--payload', '60'], init);
-      allArrived(r, `${hog} ms hogs`);
+      (strict ? allArrived : noneRefused)(r, `${hog} ms hogs, ${period} ms idle`);
     }
 
     // ---- 4. back-pressure

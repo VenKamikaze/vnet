@@ -112,7 +112,10 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 // about once a second, so a real stall is noticed after the third send instead
 // of after 250 ms; the cap bounds what is queued meanwhile. (Rejected: "time
 // since the head changed": under a frozen relay Chromium still settles about
-// one write per 0.5 s, and the queue grew to 486.)
+// one write per 0.5 s, and the queue grew to 486. Tried since the browser's
+// queue is raised, below: a rule of one turn instead of three; a 300 ms task
+// every 300 ms then still lost 10 datagrams in 1 run of 4, with three turns in
+// none of 6: the first stall is judged again only after real turns.)
 // JS_MAX_DATAGRAMS_IN_FLIGHT bounds the memory whatever the age: at most this
 // many copies (each at most RELAY_WT_DATA_MAX bytes) are held by vnet; the cap
 // alone is hit by one task sending more than that. Chromium itself buffers
@@ -128,6 +131,24 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 #define JS_MAX_DATAGRAMS_IN_FLIGHT 512
 #define JS_DATAGRAM_STALL_MS 250
 #define JS_DATAGRAM_STALL_TURNS 3
+// Chromium's datagram sink holds outgoingHighWaterMark (default 1) writes in
+// its own queue and a write settles only once the queue is below that, which
+// costs one round trip of the page's main thread per datagram: on a page that
+// is busy all the time about ONE datagram leaves per task and the rest wait in
+// the browser (measured with arrival times at the receiver: arrival time equals
+// settle time, a game at 9 frames/s with no idle had 396 of 480 datagrams
+// refused while the connection was fine). A deeper queue fixes that (0 refused
+// with 64; 24 is enough for a 12-datagram frame, 16 is not) but costs the
+// ordinary case: more than one datagram handed to the connection at a time
+// loses a block of a burst of 66 to 255 in one task about one run in ten on
+// loopback (3 x 22: 0 of 30 runs at the default, 3 of 30 at 32, 4 of 30 at 64;
+// 3 x 85: 0 of 40, 7 of 40 at 32; cause not found: nothing is dropped by
+// vnet, the kernel or the relay's own counters; the missing datagrams are
+// blocks of consecutive ones). So the queue stays at the default until the
+// first stall of the session (the rule above), which is raised to this instead
+// of being refused; the stall rule then judges again. A browser without the
+// attribute keeps the default and drops as before.
+#define JS_DATAGRAM_RAISED_HWM 64
 #define JS_MAX_CONTROL_IN_FLIGHT 64
 
 // Returns a session id (> 0), or 0 if there is no WebTransport here (the
@@ -162,7 +183,7 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
     opts.serverCertificateHashes = [{ algorithm: "sha-256", value: HEAPU8.slice(hash, hash + 32) }];
   }
   var s = { id: T.next++, state: 0, q: [], qc: [], inbox: inbox_frames, maxFrame: max_frame, ctlFrames: ctl_frames,
-            maxdg: 0, dgT: [], dgK: [], dgTurn: 0, dgTT: [], dgTB: 1, dgPing: null, dgPingOut: false, ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
+            maxdg: 0, dgT: [], dgK: [], dgTurn: 0, dgTT: [], dgTB: 1, dgPing: null, dgPingOut: false, hwmUp: false, dgRaiseK: 0, dgRaiseT: 0, ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
   // Tell C there is something to poll for. Not once the session is closed or
   // gone (T.s no longer has it): C may have freed what the hook points at.
   s.wake = function () { if (wake_fn && T.s[s.id] === s && s.state !== 3) getWasmTableEntry(wake_fn)(wake_arg); };
@@ -267,7 +288,7 @@ EM_JS(int, vnet_wt_send_control, (int id, const uint8_t *p, int n, int in_flight
 // s.dgTB + j, kept from the first turn after the head write was made. The
 // head's age is counted from that turn, whatever happened to the writes ahead
 // of it (a new head that is already old is stale at once, as it must be).
-EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_flight_max, int stall_ms, int stall_turns), {
+EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_flight_max, int stall_ms, int stall_turns, int raise_hwm), {
   var s = Module.vnetWT && Module.vnetWT.s[id];
   if (!s || s.state !== 1 || !s.dw) return -1;
   var now = performance.now();
@@ -282,9 +303,20 @@ EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_fligh
     };
   }
   var stalled = false;
-  if (s.dgT.length > 0 && s.dgTurn - s.dgK[0] >= stall_turns) {
+  var base = s.dgT.length > 0 ? Math.max(s.dgK[0], s.dgRaiseK) : 0;
+  if (s.dgT.length > 0 && s.dgTurn - base >= stall_turns) {
     // At least stall_turns turns since the head was made, so turn dgK[0]+1 is stored.
-    stalled = now - s.dgTT[s.dgK[0] + 1 - s.dgTB] > stall_ms;
+    var t0 = Math.max(s.dgTT[s.dgK[0] + 1 - s.dgTB], s.dgRaiseT);
+    stalled = now - t0 > stall_ms;
+  }
+  if (stalled && !s.hwmUp) {
+    // The first stall of a session is not yet a verdict (see the comment above
+    // JS_DATAGRAM_RAISED_HWM): raise the browser's queue depth, and judge again
+    // from now on (turns and time are counted from here).
+    s.hwmUp = true;
+    try { if (s.wt.datagrams.outgoingHighWaterMark < raise_hwm) s.wt.datagrams.outgoingHighWaterMark = raise_hwm; } catch (e) {}
+    s.dgRaiseK = s.dgTurn; s.dgRaiseT = now;
+    stalled = false;
   }
   if (s.dgT.length >= in_flight_max || stalled) { s.drops++; return 1; }
   s.dgT.push(now);
@@ -360,7 +392,7 @@ static int tp_send(void *p, const uint8_t *frame, size_t len) {
     if (len == 0 || len > 0xffff) return VNET_EINVAL;
     if (frame[0] == RELAY_T_DATA) {
         int rc = vnet_wt_send_datagram(t->id, frame, (int)len, JS_MAX_DATAGRAMS_IN_FLIGHT, JS_DATAGRAM_STALL_MS,
-                                      JS_DATAGRAM_STALL_TURNS);
+                                      JS_DATAGRAM_STALL_TURNS, JS_DATAGRAM_RAISED_HWM);
         if (rc == 0) return VNET_OK;
         return rc > 0 ? VNET_EAGAIN : VNET_ENOTCONN;
     }
