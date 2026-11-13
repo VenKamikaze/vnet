@@ -125,6 +125,16 @@ if(VNET_BUILD_EXAMPLES)
         target_link_options(wake_probe PRIVATE
             "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/examples/shell.html")
     endif()
+
+    # burst_probe: the test program for datagrams sent in a burst (brief 15).
+    # Browser: the sender. Native: the receivers.
+    add_executable(burst_probe examples/burst_probe.c)
+    target_link_libraries(burst_probe PRIVATE vnet)
+    if(EMSCRIPTEN)
+        set_target_properties(burst_probe PROPERTIES SUFFIX ".html")
+        target_link_options(burst_probe PRIVATE
+            "SHELL:--shell-file ${CMAKE_CURRENT_SOURCE_DIR}/examples/shell.html")
+    endif()
 endif()
 
 if(VNET_BUILD_TESTS OR VNET_BUILD_SMOKE)
