@@ -83,10 +83,25 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 // polled for a very long time, and the session is declared failed.
 #define JS_INBOX_FRAMES 256
 #define JS_CONTROL_FRAMES 256
-// Datagram writes the browser has not finished with; more are dropped rather
-// than queued behind stale ones (vnet is unreliable). Control writes that
-// stay unfinished this long mean the connection is stuck.
-#define JS_MAX_DATAGRAMS_IN_FLIGHT 16
+// Datagram writes the browser has not finished with. A write() settles in a
+// later task, never during the C code that made it, so a game that sends a
+// whole step's datagrams in one go (to every peer, plus acks and resends, and
+// several tics when a frame fell behind) has all of them unsettled at once
+// without the browser being in any trouble: in Chromium a burst of 256
+// settles within ~50 ms, and a game-like rhythm leaves nothing unsettled by
+// the next task. A cap that small counted bursts, not back-pressure (it was
+// 16: everything past the 16th datagram of a step was dropped).
+// Back-pressure is a write that STAYS unsettled: the datagram at the head of
+// the queue is older than JS_DATAGRAM_STALL_MS. Then new datagrams are dropped
+// rather than queued behind stale ones (vnet is unreliable), until the queue
+// drains. JS_MAX_DATAGRAMS_IN_FLIGHT bounds the memory whatever the age: at
+// most this many copies (each at most RELAY_WT_DATA_MAX bytes) are held.
+// (Chromium ignores datagrams.outgoingMaxAge and the stream's own
+// desiredSize is just 1 minus the writes unsettled, so neither can replace
+// this.) Control writes that stay unfinished this long mean the connection is
+// stuck.
+#define JS_MAX_DATAGRAMS_IN_FLIGHT 512
+#define JS_DATAGRAM_STALL_MS 250
 #define JS_MAX_CONTROL_IN_FLIGHT 64
 
 // Returns a session id (> 0), or 0 if there is no WebTransport here (the
@@ -121,7 +136,7 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
     opts.serverCertificateHashes = [{ algorithm: "sha-256", value: HEAPU8.slice(hash, hash + 32) }];
   }
   var s = { id: T.next++, state: 0, q: [], qc: [], inbox: inbox_frames, maxFrame: max_frame, ctlFrames: ctl_frames,
-            maxdg: 0, dgInFlight: 0, ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
+            maxdg: 0, dgT: [], ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
   // Tell C there is something to poll for. Not once the session is closed or
   // gone (T.s no longer has it): C may have freed what the hook points at.
   s.wake = function () { if (wake_fn && T.s[s.id] === s && s.state !== 3) getWasmTableEntry(wake_fn)(wake_arg); };
@@ -220,12 +235,16 @@ EM_JS(int, vnet_wt_send_control, (int id, const uint8_t *p, int n, int in_flight
 
 // A DATA frame as a datagram. 0, 1 if dropped because the browser is not
 // keeping up (a lossy network, as far as the game can tell), -1 when unusable.
-EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_flight_max), {
+// s.dgT holds the time each unsettled write was made, oldest first (writes of
+// one writer settle in order).
+EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_flight_max, int stall_ms), {
   var s = Module.vnetWT && Module.vnetWT.s[id];
   if (!s || s.state !== 1 || !s.dw) return -1;
-  if (s.dgInFlight >= in_flight_max) { s.drops++; return 1; }
-  s.dgInFlight++;
-  s.dw.write(HEAPU8.slice(p, p + n)).then(function () { s.dgInFlight--; }, function () { s.dgInFlight--; });
+  var now = performance.now();
+  if (s.dgT.length >= in_flight_max || (s.dgT.length > 0 && now - s.dgT[0] > stall_ms)) { s.drops++; return 1; }
+  s.dgT.push(now);
+  var settled = function () { s.dgT.shift(); };
+  s.dw.write(HEAPU8.slice(p, p + n)).then(settled, settled);
   return 0;
 })
 
@@ -288,7 +307,7 @@ static int tp_send(void *p, const uint8_t *frame, size_t len) {
     wt_tp *t = p;
     if (len == 0 || len > 0xffff) return VNET_EINVAL;
     if (frame[0] == RELAY_T_DATA) {
-        int rc = vnet_wt_send_datagram(t->id, frame, (int)len, JS_MAX_DATAGRAMS_IN_FLIGHT);
+        int rc = vnet_wt_send_datagram(t->id, frame, (int)len, JS_MAX_DATAGRAMS_IN_FLIGHT, JS_DATAGRAM_STALL_MS);
         if (rc == 0) return VNET_OK;
         return rc > 0 ? VNET_EAGAIN : VNET_ENOTCONN;
     }

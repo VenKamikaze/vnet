@@ -14,7 +14,8 @@
  *                  a second is 25): per receiver one datagram, plus --extra E
  *                  more (acks, resends) spread over the receivers. With
  *                  --catchup C a step runs C tics back to back, as a game that
- *                  fell behind does.
+ *                  fell behind does, every --catchup-every E steps (default:
+ *                  every step).
  *
  * Datagrams are --payload bytes long (at least 9) and numbered per receiver.
  * It then sends FINISHED to each receiver for a while and prints
@@ -60,7 +61,7 @@ typedef struct probe {
     int sock;
     int sender;
     int game;
-    int peers, burst, rounds, gap_ms, ticks, interval_ms, extra, catchup, payload;
+    int peers, burst, rounds, gap_ms, ticks, interval_ms, extra, catchup, catchup_every, payload;
     uint64_t timeout_ms, t0;
 
     int entered, started;
@@ -207,7 +208,8 @@ static void sender_step(uint64_t now) {
             g.fin_until = now + FIN_MS;
         }
     } else {
-        for (int c = 0; c < g.catchup; c++) {
+        int tics = g.tick % g.catchup_every == 0 ? g.catchup : 1;
+        for (int c = 0; c < tics; c++) {
             for (int i = 0; i < g.npeers; i++) send_one(i);
             for (int e = 0; e < g.extra; e++) send_one(e % g.npeers);
         }
@@ -282,6 +284,7 @@ int main(int argc, char **argv) {
     g.ticks = 100;
     g.interval_ms = 25;
     g.catchup = 1;
+    g.catchup_every = 1;
     g.payload = 40;
     g.timeout_ms = 60000;
     for (int i = 1; i < argc; i++) {
@@ -300,6 +303,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--interval") && val) g.interval_ms = atoi(argv[++i]);
         else if (!strcmp(a, "--extra") && val) g.extra = atoi(argv[++i]);
         else if (!strcmp(a, "--catchup") && val) g.catchup = atoi(argv[++i]);
+        else if (!strcmp(a, "--catchup-every") && val) g.catchup_every = atoi(argv[++i]);
         else if (!strcmp(a, "--payload") && val) g.payload = atoi(argv[++i]);
         else if (!strcmp(a, "--timeout") && val) g.timeout_ms = (uint64_t)atoll(argv[++i]);
         else if (!strcmp(a, "--verbose")) verbose = 1;
@@ -310,7 +314,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!relay || g.peers < 1 || g.peers > MAX_PEERS || g.payload < 9 || g.payload > VNET_MAX_DATAGRAM ||
-        g.burst < 1 || g.rounds < 1 || g.ticks < 1 || g.catchup < 1 || g.extra < 0)
+        g.burst < 1 || g.rounds < 1 || g.ticks < 1 || g.catchup < 1 || g.catchup_every < 1 || g.extra < 0)
         return 2;
     g.sender = room == NULL;
     g.seen = calloc(MAX_SEQ, 1);

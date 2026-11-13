@@ -22,7 +22,7 @@
 'use strict';
 const { spawn } = require('child_process');
 const readline = require('readline');
-const { chromium, arg, check, failureCount, withTimeout, startRelay, serveWeb } = require('./harness');
+const { chromium, arg, check, failureCount, withTimeout, startRelay, serveWeb, getJSON } = require('./harness');
 
 const PROBE_BIN = arg('probe-bin');
 if (!PROBE_BIN) { console.error('--probe-bin is required'); process.exit(2); }
@@ -118,13 +118,15 @@ async function main() {
     const games = [
       ['3 peers, 3 extra, one tic per task', 3, 3, 1],
       ['7 peers, 3 extra, one tic per task', 7, 3, 1],
-      ['3 peers, 3 extra, 3 tics in one task (a frame that fell behind)', 3, 3, 3],
-      ['7 peers, 3 extra, 3 tics in one task', 7, 3, 3],
+      // Every 8th step runs 3 tics back to back (a frame that fell behind): the
+      // average stays under the relay's own limit of 600 datagrams a second per client.
+      ['3 peers, 3 extra, every 8th step 3 tics in one task (a frame that fell behind)', 3, 3, 3],
+      ['7 peers, 3 extra, every 8th step 3 tics in one task', 7, 3, 3],
     ];
     for (const [what, K, extra, catchup] of games) {
       console.log(`WebTransport, game load every 25 ms: ${what}`);
       const r = await run(browser, origin, relay, wt, K,
-        ['--mode', 'game', '--ticks', '160', '--interval', '25', '--extra', String(extra), '--catchup', String(catchup), '--payload', '60']);
+        ['--mode', 'game', '--ticks', '160', '--interval', '25', '--extra', String(extra), '--catchup', String(catchup), '--catchup-every', '8', '--payload', '60']);
       allArrived(r, what);
     }
 
@@ -163,8 +165,10 @@ async function main() {
       check(writes >= r.accepted && writes <= 1100, `the page was given ${writes} writes in all (${r.accepted} datagrams accepted, and a few HELLO answers)`);
       check(r.accepted > 0 && r.accepted <= 1024, `at most 1024 datagrams were queued behind a stalled writer (${r.accepted})`);
       check(r.eagain === r.attempted - r.accepted && r.eagain > 1500, `the rest were refused with VNET_EAGAIN (${r.eagain})`);
-      check(r.tx_dropped === r.eagain, `vnet_stats.tx_dropped counts them (${r.tx_dropped})`);
-      check(js && js.drops === r.eagain && js.queued <= 1024, `the page's own count agrees: ${JSON.stringify(js)}`);
+      // (tx_dropped also counts the datagrams the probe does not tally: the answers to
+      // HELLO and the FINISHED messages.)
+      check(r.tx_dropped >= r.eagain && r.tx_dropped < r.eagain + 200, `vnet_stats.tx_dropped counts them (${r.tx_dropped})`);
+      check(js && js.drops === r.tx_dropped && js.queued <= 1024, `the page's own count agrees: ${JSON.stringify(js)}`);
       rcv.child.kill('SIGKILL');
       await sender.ctx.close();
     }
@@ -202,6 +206,10 @@ async function main() {
       check(r.tx_dropped > 200, `vnet_stats.tx_dropped saw the drops (${r.tx_dropped})`);
       await sender.ctx.close();
     }
+    // Whatever was lost was lost on purpose or not at all: the relay limited and dropped nothing.
+    const st = await getJSON(relay.stats, '/stats');
+    check(st.rate_limited === 0 && st.malformed === 0 && st.panics === 0 && st.wt_datagram_drops === 0,
+      `the relay rate limited and dropped nothing (${JSON.stringify({ r: st.rate_limited, m: st.malformed, d: st.wt_datagram_drops })})`);
   } finally {
     await browser.close();
     web.close();
