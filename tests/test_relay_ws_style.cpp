@@ -235,9 +235,15 @@ TEST_F(RelayWsStyle, BackpressureDropsADatagramInsteadOfFailing) {
     EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), VNET_EAGAIN);
     vnet_get_stats(v, &after);
     EXPECT_EQ(after.wire_datagrams, before.wire_datagrams);  // not counted as sent
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 1);      // but counted as dropped
+    EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), VNET_EAGAIN);
+    vnet_get_stats(v, &after);
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 2);
     EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);   // and not a failure
     tp.send_rc = 0;
     EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), 1);
+    vnet_get_stats(v, &after);
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 2);      // a send that works is not a drop
 }
 
 TEST_F(RelayWsStyle, TransportIsOwnedByTheContext) {

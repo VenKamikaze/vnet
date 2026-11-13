@@ -674,6 +674,11 @@ typedef struct vnet_stats {
     uint64_t rx_oversize;        /* dropped: > VNET_MAX_DATAGRAM (UDP, relay) */
     uint64_t unroutable;         /* loopback: no such host/port; relay: a
                                     datagram for a port you have not opened */
+    uint64_t tx_dropped;         /* vnet_sendto() returned VNET_EAGAIN: the
+                                    backend was not keeping up and dropped the
+                                    datagram (relay in a browser: the browser's
+                                    send queue is stalled; UDP: the socket
+                                    buffer is full). Added in 0.4.1. */
 } vnet_stats;
 
 /* Copy the counters out. A NULL `v` gives zeros. */
