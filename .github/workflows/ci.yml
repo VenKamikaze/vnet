@@ -134,6 +134,7 @@ jobs:
   browser:
     name: "browser (Emscripten + Chromium via Playwright): WebSocket, WebTransport, fallback"
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

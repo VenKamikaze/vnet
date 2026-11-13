@@ -10,6 +10,10 @@
  *
  *   --mode burst   --rounds R times (--gap ms apart): --burst B datagrams to
  *                  each receiver, back to back.
+ *                  With --busy MS the step busy-waits MS milliseconds after
+ *                  the burst and then sends the burst again (a long task, as a
+ *                  slow frame or a garbage collection: the browser cannot
+ *                  settle anything meanwhile).
  *   --mode game    --ticks T times, one every --interval ms (a game at 40 tics
  *                  a second is 25): per receiver one datagram, plus --extra E
  *                  more (acks, resends) spread over the receivers. With
@@ -61,7 +65,7 @@ typedef struct probe {
     int sock;
     int sender;
     int game;
-    int peers, burst, rounds, gap_ms, ticks, interval_ms, extra, catchup, catchup_every, payload;
+    int peers, burst, rounds, gap_ms, busy_ms, ticks, interval_ms, extra, catchup, catchup_every, payload;
     uint64_t timeout_ms, t0;
 
     int entered, started;
@@ -179,6 +183,12 @@ static void on_message(const uint8_t *m, size_t n, const vnet_addr *from) {
     }
 }
 
+static void busy_wait(uint64_t ms) {
+    uint64_t until = vnet_time(g.v) + ms;
+    while (vnet_time(g.v) < until) {
+    }
+}
+
 static void sender_step(uint64_t now) {
     if (g.fin_phase) {
         if (now >= g.fin_until) {
@@ -200,8 +210,11 @@ static void sender_step(uint64_t now) {
     if (now < g.next_step) return;
     uint64_t before = g.attempted;
     if (!g.game) {
-        for (int i = 0; i < g.npeers; i++)
-            for (int k = 0; k < g.burst; k++) send_one(i);
+        for (int pass = 0; pass < (g.busy_ms > 0 ? 2 : 1); pass++) {
+            if (pass) busy_wait((uint64_t)g.busy_ms);
+            for (int i = 0; i < g.npeers; i++)
+                for (int k = 0; k < g.burst; k++) send_one(i);
+        }
         g.next_step = now + (uint64_t)g.gap_ms;
         if (++g.round >= g.rounds) {
             g.fin_phase = 1;
@@ -299,6 +312,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--burst") && val) g.burst = atoi(argv[++i]);
         else if (!strcmp(a, "--rounds") && val) g.rounds = atoi(argv[++i]);
         else if (!strcmp(a, "--gap") && val) g.gap_ms = atoi(argv[++i]);
+        else if (!strcmp(a, "--busy") && val) g.busy_ms = atoi(argv[++i]);
         else if (!strcmp(a, "--ticks") && val) g.ticks = atoi(argv[++i]);
         else if (!strcmp(a, "--interval") && val) g.interval_ms = atoi(argv[++i]);
         else if (!strcmp(a, "--extra") && val) g.extra = atoi(argv[++i]);
@@ -314,7 +328,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!relay || g.peers < 1 || g.peers > MAX_PEERS || g.payload < 9 || g.payload > VNET_MAX_DATAGRAM ||
-        g.burst < 1 || g.rounds < 1 || g.ticks < 1 || g.catchup < 1 || g.catchup_every < 1 || g.extra < 0)
+        g.burst < 1 || g.busy_ms < 0 || g.rounds < 1 || g.ticks < 1 || g.catchup < 1 || g.catchup_every < 1 || g.extra < 0)
         return 2;
     g.sender = room == NULL;
     g.seen = calloc(MAX_SEQ, 1);

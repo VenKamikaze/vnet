@@ -36,6 +36,10 @@ const STRICT_DATAGRAMS = () => {
         return {
           getWriter() {
             const w = dg.writable.getWriter();
+            // Oversize chunks resolve at once, so out of order with the writes ahead
+            // of them. relay_wt.c assumes writes settle in order (it shifts its
+            // bookkeeping on each settle): here that only makes the ages it sees
+            // look smaller, which is harmless for this test.
             return { write: (c) => (c.length > 1024 ? Promise.resolve() : w.write(c)) };
           },
         };

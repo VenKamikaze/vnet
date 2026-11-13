@@ -91,17 +91,43 @@ int vnet__relay_wt_make(vnet *v, const char *url, const char *cert_sha256, const
 // settles within ~50 ms, and a game-like rhythm leaves nothing unsettled by
 // the next task. A cap that small counted bursts, not back-pressure (it was
 // 16: everything past the 16th datagram of a step was dropped).
-// Back-pressure is a write that STAYS unsettled: the datagram at the head of
-// the queue is older than JS_DATAGRAM_STALL_MS. Then new datagrams are dropped
-// rather than queued behind stale ones (vnet is unreliable), until the queue
-// drains. JS_MAX_DATAGRAMS_IN_FLIGHT bounds the memory whatever the age: at
-// most this many copies (each at most RELAY_WT_DATA_MAX bytes) are held.
+//
+// Back-pressure is a write that STAYS unsettled although the event loop had
+// the chance to settle it. A datagram is dropped (and the drop counted) rather
+// than queued behind stale ones (vnet is unreliable) when the write at the head
+// of the queue is both
+//   - older than JS_DATAGRAM_STALL_MS, counted from the first turn of the event
+//     loop after it was made (not from the call: a long task between the call
+//     and that turn is the page's own stall, not the connection's), and
+//   - has seen JS_DATAGRAM_STALL_TURNS turns of the event loop since it was
+//     made.
+// The turns matter because Chromium's datagram sink takes one write at a time,
+// so after a long task (a slow frame, GC: 300 ms in the test) the next game
+// timer can run before the settle tasks have drained the queue, and age alone
+// would drop datagrams the connection had already taken (an age-only rule did
+// that: 6 to 12 drops in 160 steps where 0.4.0 had none). Turns are counted by
+// a MessageChannel ping posted from the send path, one outstanding at a time,
+// so nothing runs when nothing is sent. Not a setTimeout: timers are throttled
+// in hidden tabs, a message is not. In a hidden tab the game's own timer runs
+// about once a second, so a real stall is noticed after the third send instead
+// of after 250 ms; the cap bounds what is queued meanwhile. (Rejected: "time
+// since the head changed": under a frozen relay Chromium still settles about
+// one write per 0.5 s, and the queue grew to 486.)
+// JS_MAX_DATAGRAMS_IN_FLIGHT bounds the memory whatever the age: at most this
+// many copies (each at most RELAY_WT_DATA_MAX bytes) are held by vnet; the cap
+// alone is hit by one task sending more than that. Chromium itself buffers
+// about 375 more already-settled datagrams under a stall (measured under
+// SIGSTOP of the relay): memory it bounds, but staleness this rule cannot see.
 // (Chromium ignores datagrams.outgoingMaxAge and the stream's own
 // desiredSize is just 1 minus the writes unsettled, so neither can replace
-// this.) Control writes that stay unfinished this long mean the connection is
-// stuck.
+// this.) Writes settle in order, as the head-first bookkeeping assumes; a test
+// wrapper that resolves some writes early (STRICT_DATAGRAMS in
+// wt_browser.test.js resolves oversize chunks at once) only makes the ages
+// look smaller. Control writes that stay unfinished this long mean the
+// connection is stuck.
 #define JS_MAX_DATAGRAMS_IN_FLIGHT 512
 #define JS_DATAGRAM_STALL_MS 250
+#define JS_DATAGRAM_STALL_TURNS 3
 #define JS_MAX_CONTROL_IN_FLIGHT 64
 
 // Returns a session id (> 0), or 0 if there is no WebTransport here (the
@@ -136,7 +162,7 @@ EM_JS(int, vnet_wt_open, (const char *url, const uint8_t *hash, int hashlen, int
     opts.serverCertificateHashes = [{ algorithm: "sha-256", value: HEAPU8.slice(hash, hash + 32) }];
   }
   var s = { id: T.next++, state: 0, q: [], qc: [], inbox: inbox_frames, maxFrame: max_frame, ctlFrames: ctl_frames,
-            maxdg: 0, dgT: [], ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
+            maxdg: 0, dgT: [], dgK: [], dgTurn: 0, dgTT: [], dgTB: 1, dgPing: null, dgPingOut: false, ctlInFlight: 0, wt: null, dw: null, cw: null, drops: 0, reason: "" };
   // Tell C there is something to poll for. Not once the session is closed or
   // gone (T.s no longer has it): C may have freed what the hook points at.
   s.wake = function () { if (wake_fn && T.s[s.id] === s && s.state !== 3) getWasmTableEntry(wake_fn)(wake_arg); };
@@ -235,15 +261,41 @@ EM_JS(int, vnet_wt_send_control, (int id, const uint8_t *p, int n, int in_flight
 
 // A DATA frame as a datagram. 0, 1 if dropped because the browser is not
 // keeping up (a lossy network, as far as the game can tell), -1 when unusable.
-// s.dgT holds the time each unsettled write was made, oldest first (writes of
-// one writer settle in order).
-EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_flight_max, int stall_ms), {
+// Per unsettled write, oldest first (writes of one writer settle in order):
+// s.dgT the time it was made, s.dgK the turn count then. s.dgTurn counts turns
+// of the event loop (MessageChannel pings) and s.dgTT[j] is the time of turn
+// s.dgTB + j, kept from the first turn after the head write was made. The
+// head's age is counted from that turn, whatever happened to the writes ahead
+// of it (a new head that is already old is stale at once, as it must be).
+EM_JS(int, vnet_wt_send_datagram, (int id, const uint8_t *p, int n, int in_flight_max, int stall_ms, int stall_turns), {
   var s = Module.vnetWT && Module.vnetWT.s[id];
   if (!s || s.state !== 1 || !s.dw) return -1;
   var now = performance.now();
-  if (s.dgT.length >= in_flight_max || (s.dgT.length > 0 && now - s.dgT[0] > stall_ms)) { s.drops++; return 1; }
+  if (!s.dgPing) {
+    var mc = new MessageChannel();
+    s.dgPing = mc.port2;
+    mc.port1.onmessage = function () {
+      s.dgPingOut = false;
+      s.dgTurn++;
+      if (s.dgT.length > 0) s.dgTT.push(performance.now());
+      else { s.dgTT = []; s.dgTB = s.dgTurn + 1; }
+    };
+  }
+  var stalled = false;
+  if (s.dgT.length > 0 && s.dgTurn - s.dgK[0] >= stall_turns) {
+    // At least stall_turns turns since the head was made, so turn dgK[0]+1 is stored.
+    stalled = now - s.dgTT[s.dgK[0] + 1 - s.dgTB] > stall_ms;
+  }
+  if (s.dgT.length >= in_flight_max || stalled) { s.drops++; return 1; }
   s.dgT.push(now);
-  var settled = function () { s.dgT.shift(); };
+  s.dgK.push(s.dgTurn);
+  if (!s.dgPingOut) { s.dgPingOut = true; s.dgPing.postMessage(0); }
+  var settled = function () {
+    s.dgT.shift();
+    s.dgK.shift();
+    if (s.dgT.length === 0) { s.dgTT = []; s.dgTB = s.dgTurn + 1; }
+    else while (s.dgTT.length > 0 && s.dgTB <= s.dgK[0]) { s.dgTT.shift(); s.dgTB++; }
+  };
   s.dw.write(HEAPU8.slice(p, p + n)).then(settled, settled);
   return 0;
 })
@@ -307,7 +359,8 @@ static int tp_send(void *p, const uint8_t *frame, size_t len) {
     wt_tp *t = p;
     if (len == 0 || len > 0xffff) return VNET_EINVAL;
     if (frame[0] == RELAY_T_DATA) {
-        int rc = vnet_wt_send_datagram(t->id, frame, (int)len, JS_MAX_DATAGRAMS_IN_FLIGHT, JS_DATAGRAM_STALL_MS);
+        int rc = vnet_wt_send_datagram(t->id, frame, (int)len, JS_MAX_DATAGRAMS_IN_FLIGHT, JS_DATAGRAM_STALL_MS,
+                                      JS_DATAGRAM_STALL_TURNS);
         if (rc == 0) return VNET_OK;
         return rc > 0 ? VNET_EAGAIN : VNET_ENOTCONN;
     }
