@@ -82,7 +82,7 @@ extern "C" {
 
 #define VNET_VERSION_MAJOR 0
 #define VNET_VERSION_MINOR 4
-#define VNET_VERSION_PATCH 0
+#define VNET_VERSION_PATCH 1
 
 /* The version of the library that is linked in, e.g. "0.4.0": for logs and bug
  * reports. (The macros above are the version of the header you compiled

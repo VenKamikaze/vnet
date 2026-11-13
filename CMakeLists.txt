@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(vnet
-    VERSION 0.4.0
+    VERSION 0.4.1
     DESCRIPTION "Virtual UDP for games: a small non-blocking datagram API with pluggable backends"
     LANGUAGES C)
 
