@@ -133,5 +133,73 @@ and nothing reports it. Chromium 153 has no `getStats()`. The cause is unknown.
 
 ## Re-review interim
 
-None had arrived when this update was pushed. If the paused reviewer reports before the session ends, its findings
-are added here in a follow-up commit.
+This is the paused Opus re-review of `148748a`. Its verdict: **block, or merge after fixes.**
+
+**Runs:**
+- The full browser suite passed: 166 ok, 0 failed (relay_browser 20, wt_browser 63, wake 36, wt_burst 47).
+- Native CTest passed **276/276**, with the IPv6 test skipped. The Outcome still says 275.
+- Two repeat burst runs were cut short by the pause.
+
+**Findings:**
+
+1. **Blocker: the "browser loses a few after the raise" is the relay, not the browser.**
+   - **The limit.** quic-go v0.59.0, `http3/state_tracking_stream.go:12`: `streamDatagramQueueLen = 32`. At `:141`,
+     `enqueueDatagram` silently drops a datagram when 32 are already queued. The coordinator confirmed both lines in
+     the module cache.
+   - **Why the relay hits it.** `relay/wt.go:361` `datagramReader` reads and forwards one datagram at a time, so a
+     flood of more than 32 overflows the queue.
+   - **Measured.** With `outgoingHighWaterMark` 64 set at open, a 255-datagram burst was lossy in 5 of 10 runs. The
+     relay's own drop counter roughly matched the loss.
+   - **With the queue patched to 1024:** 0 lost in 20 runs.
+   - **What this makes wrong:**
+     - The Outcome says "cause not found" and "the browser loses a few". Both are wrong.
+     - The 90% checks only tolerate this relay bug.
+     - A browser that does not pace one datagram at a time could lose any burst above 32. Firefox is the untested
+       case.
+   - **Fix:** in the relay, drain datagrams in a tight loop into a deeper queue of its own, or patch or replace
+     quic-go's queue length. Count those drops in the relay's stats. Then make the no-idle checks strict again.
+   - **Scope:** the brief allows relay changes "if the investigation shows the relay is involved". It now does, but
+     **confirm the scope with the user.**
+2. **Should-fix: once the relay is fixed, raise-on-stall has no advantage.**
+   - The reviewer ran `wt_burst` with a mutant that sets the mark to 64 at open, against the fixed relay. All 47
+     checks passed with 0 lost.
+   - The stall rule never fired in any check, and the bounds held: 512 queued against a writer that never settles,
+     21 queued with the relay frozen, and the session failed when the relay was killed.
+   - **Fix:** set the mark at open, and remove `hwmUp`, `dgRaiseK` and `dgRaiseT`.
+3. **Should-fix: the no-idle checks pin less than they claim** (`tests/browser/wt_burst.test.js:118`).
+   - With `outgoingHighWaterMark` hidden, the 300 ms case and the 110 ms hog case still pass. Only the 112 ms frames
+     case pins the raise.
+   - `noneRefused` drops failed or missing receivers from the expected count, and never checks `x.ok`.
+4. **Should-fix: the 3-turn rule can be pinned** (`src/relay_wt.c:133`).
+   - A one-turn mutant fired the stall rule in 4 of 10 hog runs. The real code fired it in 0 of 14.
+   - **Proposed check:** assert `hwmUp === false` on the strict idle and hog cases, and run the hog cases with the
+     attribute hidden too.
+   - The check is probabilistic (it catches the mutant about 40% of the time), so it needs repeats. If finding 2 is
+     adopted, re-think this.
+5. **Should-fix: the `MessageChannel` leak.**
+   - `vnet_wt_close` never closes `s.dgPing`. From Blink's `HasPendingActivity`, a port that is started and entangled
+     and has `onmessage` set keeps `s`, `s.wt`, the writers and the queues alive. This is not measured.
+   - Nothing else outlives a close: there are no timers, and the promise chains end with the WebTransport.
+   - **Fix:** `try { s.dgPing && s.dgPing.close(); } catch (e) {}`.
+6. **Nit: docs that no longer match.**
+   - `outgoingMaxAge` 250 does not reduce the loss.
+   - A browser without the attribute gets a one-time grace, so it does not "refuse as before".
+   - The re-judge counts from the raise call, not from the first turn after it.
+   - The run counts disagree: the code says 6 and the Outcome 11; the test says 20 and the Outcome 5.
+   - `doco/integration.md:38` mentions neither the raise nor the loss.
+
+**Not checked yet:**
+- more repeat runs of the stock code;
+- measuring the leak (`--expose-gc` with a `FinalizationRegistry`);
+- the relay fix with a frozen relay, combined with the current raise-on-stall code;
+- a full review of the Outcome text.
+
+**Suggested next step:** a Sonnet fix round, once the user agrees to the relay scope. It would:
+1. fix the relay's datagram drain, and count the drops;
+2. set the mark at open, and remove the raise;
+3. make the no-idle checks strict, and fix `noneRefused`;
+4. decide on the turn rule: pin it or remove it;
+5. close `dgPing` on close;
+6. correct the docs.
+
+Then a short Opus re-review.
