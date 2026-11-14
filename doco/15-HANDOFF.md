@@ -1,4 +1,4 @@
-# Brief 15: coordinator handoff note (14 Nov 2026)
+# Brief 15: coordinator handoff note (14 Nov 2026, updated by the second coordinator session)
 
 > **Temporary file. Delete it (`git rm doco/15-HANDOFF.md`) once brief 15 is merged into `claude`.** It
 > carries the coordinator's state from one session to the next and is not part of vnet's docs.
@@ -29,6 +29,8 @@ Outcome does not: the state of the review, the user's decisions, and the open po
 - The version is **0.5.0**. It is a minor bump, because the new field `vnet_stats.tx_dropped` adds to the API, and
   every earlier API addition took a minor bump. The code and docs already say 0.5.0.
 - Ask the user before pushing to `claude` and before pushing the `v0.5.0` tag.
+
+**Token budget.** The user says sessions are short of tokens. Ask the user before you spawn any subagent.
 
 **Environment notes for a cloud container:**
 
@@ -92,7 +94,10 @@ and nothing reports it. Chromium 153 has no `getStats()`. The cause is unknown.
 
 ## Open points
 
-1. **Re-review `148748a`** (Opus, focused):
+1. **Re-review `148748a`** (Opus, focused). **Started in the second session, then paused** at the user's request
+   to save tokens: it was told to finish its burst-test run and stop. Its interim report, if any, is under "Re-review
+   interim" below. Its throwaway worktree was `/tmp/claude-0/.../scratchpad/review-148748a` (session-local; gone in a
+   new container). A new session should start a fresh focused re-review, after asking the user. The points to cover:
    - **The raise-on-stall design.** It is a deviation from the reviewer's "set 64 at open".
    - **Loss after the raise.** In saturated sessions the browser silently loses a few datagrams after the raise:
      5 to 7 of 120 in 2 of 5 runs, and 18 of 2000 once.
@@ -102,9 +107,17 @@ and nothing reports it. Chromium 153 has no `getStats()`. The cause is unknown.
 2. **`MessageChannel` leak (should fix).** `vnet_wt_close` never closes `s.dgPing` or `port1`. In Blink, a port with
    an `onmessage` listener stays alive, together with `s` and the `WebTransport` object. The fix is to close both
    ports on close.
-3. **CI on `6e74bf7` failed** only on macOS / clang, in the native test
-   `RelayClient.TheWakeCallbackIsNeverCalledByTheNativeRelayClient`. It passed on `71b3258`, and brief 15 hardly
-   touches that path, so it may be flaky. Look into it, and check CI on `148748a` (run 43526140207).
+3. **CI: settled (14 Nov, second coordinator session).**
+   - **CI on `148748a` is green.** Run 43526140207 passed on all 7 jobs.
+   - **The macOS failure on `6e74bf7` is unrelated to brief 15.** The test,
+     `RelayClient.TheWakeCallbackIsNeverCalledByTheNativeRelayClient`, failed in its set-up:
+     `tests/test_relay_client.cpp:49`, where `Enter()` → `PollUntilState(READY)` returned false after 5 s of real
+     time. The client never saw the fake relay's room frame over loopback UDP, and the test's clock is virtual, so
+     nothing is resent. The same test passed on all three Linux jobs in that run.
+   - **Likely cause:** a UDP datagram lost now and then on the macOS runner. Brief 15 does not touch the
+     relay-udp handshake.
+   - **What to do with it:** record it as a follow-up in the Outcome (a flaky native test). Do not fix it in
+     brief 15.
 4. **Then:**
    - check the final head yourself;
    - set the brief's status in the `README.md` table to "done";
@@ -112,5 +125,13 @@ and nothing reports it. Chromium 153 has no `getStats()`. The cause is unknown.
    - merge into `claude` with `--no-ff`;
    - tag `v0.5.0`;
    - after the user approves, push `claude` and the tag.
-5. **Optional, AC5:** a jfsw-browser WebTransport game with a browser host and two guests at 40 tics a second.
+5. **Docs to fix before the merge.** The brief's Outcome starts with "Implemented on
+   `claude/webtransport-datagram-bursts-u1oaqa`", and `doco/README.md` (the State line) names the same branch. The
+   work is on `vnet/15-wt-datagram-bursts`, so correct both.
+6. **Optional, AC5:** a jfsw-browser WebTransport game with a browser host and two guests at 40 tics a second.
    **Untested:** Firefox and real networks.
+
+## Re-review interim
+
+None had arrived when this update was pushed. If the paused reviewer reports before the session ends, its findings
+are added here in a follow-up commit.
