@@ -235,9 +235,40 @@ TEST_F(RelayWsStyle, BackpressureDropsADatagramInsteadOfFailing) {
     EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), VNET_EAGAIN);
     vnet_get_stats(v, &after);
     EXPECT_EQ(after.wire_datagrams, before.wire_datagrams);  // not counted as sent
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 1);      // but counted as dropped
+    EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), VNET_EAGAIN);
+    vnet_get_stats(v, &after);
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 2);
     EXPECT_EQ(vnet_status(v, nullptr), VNET_STATUS_READY);   // and not a failure
     tp.send_rc = 0;
     EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), 1);
+    vnet_get_stats(v, &after);
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 2);      // a send that works is not a drop
+}
+
+TEST_F(RelayWsStyle, ImpairedDatagramRefusedWhenReleasedCountsAsDropped) {
+    // With impairment, vnet_sendto() reports success (the datagram is queued);
+    // the backend refuses it later, when vnet_poll() releases it. tx_dropped
+    // counts that too: "the backend refused it", not "vnet_sendto() failed".
+    v = Make();
+    Open();
+    Enter(1);
+    int s = vnet_open(v, 4000);
+    vnet_impair imp;
+    memset(&imp, 0, sizeof imp);
+    imp.latency_ms = 40;
+    ASSERT_EQ(vnet_set_impair(v, &imp), 0);
+    tp.send_rc = VNET_EAGAIN;
+    vnet_stats before, after;
+    vnet_get_stats(v, &before);
+    EXPECT_EQ(Send(v, s, "x", A("10.0.0.2:1")), 1);  // accepted: it is queued
+    vnet_get_stats(v, &after);
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped);
+    clk.now += 100;
+    vnet_poll(v);  // released, and refused by the backend
+    vnet_get_stats(v, &after);
+    EXPECT_EQ(after.tx_dropped, before.tx_dropped + 1);
+    EXPECT_EQ(after.wire_datagrams, before.wire_datagrams);
 }
 
 TEST_F(RelayWsStyle, TransportIsOwnedByTheContext) {

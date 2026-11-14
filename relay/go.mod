@@ -16,3 +16,8 @@ require (
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
+
+// quic-go v0.59.0 with two constants changed, both marked VNET PATCH: the
+// receive queues for datagrams, per session (http3, 32 upstream) and per
+// connection (128 upstream), both raised to 1024. See relay/README.md.
+replace github.com/quic-go/quic-go => ./third_party/quic-go

@@ -781,3 +781,54 @@ func TestManyRoomsOfMixedTransportsConcurrently(t *testing.T) {
 }
 
 var _ = websocket.BinaryMessage
+
+// Upstream quic-go keeps 32 received datagrams per session and 128 per
+// connection and silently drops the rest (patched in third_party/quic-go). A relay that forwarded each datagram before
+// reading the next lost the tail of any burst above 32 (brief 15: a browser's
+// 255-datagram burst arrived 5 runs in 10 with some missing). Real QUIC, a
+// webtransport-go client, the burst sent with no pause: every datagram must
+// reach the peer and the relay must count nothing dropped.
+func TestWebTransportBurstOfDatagramsFromOneClientIsNotLost(t *testing.T) {
+	for _, peer := range []string{"udp", "wt"} {
+		t.Run("to_"+peer, func(t *testing.T) {
+			e := newEnvWT(t, nil)
+			host := dialWT(t, e.wt, e.certHash).create()
+			var to member
+			if peer == "udp" {
+				u := dialUDP(t, e.udp)
+				// The burst is read only after it is sent: with the kernel's
+				// default receive buffer (about 208 KB on Linux, and each
+				// datagram costs about 1 KB of it) a slow runner drops part of
+				// it at this test's socket, not in the relay (seen in CI: 241
+				// of 255, rx_frames complete). The relay's own socket asks for
+				// 4 MB too (server.go).
+				_ = u.conn.SetReadBuffer(4 << 20)
+				to = u.join(host.room.code)
+			} else {
+				to = dialWT(t, e.wt, e.certHash).join(host.room.code)
+			}
+			const total = 255
+			for rep := 0; rep < 3; rep++ { // 3 bursts: the queue must also recover
+				for i := 0; i < total; i++ {
+					p := []byte{byte(rep), byte(i >> 8), byte(i)}
+					host.write(host.dataFrame(to.vaddr(), 1, 1, p))
+				}
+				seen := map[int]bool{}
+				for len(seen) < total {
+					b := to.read(waitLimit)
+					if b == nil {
+						st := e.srv.Stats()
+						t.Fatalf("burst %d: only %d of %d datagrams arrived (rx_queue_drops %d, wt_datagram_drops %d, rx_frames %d)",
+							rep, len(seen), total, st.WTRxQueueDrops, st.WTDatagramDrops, st.RxFrames)
+					}
+					f := parseFwd(t, b)
+					seen[int(f.payload[1])<<8|int(f.payload[2])] = true
+				}
+			}
+			st := e.srv.Stats()
+			if st.WTRxQueueDrops != 0 || st.WTDatagramDrops != 0 || st.RateLimited != 0 || st.Malformed != 0 {
+				t.Fatalf("relay dropped something: %+v", st)
+			}
+		})
+	}
+}
