@@ -781,3 +781,46 @@ func TestManyRoomsOfMixedTransportsConcurrently(t *testing.T) {
 }
 
 var _ = websocket.BinaryMessage
+
+// quic-go keeps 32 received datagrams per session and silently drops the rest
+// (http3 streamDatagramQueueLen). A relay that forwarded each datagram before
+// reading the next lost the tail of any burst above 32 (brief 15: a browser's
+// 255-datagram burst arrived 5 runs in 10 with some missing). Real QUIC, a
+// webtransport-go client, the burst sent with no pause: every datagram must
+// reach the peer and the relay must count nothing dropped.
+func TestWebTransportBurstOfDatagramsFromOneClientIsNotLost(t *testing.T) {
+	for _, peer := range []string{"udp", "wt"} {
+		t.Run("to_"+peer, func(t *testing.T) {
+			e := newEnvWT(t, nil)
+			host := dialWT(t, e.wt, e.certHash).create()
+			var to member
+			if peer == "udp" {
+				to = dialUDP(t, e.udp).join(host.room.code)
+			} else {
+				to = dialWT(t, e.wt, e.certHash).join(host.room.code)
+			}
+			const total = 255
+			for rep := 0; rep < 3; rep++ { // 3 bursts: the queue must also recover
+				for i := 0; i < total; i++ {
+					p := []byte{byte(rep), byte(i >> 8), byte(i)}
+					host.write(host.dataFrame(to.vaddr(), 1, 1, p))
+				}
+				seen := map[int]bool{}
+				for len(seen) < total {
+					b := to.read(waitLimit)
+					if b == nil {
+						st := e.srv.Stats()
+						t.Fatalf("burst %d: only %d of %d datagrams arrived (rx_queue_drops %d, wt_datagram_drops %d, rx_frames %d)",
+							rep, len(seen), total, st.WTRxQueueDrops, st.WTDatagramDrops, st.RxFrames)
+					}
+					f := parseFwd(t, b)
+					seen[int(f.payload[1])<<8|int(f.payload[2])] = true
+				}
+			}
+			st := e.srv.Stats()
+			if st.WTRxQueueDrops != 0 || st.WTDatagramDrops != 0 || st.RateLimited != 0 || st.Malformed != 0 {
+				t.Fatalf("relay dropped something: %+v", st)
+			}
+		})
+	}
+}

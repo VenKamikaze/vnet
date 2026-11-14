@@ -928,3 +928,59 @@ func drainDatagrams(f *fakeWT) {
 		}
 	}
 }
+
+// quic-go holds 32 received datagrams per session and drops the rest without a
+// word, so the relay must keep reading while its forwarding is held up (here:
+// the hub is locked). The reader moves datagrams into the relay's own queue
+// (1024); what does not fit is counted in wt_rx_queue_drops, the rest is
+// forwarded in order when the hub is free again. A reader that forwarded
+// before it read the next datagram would leave the 1500 in the session's queue.
+func TestWTReaderKeepsDrainingWhileTheHubIsBusyAndCountsItsOwnDrops(t *testing.T) {
+	th := newTestHub(t, func(c *Config) {
+		c.ClientPPS = 1e6
+		c.ClientPPSBurst = 1e6
+		c.WTSendQueue = 4096
+		c.WTSendQueueBytes = 1 << 20
+	})
+	src := th.wtClient("192.0.2.1").create()
+	dst := th.wtClient("192.0.2.2").join(src.room.code)
+	before := th.h.snapshot()
+
+	const n = 1500
+	th.h.mu.Lock()
+	unlock := sync.OnceFunc(th.h.mu.Unlock) // a failed check must not leave the hub locked
+	defer unlock()
+	for i := 0; i < n; i++ {
+		src.dg(src.dataFrame(2, 1, 1, []byte{byte(i >> 8), byte(i)}))
+	}
+	waitFor(t, "the reader to take every datagram out of the session's queue", func() bool { return len(src.f.dgIn) == 0 })
+	waitFor(t, "the relay's own queue to overflow and count it", func() bool {
+		return th.h.stats.wtRxQueueDrops.Load() >= n-wtRxQueue-1 // (snapshot() needs the lock held here)
+	})
+	unlock()
+
+	waitFor(t, "everything queued to be forwarded", func() bool {
+		s := th.h.snapshot()
+		return s.DataForwarded-before.DataForwarded+s.WTRxQueueDrops == n
+	})
+	s := th.h.snapshot()
+	if s.WTRxQueueDrops < n-wtRxQueue-1 || s.WTRxQueueDrops > n-wtRxQueue {
+		t.Fatalf("wt_rx_queue_drops = %d, want %d or %d", s.WTRxQueueDrops, n-wtRxQueue-1, n-wtRxQueue)
+	}
+	if s.RxFrames-before.RxFrames < n {
+		t.Fatalf("rx_frames counted %d of %d", s.RxFrames-before.RxFrames, n)
+	}
+	// The first datagrams are the ones forwarded, in order.
+	last := -1
+	for i := uint64(0); i < s.DataForwarded-before.DataForwarded; i++ {
+		b := dst.dgRecv()
+		if b == nil {
+			t.Fatalf("the receiver got only %d datagrams", i)
+		}
+		v := int(b[wsDataHdr])<<8 | int(b[wsDataHdr+1])
+		if v != last+1 {
+			t.Fatalf("datagram %d came after %d: out of order or a gap", v, last)
+		}
+		last = v
+	}
+}

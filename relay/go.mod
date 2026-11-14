@@ -16,3 +16,7 @@ require (
 	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
+
+// quic-go v0.59.0 with one constant changed (http3's per-session queue of
+// received datagrams, 32 upstream); see third_party/quic-go/http3/state_tracking_stream.go.
+replace github.com/quic-go/quic-go => ./third_party/quic-go

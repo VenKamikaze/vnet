@@ -357,20 +357,57 @@ func (c *wtConn) datagramWriter(ws wtSession) {
 	}
 }
 
-// datagramReader forwards the client's DATA datagrams.
-func (c *wtConn) datagramReader(ws wtSession) {
+// wtRxQueue is how many received datagrams wait for the forwarder per client.
+// quic-go keeps only 32 received datagrams per session (http3's
+// streamDatagramQueueLen) and silently drops the 33rd, so a reader that
+// forwards before it reads again loses the tail of any burst above 32 (a game
+// sends dozens in one step). The reader below only moves datagrams into this
+// queue, so quic-go's own never fills.
+const wtRxQueue = 1024
+
+type wtRx struct {
+	msg []byte
+	at  time.Time
+}
+
+// datagramReader drains the session's datagram queue as fast as it can, and
+// hands each datagram to datagramForwarder. When that queue is full (the
+// forwarder is stuck behind the hub's lock, or the client sends faster than
+// the hub can route) the datagram is dropped and counted (wt_rx_queue_drops),
+// as the relay's own decision.
+func (c *wtConn) datagramReader(ws wtSession, in chan<- wtRx) {
 	h := c.hub
 	defer h.recoverPanic("webtransport datagram reader")
 	defer c.close()
 	ctx := ws.Context()
-	scratch := make([]byte, 0, maxUDPFrame)
 	for {
 		msg, err := ws.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
 		h.stats.rxFrames.Add(1)
-		now := h.now()
+		select {
+		case in <- wtRx{msg, h.now()}:
+		default:
+			h.stats.wtRxQueueDrops.Add(1)
+		}
+	}
+}
+
+// datagramForwarder forwards the client's DATA datagrams, in order.
+func (c *wtConn) datagramForwarder(in <-chan wtRx) {
+	h := c.hub
+	defer h.recoverPanic("webtransport datagram forwarder")
+	defer c.close()
+	scratch := make([]byte, 0, maxUDPFrame)
+	for {
+		var r wtRx
+		select {
+		case r = <-in:
+		case <-c.done:
+			return
+		}
+		msg, now := r.msg, r.at
 		s := c.sess.Load()
 		if s == nil { // DATA before the room: the client has no address yet
 			h.stats.wtEarlyDatagrams.Add(1)
@@ -528,7 +565,9 @@ func (h *Hub) serveWTSession(c *wtConn, ws wtSession) {
 	go c.refuseStreams(ws)
 	go c.controlWriter()
 	go c.datagramWriter(ws)
-	go c.datagramReader(ws)
+	rx := make(chan wtRx, wtRxQueue)
+	go c.datagramReader(ws, rx)
+	go c.datagramForwarder(rx)
 	c.controlReader(st)
 }
 
