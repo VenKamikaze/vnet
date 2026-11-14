@@ -782,8 +782,8 @@ func TestManyRoomsOfMixedTransportsConcurrently(t *testing.T) {
 
 var _ = websocket.BinaryMessage
 
-// quic-go keeps 32 received datagrams per session and silently drops the rest
-// (http3 streamDatagramQueueLen). A relay that forwarded each datagram before
+// Upstream quic-go keeps 32 received datagrams per session and 128 per
+// connection and silently drops the rest (patched in third_party/quic-go). A relay that forwarded each datagram before
 // reading the next lost the tail of any burst above 32 (brief 15: a browser's
 // 255-datagram burst arrived 5 runs in 10 with some missing). Real QUIC, a
 // webtransport-go client, the burst sent with no pause: every datagram must
@@ -795,7 +795,15 @@ func TestWebTransportBurstOfDatagramsFromOneClientIsNotLost(t *testing.T) {
 			host := dialWT(t, e.wt, e.certHash).create()
 			var to member
 			if peer == "udp" {
-				to = dialUDP(t, e.udp).join(host.room.code)
+				u := dialUDP(t, e.udp)
+				// The burst is read only after it is sent: with the kernel's
+				// default receive buffer (about 208 KB on Linux, and each
+				// datagram costs about 1 KB of it) a slow runner drops part of
+				// it at this test's socket, not in the relay (seen in CI: 241
+				// of 255, rx_frames complete). The relay's own socket asks for
+				// 4 MB too (server.go).
+				_ = u.conn.SetReadBuffer(4 << 20)
+				to = u.join(host.room.code)
 			} else {
 				to = dialWT(t, e.wt, e.certHash).join(host.room.code)
 			}

@@ -27,7 +27,7 @@ type stats struct {
 	wsRefused         atomic.Uint64 // WebSocket upgrades refused (global or per-address cap)
 	wtRefused         atomic.Uint64 // WebTransport (QUIC) connections refused (global or per-address cap)
 	wtDatagramDrops   atomic.Uint64 // datagrams dropped because a WebTransport client was too slow (or the datagram did not fit)
-	wtRxQueueDrops    atomic.Uint64 // datagrams from a WebTransport client dropped because the relay's own receive queue (1024) was full
+	wtRxQueueDrops    atomic.Uint64 // datagrams from a WebTransport client dropped because the relay's own receive queue (512 frames or 512 KiB) was full
 	wtCtlOverflow     atomic.Uint64 // WebTransport sessions closed because their control stream could not keep up
 	wtEarlyDatagrams  atomic.Uint64 // datagrams that arrived before the session had entered a room
 	wtBadStreams      atomic.Uint64 // streams other than the one control stream, reset on arrival

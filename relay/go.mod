@@ -17,6 +17,7 @@ require (
 	golang.org/x/text v0.28.0 // indirect
 )
 
-// quic-go v0.59.0 with one constant changed (http3's per-session queue of
-// received datagrams, 32 upstream); see third_party/quic-go/http3/state_tracking_stream.go.
+// quic-go v0.59.0 with two constants changed, both marked VNET PATCH: the
+// receive queues for datagrams, per session (http3, 32 upstream) and per
+// connection (128 upstream), both raised to 1024. See relay/README.md.
 replace github.com/quic-go/quic-go => ./third_party/quic-go

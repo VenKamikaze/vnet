@@ -11,7 +11,11 @@ import (
 
 const (
 	maxDatagramSendQueueLen = 32
-	maxDatagramRcvQueueLen  = 4096
+	// VNET PATCH (one of two changes to quic-go v0.59.0 in this directory; the
+	// other is streamDatagramQueueLen in http3/state_tracking_stream.go):
+	// upstream has 128 and silently drops received datagrams past it, which
+	// lost the tail of a burst from one client. See relay/README.md.
+	maxDatagramRcvQueueLen = 1024
 )
 
 type datagramQueue struct {

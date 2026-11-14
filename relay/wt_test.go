@@ -984,3 +984,58 @@ func TestWTReaderKeepsDrainingWhileTheHubIsBusyAndCountsItsOwnDrops(t *testing.T
 		last = v
 	}
 }
+
+// The relay's own receive queue is bounded in bytes as well as in frames, so a
+// client cannot make it hold 512 maximum-size datagrams (about 570 KB) while
+// the hub is busy: what does not fit in wtRxQueueBytes is dropped and counted.
+func TestWTReceiveQueueIsBoundedInBytes(t *testing.T) {
+	th := newTestHub(t, func(c *Config) {
+		c.ClientPPS = 1e6
+		c.ClientPPSBurst = 1e6
+		c.WTSendQueue = 4096
+		c.WTSendQueueBytes = 4 << 20
+	})
+	src := th.wtClient("192.0.2.1").create()
+	dst := th.wtClient("192.0.2.2").join(src.room.code)
+	before := th.h.snapshot()
+
+	const n = 700
+	payload := make([]byte, MaxPayload)
+	frame := len(src.dataFrame(2, 1, 1, payload))
+	fit := wtRxQueueBytes / frame // whole frames that fit in the byte bound
+	if fit >= wtRxQueue {
+		t.Fatalf("test set-up: %d frames of %d bytes fit in %d bytes, not fewer than the frame bound %d", fit, frame, wtRxQueueBytes, wtRxQueue)
+	}
+	th.h.mu.Lock()
+	unlock := sync.OnceFunc(th.h.mu.Unlock)
+	defer unlock()
+	for i := 0; i < n; i++ {
+		payload[0], payload[1] = byte(i>>8), byte(i)
+		src.dg(src.dataFrame(2, 1, 1, payload))
+	}
+	waitFor(t, "the reader to take every datagram out of the session's queue", func() bool { return len(src.f.dgIn) == 0 })
+	waitFor(t, "the byte bound to drop the rest", func() bool {
+		return th.h.stats.wtRxQueueDrops.Load() >= uint64(n-fit-1)
+	})
+	unlock()
+
+	waitFor(t, "everything queued to be forwarded", func() bool {
+		s := th.h.snapshot()
+		return s.DataForwarded-before.DataForwarded+s.WTRxQueueDrops == n
+	})
+	s := th.h.snapshot()
+	// The forwarder may already hold one datagram (out of the queue) when it
+	// blocks on the hub's lock.
+	if s.WTRxQueueDrops < uint64(n-fit-1) || s.WTRxQueueDrops > uint64(n-fit) {
+		t.Fatalf("wt_rx_queue_drops = %d, want %d or %d (a byte bound of %d holds %d frames of %d bytes)",
+			s.WTRxQueueDrops, n-fit-1, n-fit, wtRxQueueBytes, fit, frame)
+	}
+	for i := uint64(0); i < s.DataForwarded-before.DataForwarded; i++ {
+		if dst.dgRecv() == nil {
+			t.Fatalf("the receiver got only %d datagrams", i)
+		}
+	}
+	if q := src.c.rxq.Load(); q != 0 {
+		t.Fatalf("rxq = %d bytes after the queue drained, want 0", q)
+	}
+}

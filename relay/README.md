@@ -59,7 +59,7 @@ The public HTTP listener serves only `/vnet` and `/healthz`; the WebTransport li
 
 If `/stats` shows `panics` > 0, restart the relay soon: a recovered panic is not guaranteed to have left its state consistent.
 
-Datagram drops are counted, never silent: `wt_datagram_drops` (a WebTransport client could not take datagrams as fast as they came, or one did not fit), `ws_queue_drops` (the same for WebSocket) and `wt_rx_queue_drops`: datagrams **from** a WebTransport client dropped because the relay's own receive queue (1024 per client) was full, which means the hub's forwarding was held up for a long burst. All three should stay at 0 for a game's traffic.
+Datagram drops in the relay's own queues are counted: `wt_datagram_drops` (a WebTransport client could not take datagrams as fast as they came, or one did not fit), `ws_queue_drops` (the same for WebSocket) and `wt_rx_queue_drops`: datagrams **from** a WebTransport client dropped because the relay's own receive queue (512 datagrams or 512 KiB per client) was full, which means the hub's forwarding was held up for a long burst. All three should stay at 0 for a game's traffic. Only quic-go's own receive queues (below, deepened to 1024) drop silently, and only if the relay's reader goroutine is starved.
 
 ### quic-go is vendored (two constants changed)
 
@@ -68,7 +68,7 @@ Datagram drops are counted, never silent: `wt_datagram_drops` (a WebTransport cl
 - `http3/state_tracking_stream.go`, `streamDatagramQueueLen` (32 upstream): the datagrams received for one WebTransport session;
 - `datagram_queue.go`, `maxDatagramRcvQueueLen` (128 upstream): the datagrams received on one QUIC connection.
 
-Upstream drops a received datagram **silently** when its queue is full, and a game's step sends dozens in a burst: with the stock queues a 255-datagram burst from one client lost part of its tail in most runs of a tight loop and in 9 of 60 browser runs, even with a relay goroutine that does nothing but read (`wt.go`'s `datagramReader`; the forwarder is separate, behind a queue of 1024 of the relay's own, so a busy hub cannot make quic-go drop). The newest quic-go (v0.65.0) still has 32. The two edits are marked `VNET PATCH`; `TestWebTransportBurstOfDatagramsFromOneClientIsNotLost` fails without them. To move to a newer quic-go, copy it over, strip the tests, and reapply the two constants (an upstream option to size these queues would make the copy unnecessary).
+Upstream drops a received datagram **silently** when its queue is full, and a game's step sends dozens in a burst: with the stock queues a 255-datagram burst from one client lost part of its tail in most runs of a tight loop and in 9 of 60 browser runs, even with a relay goroutine that does nothing but read (`wt.go`'s `datagramReader`; the forwarder is separate, behind a queue of the relay's own (512 datagrams or 512 KiB), so a busy hub cannot make quic-go drop). The newest quic-go (v0.65.0) still has 32 and 128. The two edits are marked `VNET PATCH`; `TestWebTransportBurstOfDatagramsFromOneClientIsNotLost` fails without them. To move to a newer quic-go, copy it over, strip the tests, and reapply the two constants (an upstream option to size these queues would make the copy unnecessary).
 
 ## WebTransport (HTTP/3 datagrams)
 
@@ -126,7 +126,7 @@ Chromium needs **no flags** for this (checked with Chromium 153 under Playwright
 
 ### Sizing WebTransport
 
-A WebTransport member is a QUIC connection with several goroutines and buffers, not just a socket entry. Measured on one relay process (load generator on the same machine, 100-byte payloads): **about 150 KB per connection** with 1000 mostly idle clients (1 packet per second each: 157 MB resident in all) and **about 250 KB per connection** at 30 packets per second per client (200 clients: 60 MB, 56% of one core, against 9 MB and 9% for UDP). A connection can also hold up to 128 KiB of QUIC receive window and 64 KiB of queued datagrams in the worst case, so budget **250 KB to 300 KB per connection**:
+A WebTransport member is a QUIC connection with several goroutines and buffers, not just a socket entry. Measured on one relay process (load generator on the same machine, 100-byte payloads): **about 150 KB per connection** with 1000 mostly idle clients (1 packet per second each: 157 MB resident in all) and **about 250 KB per connection** at 30 packets per second per client (200 clients: 60 MB, 56% of one core, against 9 MB and 9% for UDP). A connection can also hold up to 128 KiB of QUIC receive window and 64 KiB of queued outgoing datagrams. For received datagrams, the relay's own queue holds at most 512 KiB, and only while the hub's forwarding is held up; quic-go's two queues (1024 datagrams each, about 1.5 MB each at the maximum size) fill only if the relay's reader goroutine is starved, which a host that is not overloaded does not do. Budget **250 KB to 300 KB per connection** for normal traffic, and keep the worst case in mind (about 3.5 MB per connection with every queue full, so `-max-wt` 4000 bounds it at about 14 GB in theory):
 
 | `-max-wt` | memory to budget |
 |---|---|

@@ -143,6 +143,7 @@ type wtConn struct {
 	ctl    chan []byte // control frames to the client (bounded)
 	out    chan []byte // DATA frames to the client (bounded in frames and bytes)
 	qbytes atomic.Int64
+	rxq    atomic.Int64 // bytes waiting for datagramForwarder (bounded by wtRxQueueBytes)
 	done   chan struct{}
 
 	closeOnce sync.Once
@@ -357,13 +358,18 @@ func (c *wtConn) datagramWriter(ws wtSession) {
 	}
 }
 
-// wtRxQueue is how many received datagrams wait for the forwarder per client.
-// quic-go keeps only 32 received datagrams per session (http3's
-// streamDatagramQueueLen) and silently drops the 33rd, so a reader that
-// forwards before it reads again loses the tail of any burst above 32 (a game
-// sends dozens in one step). The reader below only moves datagrams into this
-// queue, so quic-go's own never fills.
-const wtRxQueue = 1024
+// wtRxQueue and wtRxQueueBytes bound the received datagrams that wait for the
+// forwarder per client, in frames and in bytes (a full burst of 255 maximum-size
+// datagrams, about 280 KiB, fits). quic-go's own receive queues sit below this
+// one and are deepened in the vendored copy (third_party/quic-go, VNET PATCH):
+// upstream keeps 32 per session and 128 per connection and silently drops past
+// that, which lost the tail of a game's burst. The reader below only moves
+// datagrams into this queue, so those deeper queues fill only if the reader
+// goroutine itself is starved; a drop there would still be silent.
+const (
+	wtRxQueue      = 512
+	wtRxQueueBytes = 512 << 10
+)
 
 type wtRx struct {
 	msg []byte
@@ -371,10 +377,10 @@ type wtRx struct {
 }
 
 // datagramReader drains the session's datagram queue as fast as it can, and
-// hands each datagram to datagramForwarder. When that queue is full (the
-// forwarder is stuck behind the hub's lock, or the client sends faster than
-// the hub can route) the datagram is dropped and counted (wt_rx_queue_drops),
-// as the relay's own decision.
+// hands each datagram to datagramForwarder. When the relay's queue is full, in
+// frames or in bytes (the forwarder is stuck behind the hub's lock, or the
+// client sends faster than the hub can route), the datagram is dropped and
+// counted (wt_rx_queue_drops), as the relay's own decision.
 func (c *wtConn) datagramReader(ws wtSession, in chan<- wtRx) {
 	h := c.hub
 	defer h.recoverPanic("webtransport datagram reader")
@@ -386,9 +392,16 @@ func (c *wtConn) datagramReader(ws wtSession, in chan<- wtRx) {
 			return
 		}
 		h.stats.rxFrames.Add(1)
+		n := int64(len(msg))
+		if c.rxq.Add(n) > wtRxQueueBytes {
+			c.rxq.Add(-n)
+			h.stats.wtRxQueueDrops.Add(1)
+			continue
+		}
 		select {
 		case in <- wtRx{msg, h.now()}:
 		default:
+			c.rxq.Add(-n)
 			h.stats.wtRxQueueDrops.Add(1)
 		}
 	}
@@ -404,6 +417,7 @@ func (c *wtConn) datagramForwarder(in <-chan wtRx) {
 		var r wtRx
 		select {
 		case r = <-in:
+			c.rxq.Add(-int64(len(r.msg)))
 		case <-c.done:
 			return
 		}
