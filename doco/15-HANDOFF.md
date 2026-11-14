@@ -30,6 +30,10 @@ Outcome does not: the state of the review, the user's decisions, and the open po
   every earlier API addition took a minor bump. The code and docs already say 0.5.0.
 - Ask the user before pushing to `claude` and before pushing the `v0.5.0` tag.
 
+**Relay scope: decided (14 Nov).** The user put the relay in scope for brief 15. Prefer fixing the drops in vnet's relay
+code without modifying quic-go. If patching quic-go upstream, or switching libraries, is much cleaner or easier, that is
+acceptable; don't contort the relay to avoid it. The user also approved the fix round proposed below.
+
 **Token budget.** The user says sessions are short of tokens. Ask the user before you spawn any subagent.
 
 **Environment notes for a cloud container:**
