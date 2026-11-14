@@ -6,8 +6,10 @@
 // real relay on loopback with no impairment.
 //
 //   1. A burst of more than 16 datagrams in one task (one JavaScript task: the
-//      whole of a step runs inside one call of C code) loses nothing, over
-//      WebTransport and over WebSocket.
+//      whole of a step runs inside one call of C code), up to 255, loses nothing,
+//      over WebTransport and over WebSocket, and vnet sets the browser's datagram
+//      queue depth to 64 when the session opens. The relay counts what it drops
+//      and must have dropped nothing.
 //   2. A game-like load (one datagram to each of 3 or 7 peers every 25 ms, plus
 //      a few acks and resends, also with several tics in one task) loses
 //      nothing and reports no drops. The numbers are printed.
@@ -18,8 +20,9 @@
 //      unable to settle writes). Also with no idle at all: a 300 ms task every
 //      300 ms, a game of 9 frames a second whose frames never end before the
 //      next one starts, and a task that hogs 99 percent of the main thread. The
-//      browser's own queue of datagrams (Chromium: one at a time) then drains
-//      one datagram per task; nothing may be refused (396 of 480 were).
+//      browser's own queue of datagrams (Chromium: one at a time, unless vnet
+//      deepens it when the session opens) drains one datagram per task; every
+//      datagram must arrive and none may be refused (396 of 480 were).
 //   4. Back-pressure is real and bounded: with a datagram writer whose writes
 //      never settle (the browser stops sending), and with a relay that is
 //      frozen (SIGSTOP), the queue stays bounded and the datagrams past the
@@ -86,7 +89,8 @@ const senderResult = (s, ms = 60000) =>
 const jsState = (s) => evaluate(s.page, () => {
   const T = window.Module && Module.vnetWT;
   const x = T && Object.values(T.s)[0];
-  return x ? { drops: x.drops, queued: x.dgT ? x.dgT.length : null, state: x.state } : null;
+  return x ? { drops: x.drops, queued: x.dgT ? x.dgT.length : null, state: x.state,
+    hwm: x.wt && x.wt.datagrams ? x.wt.datagrams.outgoingHighWaterMark : null } : null;
 });
 
 // One run: a sender with `params`, K native receivers. Returns everything measured.
@@ -105,21 +109,8 @@ const summary = (r) => `attempted ${r.sender.attempted}, accepted ${r.sender.acc
   `received ${r.recv.reduce((a, x) => a + (x ? x.distinct : 0), 0)}, lost ${lostOf(r)}, most in one task ${r.sender.max_per_step}`;
 function allArrived(r, what) {
   const ok = r.sender.ok && r.recv.every((x) => x && x.ok && x.distinct === x.expect && x.expect > 0);
-  check(ok && r.sender.eagain === 0 && r.sender.tx_dropped === 0 && r.sender.accepted === r.sender.attempted && lostOf(r) === 0,
-    `${what}: ${summary(r)}`);
-  check(r.errors.length === 0, 'no page errors ' + r.errors.join('; '));
-}
-
-// For a page that is busy all the time: nothing may be REFUSED by vnet (that is what
-// is under test). What the browser then loses on the way (once vnet has raised its
-// queue the datagrams leave in floods of 10 to 20 at a time, and a few of a flood
-// are lost, 7 of 120 at most in 20 runs: see the Outcome of brief 15) is not counted
-// against it, but at least 90 percent must arrive.
-function noneRefused(r, what) {
-  const exp = r.recv.reduce((a, x) => a + (x ? x.expect : 0), 0), got = r.recv.reduce((a, x) => a + (x ? x.distinct : 0), 0);
-  check(r.sender.ok && r.sender.eagain === 0 && r.sender.tx_dropped === 0 && r.sender.accepted === r.sender.attempted && (!r.js || r.js.drops === 0),
-    `${what}: ${summary(r)}`);
-  check(exp > 0 && got >= 0.9 * exp, `${what}: at least 90 percent arrived (${got} of ${exp})`);
+  check(ok && r.sender.eagain === 0 && r.sender.tx_dropped === 0 && r.sender.accepted === r.sender.attempted && lostOf(r) === 0 &&
+    (!r.js || r.js.drops === 0), `${what}: ${summary(r)}`);
   check(r.errors.length === 0, 'no page errors ' + r.errors.join('; '));
 }
 
@@ -146,11 +137,16 @@ async function main() {
       allArrived(r, `${name}, 3 x 22 in one task, 3 times`);
       check(r.recv.every((x) => x && x.distinct === 66), `each receiver got all 66: ${JSON.stringify(r.recv)}`);
       if (r.js) check(r.js.drops === 0, 'the page counted no drops');
+      if (name === 'WebTransport') check(r.js && r.js.hwm === 64, `vnet set datagrams.outgoingHighWaterMark to 64 when the session opened (${r.js && r.js.hwm}; Chromium's default is 1)`);
     }
-    console.log('WebTransport: one big burst, 3 x 85 = 255 datagrams in one task');
+    console.log('WebTransport: big bursts, 3 x 85 = 255 datagrams in one task, 4 times');
     {
-      const r = await run(browser, origin, relay, wt, 3, ['--mode', 'burst', '--burst', '85', '--rounds', '1', '--payload', '100']);
-      allArrived(r, 'one burst of 255');
+      // The relay used to lose part of such a burst (quic-go keeps 32 received
+      // datagrams per session and drops the rest silently): 7 of 8 runs of four
+      // bursts lost some, so a relay that regresses is caught almost every run.
+      const r = await run(browser, origin, relay, wt, 3, ['--mode', 'burst', '--burst', '85', '--rounds', '4', '--payload', '100']);
+      check(r.sender.max_per_step === 255, `${r.sender.max_per_step} datagrams were sent in one step`);
+      allArrived(r, 'four bursts of 255');
     }
 
     // ---- 2. game-like load
@@ -177,23 +173,22 @@ async function main() {
       // time (a 300 ms task every 300 ms): the datagrams leave at the end of each
       // task, none may be refused.
       const r = await run(browser, origin, relay, wt, 1, ['--mode', 'burst', '--burst', '10', '--rounds', '6', '--gap', '300', '--payload', '100', '--busy', '300']);
-      noneRefused(r, 'a 300 ms task between two bursts, no idle');
+      allArrived(r, 'a 300 ms task between two bursts, no idle');
     }
     console.log('WebTransport: a game that never idles (6 datagrams, 112 ms of frame work, 6 more; about 9 frames a second)');
     {
-      // Chromium's default outgoingHighWaterMark of 1 let ONE datagram out per task here:
-      // 396 of 480 were refused while the connection was fine.
+      // Chromium's default outgoingHighWaterMark of 1 lets ONE datagram out per task here:
+      // 396 of 480 were refused while the connection was fine. vnet sets it to 64 at open.
       const r = await run(browser, origin, relay, wt, 1, ['--mode', 'burst', '--burst', '6', '--rounds', '40', '--gap', '0', '--payload', '100', '--busy', '112']);
-      noneRefused(r, 'frames of 112 ms, no idle');
+      allArrived(r, 'frames of 112 ms, no idle');
     }
     for (const [hog, period] of [[300, 700], [400, 1000], [110, 1]]) {
-      const strict = period > 1;
       console.log(`WebTransport, game load every 25 ms while another page task hogs the main thread ${hog} ms, then idles ${period} ms`);
       const init = `(() => { const L = ${hog}, P = ${period}; window.__hogs = 0;
         setTimeout(function hog() { const u = performance.now() + L; while (performance.now() < u) {} window.__hogs++; setTimeout(hog, P); }, 1500); })()`;
       const r = await run(browser, origin, relay, wt, 3,
         ['--mode', 'game', '--ticks', '160', '--interval', '25', '--extra', '3', '--payload', '60'], init);
-      (strict ? allArrived : noneRefused)(r, `${hog} ms hogs, ${period} ms idle`);
+      allArrived(r, `${hog} ms hogs, ${period} ms idle`);
     }
 
     // ---- 4. back-pressure
@@ -278,8 +273,8 @@ async function main() {
     }
     // Whatever was lost was lost on purpose or not at all: the relay limited and dropped nothing.
     const st = await getJSON(relay.stats, '/stats');
-    check(st.rate_limited === 0 && st.malformed === 0 && st.panics === 0 && st.wt_datagram_drops === 0,
-      `the relay rate limited and dropped nothing (${JSON.stringify({ r: st.rate_limited, m: st.malformed, d: st.wt_datagram_drops })})`);
+    check(st.rate_limited === 0 && st.malformed === 0 && st.panics === 0 && st.wt_datagram_drops === 0 && st.wt_rx_queue_drops === 0,
+      `the relay rate limited and dropped nothing (${JSON.stringify({ r: st.rate_limited, m: st.malformed, d: st.wt_datagram_drops, rx: st.wt_rx_queue_drops })})`);
   } finally {
     killAll();
     await closeQuietly(browser, 'closing the browser');
