@@ -50,7 +50,7 @@ Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper ca
 | `-dev-cert-names` | | extra host names or IP addresses for the `-dev-cert` certificate (`localhost`, `127.0.0.1` and `::1` are always there) |
 | `-max-wt-per-ip` | 128 | QUIC connections per source address, with or without a session. Counted from the moment the Initial packet is accepted; shared by everyone behind one NAT |
 | `-max-pending-wt-per-ip` | 32 | of those, the ones that have not entered a room yet (including connections that never send an HTTP/3 request) |
-| `-wt-queue-bytes` | 65536 | bytes of datagrams queued per WebTransport client before its datagrams are dropped (and at most 128 datagrams) |
+| `-wt-queue-bytes` | 65536 | bytes of datagrams queued per WebTransport client before its datagrams are dropped (and at most 512 datagrams) |
 | `-trust-forwarded-for` | off | use the rightmost `X-Forwarded-For` entry as the client IP (only behind a proxy you control) |
 | `-stats` | off | serve `/stats` on this address, e.g. `127.0.0.1:8081` |
 | `-v` | off | log room creation and closure |
@@ -58,6 +58,17 @@ Every flag can also be set from the environment as `VNET_RELAY_<NAME>` (upper ca
 The public HTTP listener serves only `/vnet` and `/healthz`; the WebTransport listener serves only `CONNECT /vnet`. `/stats` (counters as JSON: rooms, members, frames, drops by reason, path validations) is **off by default**: give `-stats` a private address (localhost or an internal interface) to turn it on.
 
 If `/stats` shows `panics` > 0, restart the relay soon: a recovered panic is not guaranteed to have left its state consistent.
+
+Datagram drops are counted, never silent: `wt_datagram_drops` (a WebTransport client could not take datagrams as fast as they came, or one did not fit), `ws_queue_drops` (the same for WebSocket) and `wt_rx_queue_drops`: datagrams **from** a WebTransport client dropped because the relay's own receive queue (1024 per client) was full, which means the hub's forwarding was held up for a long burst. All three should stay at 0 for a game's traffic.
+
+### quic-go is vendored (two constants changed)
+
+`go.mod` replaces `github.com/quic-go/quic-go` with `third_party/quic-go`, v0.59.0 with its tests, examples and integration tests removed and **two constants raised to 1024**:
+
+- `http3/state_tracking_stream.go`, `streamDatagramQueueLen` (32 upstream): the datagrams received for one WebTransport session;
+- `datagram_queue.go`, `maxDatagramRcvQueueLen` (128 upstream): the datagrams received on one QUIC connection.
+
+Upstream drops a received datagram **silently** when its queue is full, and a game's step sends dozens in a burst: with the stock queues a 255-datagram burst from one client lost part of its tail in most runs of a tight loop and in 9 of 60 browser runs, even with a relay goroutine that does nothing but read (`wt.go`'s `datagramReader`; the forwarder is separate, behind a queue of 1024 of the relay's own, so a busy hub cannot make quic-go drop). The newest quic-go (v0.65.0) still has 32. The two edits are marked `VNET PATCH`; `TestWebTransportBurstOfDatagramsFromOneClientIsNotLost` fails without them. To move to a newer quic-go, copy it over, strip the tests, and reapply the two constants (an upstream option to size these queues would make the copy unnecessary).
 
 ## WebTransport (HTTP/3 datagrams)
 
