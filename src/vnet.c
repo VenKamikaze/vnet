@@ -218,6 +218,7 @@ int vnet_local_addr(vnet *v, int s, vnet_addr *out) {
 int vnet__wire_send(vnet *v, int s, const void *buf, size_t len, const vnet_addr *to) {
     int rc = v->be->send(v, s, buf, len, to);
     if (rc >= 0) v->stats.wire_datagrams++;  // failed sends are not counted
+    else if (rc == VNET_EAGAIN) v->stats.tx_dropped++;
     return rc;
 }
 

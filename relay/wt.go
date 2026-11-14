@@ -143,6 +143,7 @@ type wtConn struct {
 	ctl    chan []byte // control frames to the client (bounded)
 	out    chan []byte // DATA frames to the client (bounded in frames and bytes)
 	qbytes atomic.Int64
+	rxq    atomic.Int64 // bytes waiting for datagramForwarder (bounded by wtRxQueueBytes)
 	done   chan struct{}
 
 	closeOnce sync.Once
@@ -357,20 +358,70 @@ func (c *wtConn) datagramWriter(ws wtSession) {
 	}
 }
 
-// datagramReader forwards the client's DATA datagrams.
-func (c *wtConn) datagramReader(ws wtSession) {
+// wtRxQueue and wtRxQueueBytes bound the received datagrams that wait for the
+// forwarder per client, in frames and in bytes (a full burst of 255 maximum-size
+// datagrams, about 280 KiB, fits). quic-go's own receive queues sit below this
+// one and are deepened in the vendored copy (third_party/quic-go, VNET PATCH):
+// upstream keeps 32 per session and 128 per connection and silently drops past
+// that, which lost the tail of a game's burst. The reader below only moves
+// datagrams into this queue, so those deeper queues fill only if the reader
+// goroutine itself is starved; a drop there would still be silent.
+const (
+	wtRxQueue      = 512
+	wtRxQueueBytes = 512 << 10
+)
+
+type wtRx struct {
+	msg []byte
+	at  time.Time
+}
+
+// datagramReader drains the session's datagram queue as fast as it can, and
+// hands each datagram to datagramForwarder. When the relay's queue is full, in
+// frames or in bytes (the forwarder is stuck behind the hub's lock, or the
+// client sends faster than the hub can route), the datagram is dropped and
+// counted (wt_rx_queue_drops), as the relay's own decision.
+func (c *wtConn) datagramReader(ws wtSession, in chan<- wtRx) {
 	h := c.hub
 	defer h.recoverPanic("webtransport datagram reader")
 	defer c.close()
 	ctx := ws.Context()
-	scratch := make([]byte, 0, maxUDPFrame)
 	for {
 		msg, err := ws.ReceiveDatagram(ctx)
 		if err != nil {
 			return
 		}
 		h.stats.rxFrames.Add(1)
-		now := h.now()
+		n := int64(len(msg))
+		if c.rxq.Add(n) > wtRxQueueBytes {
+			c.rxq.Add(-n)
+			h.stats.wtRxQueueDrops.Add(1)
+			continue
+		}
+		select {
+		case in <- wtRx{msg, h.now()}:
+		default:
+			c.rxq.Add(-n)
+			h.stats.wtRxQueueDrops.Add(1)
+		}
+	}
+}
+
+// datagramForwarder forwards the client's DATA datagrams, in order.
+func (c *wtConn) datagramForwarder(in <-chan wtRx) {
+	h := c.hub
+	defer h.recoverPanic("webtransport datagram forwarder")
+	defer c.close()
+	scratch := make([]byte, 0, maxUDPFrame)
+	for {
+		var r wtRx
+		select {
+		case r = <-in:
+			c.rxq.Add(-int64(len(r.msg)))
+		case <-c.done:
+			return
+		}
+		msg, now := r.msg, r.at
 		s := c.sess.Load()
 		if s == nil { // DATA before the room: the client has no address yet
 			h.stats.wtEarlyDatagrams.Add(1)
@@ -528,7 +579,9 @@ func (h *Hub) serveWTSession(c *wtConn, ws wtSession) {
 	go c.refuseStreams(ws)
 	go c.controlWriter()
 	go c.datagramWriter(ws)
-	go c.datagramReader(ws)
+	rx := make(chan wtRx, wtRxQueue)
+	go c.datagramReader(ws, rx)
+	go c.datagramForwarder(rx)
 	c.controlReader(st)
 }
 

@@ -27,6 +27,7 @@ type stats struct {
 	wsRefused         atomic.Uint64 // WebSocket upgrades refused (global or per-address cap)
 	wtRefused         atomic.Uint64 // WebTransport (QUIC) connections refused (global or per-address cap)
 	wtDatagramDrops   atomic.Uint64 // datagrams dropped because a WebTransport client was too slow (or the datagram did not fit)
+	wtRxQueueDrops    atomic.Uint64 // datagrams from a WebTransport client dropped because the relay's own receive queue (512 frames or 512 KiB) was full
 	wtCtlOverflow     atomic.Uint64 // WebTransport sessions closed because their control stream could not keep up
 	wtEarlyDatagrams  atomic.Uint64 // datagrams that arrived before the session had entered a room
 	wtBadStreams      atomic.Uint64 // streams other than the one control stream, reset on arrival
@@ -64,6 +65,7 @@ type Stats struct {
 	WSRefused         uint64 `json:"ws_refused"`
 	WTRefused         uint64 `json:"wt_refused"`
 	WTDatagramDrops   uint64 `json:"wt_datagram_drops"`
+	WTRxQueueDrops    uint64 `json:"wt_rx_queue_drops"`
 	WTCtlOverflow     uint64 `json:"wt_ctl_overflow"`
 	WTEarlyDatagrams  uint64 `json:"wt_early_datagrams"`
 	WTBadStreams      uint64 `json:"wt_bad_streams"`
@@ -98,7 +100,7 @@ func (h *Hub) snapshot() Stats {
 		RoomsIdleClosed: s.roomsIdleClosed.Load(), SessionsJoined: s.sessionsJoined.Load(),
 		SessionsTimedOut: s.sessionsTimedOut.Load(), WSQueueDrops: s.wsQueueDrops.Load(),
 		RetriesSent: s.retriesSent.Load(), BadCookies: s.badCookies.Load(), WSRefused: s.wsRefused.Load(), WTRefused: s.wtRefused.Load(),
-		WTDatagramDrops: s.wtDatagramDrops.Load(), WTCtlOverflow: s.wtCtlOverflow.Load(),
+		WTDatagramDrops: s.wtDatagramDrops.Load(), WTRxQueueDrops: s.wtRxQueueDrops.Load(), WTCtlOverflow: s.wtCtlOverflow.Load(),
 		WTEarlyDatagrams: s.wtEarlyDatagrams.Load(), WTBadStreams: s.wtBadStreams.Load(), PathChallenges: s.pathChallenges.Load(),
 		PathMigrations: s.pathMigrations.Load(), BadPathResponses: s.badPathResponses.Load(),
 		Panics: s.panics.Load(),

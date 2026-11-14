@@ -81,7 +81,7 @@ extern "C" {
 #endif
 
 #define VNET_VERSION_MAJOR 0
-#define VNET_VERSION_MINOR 4
+#define VNET_VERSION_MINOR 5
 #define VNET_VERSION_PATCH 0
 
 /* The version of the library that is linked in, e.g. "0.4.0": for logs and bug
@@ -674,6 +674,18 @@ typedef struct vnet_stats {
     uint64_t rx_oversize;        /* dropped: > VNET_MAX_DATAGRAM (UDP, relay) */
     uint64_t unroutable;         /* loopback: no such host/port; relay: a
                                     datagram for a port you have not opened */
+    uint64_t tx_dropped;         /* the backend refused a datagram with
+                                    VNET_EAGAIN: at vnet_sendto(), or, with
+                                    impairment, when vnet_poll() released the
+                                    delayed datagram (vnet_sendto() had
+                                    returned success then). Sources: UDP
+                                    EWOULDBLOCK/EAGAIN/ENOBUFS; relay-udp (the
+                                    same, on the inner UDP socket); relay-ws
+                                    bufferedAmount over 64 KiB; relay-wt send
+                                    queue over its cap or stalled. Never the
+                                    loopback network. Relay control frames
+                                    (handshake, keepalive) are not counted.
+                                    Added in 0.5.0. */
 } vnet_stats;
 
 /* Copy the counters out. A NULL `v` gives zeros. */

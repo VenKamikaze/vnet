@@ -66,7 +66,7 @@ type Config struct {
 
 	// WebTransport. The connection is also bounded by SessionTimeout (QUIC's
 	// idle timeout) and PingInterval (QUIC keep-alive).
-	WTSendQueue      int           // datagrams queued per WebTransport client before drops; default 128
+	WTSendQueue      int           // datagrams queued per WebTransport client before drops; default 512 (also bounded by WTSendQueueBytes)
 	WTSendQueueBytes int           // bytes queued per WebTransport client before drops; default 65536
 	WTWriteTimeout   time.Duration // a control-stream write that takes longer closes the session; default 5 s
 
@@ -102,7 +102,7 @@ func (c Config) withDefaults() (Config, error) {
 	def(&c.MaxWT, 4000)
 	def(&c.MaxWTPerIP, 128)
 	def(&c.MaxPendingWTPerIP, 32)
-	def(&c.WTSendQueue, 128)
+	def(&c.WTSendQueue, 512)
 	def(&c.WTSendQueueBytes, 65536)
 	defD(&c.WTWriteTimeout, 5*time.Second)
 	def(&c.WSSendQueueBytes, 65536)

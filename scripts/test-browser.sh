@@ -6,7 +6,8 @@
 # (WebSocket), tests/browser/wt_browser.test.js (WebTransport, with a
 # development certificate and the fallback to WebSocket) and
 # tests/browser/wake_browser.test.js (the wake callback in a page whose loop is
-# frozen), which drive Chromium with Playwright against relays started on
+# frozen) and tests/browser/wt_burst.test.js (datagrams sent in a burst, and
+# back-pressure), which drive Chromium with Playwright against relays started on
 # loopback.
 #
 # Prerequisites: go, cmake, node with `playwright` resolvable by require()
@@ -31,12 +32,12 @@ echo "== Go relay"
 echo "== native relay_peer"
 cmake -S "$root" -B "$out/native" -DCMAKE_BUILD_TYPE=Release \
     -DVNET_BUILD_TESTS=OFF -DVNET_BUILD_RELAY=OFF -DVNET_INSTALL=OFF -DVNET_WARNINGS_AS_ERRORS=ON >/dev/null
-cmake --build "$out/native" --target relay_peer wake_probe -j 4
+cmake --build "$out/native" --target relay_peer wake_probe burst_probe -j 4
 
 echo "== wasm relay_peer"
 emcmake cmake -S "$root" -B "$out/wasm" -DCMAKE_BUILD_TYPE=Release \
     -DVNET_BUILD_TESTS=OFF -DVNET_BUILD_RELAY=OFF -DVNET_INSTALL=OFF -DVNET_WARNINGS_AS_ERRORS=ON >/dev/null
-cmake --build "$out/wasm" --target relay_peer wake_probe -j 4
+cmake --build "$out/wasm" --target relay_peer wake_probe burst_probe -j 4
 
 echo "== Chromium: WebSocket"
 node "$root/tests/browser/relay_browser.test.js" \
@@ -49,3 +50,7 @@ node "$root/tests/browser/wt_browser.test.js" \
 echo "== Chromium: the wake callback"
 node "$root/tests/browser/wake_browser.test.js" \
     --relay-bin "$out/vnet-relay" --probe-bin "$out/native/wake_probe" --web-dir "$out/wasm"
+
+echo "== Chromium: datagram bursts and back-pressure"
+node "$root/tests/browser/wt_burst.test.js" \
+    --relay-bin "$out/vnet-relay" --probe-bin "$out/native/burst_probe" --web-dir "$out/wasm"

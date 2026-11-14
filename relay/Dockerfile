@@ -18,7 +18,10 @@
 
 FROM golang:1.24-alpine AS build
 WORKDIR /src
+# go.mod replaces quic-go with the patched copy in third_party/, which must be
+# there before the modules are downloaded.
 COPY go.mod go.sum ./
+COPY third_party ./third_party
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/vnet-relay ./cmd/vnet-relay
